@@ -1,0 +1,90 @@
+# ---------------------------------------------------------
+# AI SOC SYSTEM - GLOBAL CONFIGURATION (config.yaml)
+# ---------------------------------------------------------
+
+# 1. Message Broker (Redis)
+# Used for real-time communication between Workers, Supervisors, and Commander
+redis:
+  host: "127.0.0.1" # Change to Redis server IP in production
+  port: 6379
+  db: 0
+  password: "YOUR_REDIS_SECURE_PASSWORD" # Ensure this matches docker-compose
+
+# 2. Data Lake (OpenSearch)
+# Where all logs (Wazuh, Zeek, Suricata, Cloud) are stored
+opensearch:
+  hosts: ["https://127.0.0.1:9200"]
+  username: "admin"
+  password: "YOUR_OPENSEARCH_PASSWORD"
+  verify_certs: false # Set to true in production if using CA
+  indexes:
+    wazuh: "wazuh-alerts-4.x-*"
+    zeek: "zeek-*"
+    suricata: "suricata-*"
+
+# 3. LLM AI Engine (Ollama)
+# Used for decision making, report generation, and alert explanation
+llm:
+  provider: "ollama"
+  base_url: "http://127.0.0.1:11434"
+  # Use llama3 for deep reasoning (Commander/Report), mistral for fast classification
+  primary_model: "llama3"
+  fast_model: "mistral" 
+  timeout: 60
+
+# 4. Endpoints & SIEM (Wazuh API)
+# Used for active response, agent isolation, and rule management
+wazuh:
+  host: "https://127.0.0.1"
+  port: 55000
+  username: "wazuh"
+  password: "YOUR_WAZUH_PASSWORD"
+  verify_certs: false
+
+# 5. Threat Intelligence (MISP & IntelOwl)
+threat_intel:
+  misp:
+    url: "https://127.0.0.1:443"
+    api_key: "YOUR_MISP_API_KEY"
+    verify_certs: false
+  intelowl:
+    url: "http://127.0.0.1:8000"
+    api_key: "YOUR_INTELOWL_API_KEY"
+
+# 6. SOAR & Automation (Shuffle)
+soar:
+  shuffle:
+    webhook_base_url: "http://127.0.0.1:3443/api/v1/hooks"
+    playbooks:
+      isolate_host: "YOUR_ISOLATE_HOOK_ID"
+      block_ip: "YOUR_BLOCK_IP_HOOK_ID"
+      disable_user: "YOUR_DISABLE_USER_HOOK_ID"
+
+# 7. Case Management (DFIR-IRIS)
+dfir_iris:
+  url: "https://127.0.0.1:443"
+  api_key: "YOUR_IRIS_API_KEY"
+  client_id: 1
+
+# 8. Asset Inventory & Criticality
+# Used by the Smart Decision agent (W26) to determine severity
+asset_inventory:
+  critical_subnets:
+    - "10.0.10.0/24" # Servers
+    - "10.0.20.0/24" # Databases
+  critical_hosts:
+    - "DC01.local"
+    - "DB-PROD-01"
+    - "CEO-LAPTOP"
+  honeypots:
+    - "10.0.99.10" # T-Pot instance
+
+# 9. Agent Tuning & Logging
+logging:
+  level: "INFO" # Change to DEBUG for troubleshooting
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/var/log/soc-agents.log"
+
+thresholds:
+  noise_reduction_limit: 100 # Suppress alert if seen > 100 times in an hour
+  ml_confidence_min: 0.85 # Minimum confidence for ML predictions to act

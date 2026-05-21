@@ -1,0 +1,270 @@
+###############################################################################
+# SOC Platform — Additional Security Tools
+# مركز العمليات الأمنية — أدوات أمنية إضافية
+#
+# Services: CAPEv2 (Sandbox), Greenbone/OpenVAS, Keycloak, T-Pot CE (Honeypot)
+#
+# Usage:
+#   docker compose -f docker-compose.security.yml --env-file ../.env up -d
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # CAPEv2 — Malware sandbox analysis (web interface placeholder)
+  # صندوق الرمل — تحليل البرمجيات الخبيثة في بيئة معزولة
+  #
+  # NOTE: Full CAPEv2 requires a hypervisor (KVM/QEMU) and guest VMs.
+  # This is a placeholder for the web interface component. Full deployment
+  # requires additional host-level configuration.
+  # ملاحظة: التثبيت الكامل يتطلب برنامج محاكاة افتراضية وأجهزة ضيف
+  # ===========================================================================
+  capev2-web:
+    image: python:3.11-slim
+    container_name: soc-capev2-web
+    hostname: capev2-web
+    restart: unless-stopped
+    # Placeholder: runs a simple health endpoint until full CAPEv2 is configured
+    # عنصر نائب: يشغل نقطة فحص صحة بسيطة حتى يتم تكوين CAPEv2 بالكامل
+    command: >
+      bash -c "
+        pip install --quiet flask &&
+        python -c \"
+        from flask import Flask, jsonify
+        app = Flask(__name__)
+
+        @app.route('/health')
+        def health():
+            return jsonify({
+                'status': 'placeholder',
+                'service': 'CAPEv2',
+                'message': 'CAPEv2 sandbox requires host-level KVM/QEMU setup. '
+                           'See docs for full deployment instructions.'
+            })
+
+        @app.route('/')
+        def index():
+            return '<h1>CAPEv2 Sandbox</h1><p>Placeholder — configure KVM and guest VMs for full functionality.</p>'
+
+        app.run(host='0.0.0.0', port=8000)
+        \"
+      "
+    volumes:
+      - capev2-data:/opt/CAPEv2/storage
+    ports:
+      - "${CAPEV2_WEB_PORT:-8000}:8000"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:8000/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Greenbone / OpenVAS — Vulnerability scanner
+  # أوبن فاس / غرينبون — ماسح الثغرات الأمنية
+  # ===========================================================================
+  openvas:
+    image: greenbone/community-edition:latest
+    container_name: soc-openvas
+    hostname: openvas
+    restart: unless-stopped
+    environment:
+      - GSAD_ARGS=--listen=0.0.0.0 --port=9392
+      - GVM_ADMIN_PASSWORD=${OPENVAS_ADMIN_PASSWORD:-Ch@ngeMe_OpenVAS_2024!}
+    volumes:
+      - openvas-data:/var/lib/openvas
+      - gvm-data:/var/lib/gvm
+      - openvas-logs:/var/log/gvm
+    ports:
+      - "${OPENVAS_PORT:-9392}:9392"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 6g
+        reservations:
+          memory: 2g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sfk https://localhost:9392/login || exit 1",
+        ]
+      interval: 60s
+      timeout: 15s
+      retries: 10
+      start_period: 300s
+
+  # ===========================================================================
+  # Keycloak — Identity and Access Management (SSO / RBAC)
+  # كيكلوك — إدارة الهوية والوصول (تسجيل دخول موحد / تحكم بالأدوار)
+  # ===========================================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest
+    container_name: soc-keycloak
+    hostname: keycloak
+    restart: unless-stopped
+    command: start-dev
+    environment:
+      - KEYCLOAK_ADMIN=${KEYCLOAK_ADMIN:-admin}
+      - KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD:-Ch@ngeMe_Keycloak_2024!}
+      - KC_HTTP_PORT=8180
+      - KC_PROXY=edge
+      - KC_DB=postgres
+      - KC_DB_URL=jdbc:postgresql://keycloak-db:5432/keycloak
+      - KC_DB_USERNAME=keycloak
+      - KC_DB_PASSWORD=${KC_DB_PASSWORD:-Ch@ngeMe_KC_DB_2024!}
+    volumes:
+      - keycloak-data:/opt/keycloak/data
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8180"
+    networks:
+      - soc-net
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:8180/health/ready || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # Keycloak PostgreSQL Database
+  keycloak-db:
+    image: postgres:16-alpine
+    container_name: soc-keycloak-db
+    hostname: keycloak-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=keycloak
+      - POSTGRES_USER=keycloak
+      - POSTGRES_PASSWORD=${KC_DB_PASSWORD:-Ch@ngeMe_KC_DB_2024!}
+    volumes:
+      - keycloak-db-data:/var/lib/postgresql/data
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ===========================================================================
+  # T-Pot CE — Multi-honeypot platform
+  # مصيدة — منصة مصائد متعددة
+  #
+  # NOTE: T-Pot CE is designed to run on a dedicated host with its own
+  # network stack. This is a simplified container deployment. For full
+  # T-Pot functionality, deploy on a separate VM/host.
+  # ملاحظة: مصمم للعمل على جهاز مخصص. للوظائف الكاملة، انشره على جهاز منفصل
+  # ===========================================================================
+  tpot-ce:
+    image: telekom-security/tpotce:latest
+    container_name: soc-tpot-ce
+    hostname: tpot-ce
+    restart: unless-stopped
+    # T-Pot needs extensive network access for honeypot services
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - TPOT_TYPE=STANDARD
+      - WEB_USER=admin
+      - WEB_PW=Ch@ngeMe_TPot_2024!
+    volumes:
+      - tpot-data:/data
+      - tpot-logs:/var/log/tpot
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      # T-Pot web interface
+      - "${TPOT_WEB_PORT:-64297}:64297"
+      # Common honeypot ports (adjust as needed)
+      - "22222:22"       # SSH honeypot
+      - "2323:23"        # Telnet honeypot
+      - "8081:80"        # HTTP honeypot
+      - "4443:443"       # HTTPS honeypot
+      - "3389:3389"      # RDP honeypot
+      - "445:445"        # SMB honeypot
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sfk https://localhost:64297 || exit 1",
+        ]
+      interval: 60s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
+
+# =============================================================================
+# Volumes — Persistent storage
+# وحدات التخزين — التخزين الدائم
+# =============================================================================
+volumes:
+  capev2-data:
+    driver: local
+    name: soc-capev2-data
+  openvas-data:
+    driver: local
+    name: soc-openvas-data
+  gvm-data:
+    driver: local
+    name: soc-gvm-data
+  openvas-logs:
+    driver: local
+    name: soc-openvas-logs
+  keycloak-data:
+    driver: local
+    name: soc-keycloak-data
+  keycloak-db-data:
+    driver: local
+    name: soc-keycloak-db-data
+  tpot-data:
+    driver: local
+    name: soc-tpot-data
+  tpot-logs:
+    driver: local
+    name: soc-tpot-logs
+
+# =============================================================================
+# Networks — Shared SOC network
+# الشبكات — شبكة مركز العمليات المشتركة
+# =============================================================================
+networks:
+  soc-net:
+    external: true
+    name: soc-net

@@ -1,0 +1,403 @@
+"""
+SOC Platform - Base Agent Class
+الفئة الأساسية للوكيل
+
+All SOC worker agents inherit from BaseAgent.
+Implements the Collect → Analyze → Decide → Act loop with:
+- Scheduled run loop with error recovery
+- Prometheus metrics instrumentation
+- Redis pub/sub supervisor reporting
+- Graceful shutdown on SIGTERM/SIGINT
+- Health-check endpoint
+"""
+
+from __future__ import annotations
+
+import logging
+import signal
+import sys
+import threading
+import time
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from .alerter import Alerter
+from .config import SOCConfig
+from .metrics import AgentMetrics, start_metrics_server
+from .opensearch_client import OpenSearchClient
+from .redis_bus import CHANNEL_COMMANDER_BROADCAST, RedisBus
+
+logger = logging.getLogger("soc.agent")
+
+
+class BaseAgent(ABC):
+    """
+    Abstract base class for all SOC agents.
+    الفئة الأساسية المجردة لجميع وكلاء مركز العمليات الأمنية
+
+    Sub-classes must implement:
+        collect()  -> raw data
+        analyze()  -> findings from data
+        decide()   -> actions from findings
+        act()      -> results from actions
+
+    The run_loop() orchestrates these in a timed cycle with metrics,
+    error handling, and supervisor reporting.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        interval_seconds: int = 60,
+        config: Optional[SOCConfig] = None,
+    ) -> None:
+        """
+        Initialize the base agent.
+
+        Args:
+            name:             Unique agent name (e.g. 'w37_brute_force').
+            description:      Human-readable description.
+            interval_seconds: Seconds between each run cycle.
+            config:           SOCConfig instance (defaults to singleton).
+        """
+        self.name = name
+        self.description = description
+        self.interval_seconds = interval_seconds
+        self.config = config or SOCConfig.get_instance()
+
+        # Shared clients (lazy-initialized in start())
+        self._os_client: Optional[OpenSearchClient] = None
+        self._redis_bus: Optional[RedisBus] = None
+        self._alerter: Optional[Alerter] = None
+
+        # Metrics
+        self._metrics = AgentMetrics(self.name)
+
+        # Runtime state
+        self._running = False
+        self._last_run: Optional[float] = None
+        self._events_processed: int = 0
+        self._errors: int = 0
+        self._lock = threading.Lock()
+
+        # Agent-specific config overrides
+        self._agent_config = self.config.get_agent_config(self.name)
+
+        logger.info(
+            "Agent '%s' initialized: %s (interval=%ds)",
+            name, description, interval_seconds,
+        )
+
+    # ------------------------------------------------------------------
+    # Shared client accessors (lazy init) / عملاء مشتركون
+    # ------------------------------------------------------------------
+
+    @property
+    def os_client(self) -> OpenSearchClient:
+        """OpenSearch client (lazy-initialized)."""
+        if self._os_client is None:
+            self._os_client = OpenSearchClient(self.config)
+        return self._os_client
+
+    @property
+    def redis_bus(self) -> RedisBus:
+        """Redis message bus (lazy-initialized)."""
+        if self._redis_bus is None:
+            self._redis_bus = RedisBus(self.config)
+        return self._redis_bus
+
+    @property
+    def alerter(self) -> Alerter:
+        """Alert dispatcher (lazy-initialized)."""
+        if self._alerter is None:
+            self._alerter = Alerter(self.config)
+        return self._alerter
+
+    # ------------------------------------------------------------------
+    # Abstract methods (Collect -> Analyze -> Decide -> Act)
+    # الطرق المجردة: جمع -> تحليل -> قرار -> تنفيذ
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def collect(self) -> Any:
+        """
+        Collect raw data from sources (OpenSearch, Wazuh, etc.).
+        جمع البيانات الخام من المصادر
+
+        Returns:
+            Raw data in any format suitable for the agent.
+        """
+        ...
+
+    @abstractmethod
+    def analyze(self, data: Any) -> Any:
+        """
+        Analyze collected data and extract findings.
+        تحليل البيانات المجمعة واستخراج النتائج
+
+        Args:
+            data: Raw data from collect().
+
+        Returns:
+            Findings (threats, anomalies, patterns, etc.).
+        """
+        ...
+
+    @abstractmethod
+    def decide(self, findings: Any) -> Any:
+        """
+        Decide on actions based on findings.
+        اتخاذ القرارات بناءً على النتائج
+
+        Args:
+            findings: Analysis results from analyze().
+
+        Returns:
+            List of actions to execute.
+        """
+        ...
+
+    @abstractmethod
+    def act(self, actions: Any) -> Any:
+        """
+        Execute decided actions (alert, block, isolate, etc.).
+        تنفيذ الإجراءات المقررة
+
+        Args:
+            actions: Actions from decide().
+
+        Returns:
+            Results of executed actions.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Supervisor reporting / التقرير إلى المشرف
+    # ------------------------------------------------------------------
+
+    def report_to_supervisor(self, message: dict[str, Any]) -> None:
+        """
+        Send a report to the supervisor agent via Redis pub/sub.
+
+        Args:
+            message: Report payload dict.
+        """
+        report = {
+            "agent_name": self.name,
+            "agent_description": self.description,
+            **message,
+        }
+        try:
+            self.redis_bus.report_to_supervisor(
+                sender=self.name,
+                payload=report,
+                message_type="agent_report",
+            )
+        except Exception as exc:
+            logger.error("Failed to report to supervisor: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Commander broadcast listener / مستمع أوامر القائد
+    # ------------------------------------------------------------------
+
+    def _handle_commander_broadcast(self, message: dict[str, Any]) -> None:
+        """Handle broadcast messages from the Commander agent."""
+        msg_type = message.get("type", "")
+        payload = message.get("payload", {})
+        target = payload.get("target_agent")
+
+        # Only process if broadcast is for all agents or this agent specifically
+        if target and target != self.name and target != "all":
+            return
+
+        logger.info(
+            "Received commander broadcast: type=%s, payload=%s",
+            msg_type, str(payload)[:200],
+        )
+
+        # Handle standard directives
+        directive = payload.get("directive", "")
+        if directive == "pause":
+            logger.warning("Received PAUSE directive -- agent will stop running.")
+            self._running = False
+        elif directive == "update_interval":
+            new_interval = payload.get("interval_seconds")
+            if isinstance(new_interval, int) and new_interval > 0:
+                self.interval_seconds = new_interval
+                logger.info("Interval updated to %ds", new_interval)
+        elif directive == "health_check":
+            health = self.health_check()
+            self.report_to_supervisor({"type": "health_response", **health})
+
+    # ------------------------------------------------------------------
+    # Health check / فحص الصحة
+    # ------------------------------------------------------------------
+
+    def health_check(self) -> dict[str, Any]:
+        """
+        Return the agent's current health status.
+
+        Returns:
+            Dict with status, last_run, events_processed, errors, etc.
+        """
+        return {
+            "agent_name": self.name,
+            "status": "running" if self._running else "stopped",
+            "last_run": (
+                datetime.fromtimestamp(self._last_run, tz=timezone.utc).isoformat()
+                if self._last_run
+                else None
+            ),
+            "events_processed": self._events_processed,
+            "errors": self._errors,
+            "interval_seconds": self.interval_seconds,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ------------------------------------------------------------------
+    # Single run cycle / دورة تشغيل واحدة
+    # ------------------------------------------------------------------
+
+    def _run_once(self) -> None:
+        """Execute one full Collect -> Analyze -> Decide -> Act cycle."""
+        start_time = time.time()
+        try:
+            # Collect
+            data = self.collect()
+            if data is None:
+                logger.debug("[%s] No data collected this cycle.", self.name)
+                return
+
+            # Analyze
+            findings = self.analyze(data)
+
+            # Decide
+            actions = self.decide(findings)
+
+            # Act
+            results = self.act(actions)
+
+            # Update metrics
+            duration = time.time() - start_time
+            self._last_run = time.time()
+            self._metrics.set_last_run(self._last_run)
+            self._metrics.observe_duration(duration)
+
+            logger.debug(
+                "[%s] Cycle completed in %.2fs -- results: %s",
+                self.name, duration, str(results)[:200],
+            )
+
+        except Exception as exc:
+            self._errors += 1
+            self._metrics.inc_errors(type(exc).__name__)
+            logger.exception("[%s] Error in run cycle: %s", self.name, exc)
+            # Report error to supervisor
+            self.report_to_supervisor({
+                "type": "error",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            })
+
+    # ------------------------------------------------------------------
+    # Main run loop / حلقة التشغيل الرئيسية
+    # ------------------------------------------------------------------
+
+    def run_loop(self) -> None:
+        """
+        Main agent loop. Runs collect->analyze->decide->act on a schedule.
+
+        - Handles errors gracefully (logs, increments counter, continues).
+        - Publishes Prometheus metrics each cycle.
+        - Listens for commander broadcasts.
+        - Shuts down gracefully on SIGTERM / SIGINT.
+        """
+        self._running = True
+
+        # Start Prometheus metrics server (idempotent)
+        start_metrics_server(self.config)
+
+        # Subscribe to commander broadcast channel
+        try:
+            self.redis_bus.subscribe(
+                CHANNEL_COMMANDER_BROADCAST,
+                self._handle_commander_broadcast,
+            )
+        except Exception as exc:
+            logger.warning("Could not subscribe to commander broadcast: %s", exc)
+
+        # Register signal handlers for graceful shutdown
+        def _shutdown_handler(signum: int, frame: Any) -> None:
+            sig_name = signal.Signals(signum).name
+            logger.info(
+                "[%s] Received %s -- shutting down gracefully...",
+                self.name, sig_name,
+            )
+            self._running = False
+
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+        signal.signal(signal.SIGINT, _shutdown_handler)
+
+        logger.info(
+            "Agent '%s' starting run loop (interval=%ds)",
+            self.name, self.interval_seconds,
+        )
+
+        # Send startup heartbeat
+        self.report_to_supervisor({
+            "type": "heartbeat",
+            "status": "started",
+            "interval_seconds": self.interval_seconds,
+        })
+
+        try:
+            while self._running:
+                self._run_once()
+
+                # Sleep in small increments to allow responsive shutdown
+                sleep_end = time.time() + self.interval_seconds
+                while self._running and time.time() < sleep_end:
+                    time.sleep(min(1.0, sleep_end - time.time()))
+
+        finally:
+            # Cleanup
+            logger.info("[%s] Shutting down...", self.name)
+            self.report_to_supervisor({
+                "type": "heartbeat",
+                "status": "stopped",
+            })
+            if self._redis_bus:
+                self._redis_bus.shutdown()
+            logger.info("[%s] Shutdown complete.", self.name)
+
+    # ------------------------------------------------------------------
+    # Start in thread / بدء في خيط
+    # ------------------------------------------------------------------
+
+    def start_in_thread(self) -> threading.Thread:
+        """
+        Start the agent's run loop in a background thread.
+
+        Returns:
+            The running thread.
+        """
+        thread = threading.Thread(
+            target=self.run_loop,
+            name=f"agent-{self.name}",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    # ------------------------------------------------------------------
+    # Repr / التمثيل
+    # ------------------------------------------------------------------
+
+    def __repr__(self) -> str:
+        return (
+            f"<{self.__class__.__name__} name={self.name!r} "
+            f"interval={self.interval_seconds}s "
+            f"status={'running' if self._running else 'stopped'}>"
+        )

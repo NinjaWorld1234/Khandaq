@@ -1,0 +1,317 @@
+###############################################################################
+# SOC Platform — Core Services
+# مركز العمليات الأمنية — الخدمات الأساسية
+#
+# Services: OpenSearch (2 nodes), OpenSearch Dashboards, Wazuh Manager, Wazuh Dashboard
+#
+# Usage:
+#   docker compose -f docker-compose.core.yml --env-file ../.env up -d
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # OpenSearch Node 1 — Primary search and analytics engine
+  # عقدة البحث المفتوح الأولى — محرك البحث والتحليل الرئيسي
+  # ===========================================================================
+  opensearch-node1:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-2.17.0}
+    container_name: soc-opensearch-node1
+    hostname: opensearch-node1
+    restart: unless-stopped
+    environment:
+      - cluster.name=soc-opensearch-cluster
+      - node.name=opensearch-node1
+      - node.roles=cluster_manager,data,ingest
+      - discovery.seed_hosts=opensearch-node1,opensearch-node2
+      - cluster.initial_cluster_manager_nodes=opensearch-node1,opensearch-node2
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS:--Xms2g -Xmx2g}
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!}
+      # Disable security for initial setup; enable in production
+      # تعطيل الأمان للإعداد الأولي؛ يُفعّل في الإنتاج
+      - plugins.security.disabled=${OPENSEARCH_SECURITY_ENABLED:-false}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data-node1:/usr/share/opensearch/data
+      - opensearch-logs-node1:/usr/share/opensearch/logs
+    ports:
+      - "${OPENSEARCH_NODE1_PORT:-9200}:9200"
+      - "9300:9300"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: ${OPENSEARCH_MEM_LIMIT:-4g}
+        reservations:
+          memory: ${OPENSEARCH_MEM_RESERVATION:-2g}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ===========================================================================
+  # OpenSearch Node 2 — Secondary node for cluster resilience
+  # عقدة البحث المفتوح الثانية — عقدة ثانوية للمرونة
+  # ===========================================================================
+  opensearch-node2:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-2.17.0}
+    container_name: soc-opensearch-node2
+    hostname: opensearch-node2
+    restart: unless-stopped
+    environment:
+      - cluster.name=soc-opensearch-cluster
+      - node.name=opensearch-node2
+      - node.roles=cluster_manager,data,ingest
+      - discovery.seed_hosts=opensearch-node1,opensearch-node2
+      - cluster.initial_cluster_manager_nodes=opensearch-node1,opensearch-node2
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS:--Xms2g -Xmx2g}
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!}
+      - plugins.security.disabled=${OPENSEARCH_SECURITY_ENABLED:-false}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data-node2:/usr/share/opensearch/data
+      - opensearch-logs-node2:/usr/share/opensearch/logs
+    ports:
+      - "${OPENSEARCH_NODE2_PORT:-9201}:9200"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: ${OPENSEARCH_MEM_LIMIT:-4g}
+        reservations:
+          memory: ${OPENSEARCH_MEM_RESERVATION:-2g}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  # ===========================================================================
+  # OpenSearch Dashboards — Web UI for search and visualisation
+  # لوحة تحكم البحث المفتوح — واجهة ويب للبحث والتصور
+  # ===========================================================================
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION:-2.17.0}
+    container_name: soc-opensearch-dashboards
+    hostname: opensearch-dashboards
+    restart: unless-stopped
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch-node1:9200","http://opensearch-node2:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "${OPENSEARCH_DASHBOARDS_PORT:-5601}:5601"
+    networks:
+      - soc-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+      opensearch-node2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:5601/api/status || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  # ===========================================================================
+  # Wazuh Manager — SIEM / XDR / HIDS manager
+  # مدير وازه — إدارة كشف التسلل والتهديدات
+  # ===========================================================================
+  wazuh-manager:
+    image: wazuh/wazuh-manager:${WAZUH_VERSION:-4.9.2}
+    container_name: soc-wazuh-manager
+    hostname: wazuh-manager
+    restart: unless-stopped
+    environment:
+      - INDEXER_URL=http://opensearch-node1:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!}
+      - FILEBEAT_SSL_VERIFICATION_MODE=none
+      - SSL_CERTIFICATE_AUTHORITIES=""
+      - SSL_CERTIFICATE=""
+      - SSL_KEY=""
+      - API_USERNAME=${WAZUH_API_USER:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD:-Ch@ngeMe_Wazuh_API_2024!}
+    volumes:
+      - wazuh-api-configuration:/var/ossec/api/configuration
+      - wazuh-etc:/var/ossec/etc
+      - wazuh-logs:/var/ossec/logs
+      - wazuh-queue:/var/ossec/queue
+      - wazuh-var-multigroups:/var/ossec/var/multigroups
+      - wazuh-integrations:/var/ossec/integrations
+      - wazuh-active-response:/var/ossec/active-response/bin
+      - wazuh-agentless:/var/ossec/agentless
+      - wazuh-wodles:/var/ossec/wodles
+      - filebeat-etc:/etc/filebeat
+      - filebeat-var:/var/lib/filebeat
+    ports:
+      - "${WAZUH_MANAGER_PORT:-1514}:1514"
+      - "${WAZUH_REGISTRATION_PORT:-1515}:1515"
+      - "${WAZUH_API_PORT:-55000}:55000/tcp"
+      - "514:514/udp"
+    networks:
+      - soc-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${WAZUH_MEM_LIMIT:-2g}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/var/ossec/bin/wazuh-control status | grep -q 'is running' || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+
+  # ===========================================================================
+  # Wazuh Dashboard — Web UI for Wazuh
+  # لوحة تحكم وازه — واجهة ويب لوازه
+  # ===========================================================================
+  wazuh-dashboard:
+    image: wazuh/wazuh-dashboard:${WAZUH_VERSION:-4.9.2}
+    container_name: soc-wazuh-dashboard
+    hostname: wazuh-dashboard
+    restart: unless-stopped
+    environment:
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!}
+      - WAZUH_API_URL=https://wazuh-manager
+      - DASHBOARD_USERNAME=${WAZUH_DASHBOARD_USER:-admin}
+      - DASHBOARD_PASSWORD=${WAZUH_DASHBOARD_PASSWORD:-Ch@ngeMe_Wazuh_Dash_2024!}
+      - API_USERNAME=${WAZUH_API_USER:-wazuh-wui}
+      - API_PASSWORD=${WAZUH_API_PASSWORD:-Ch@ngeMe_Wazuh_API_2024!}
+    volumes:
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/data/wazuh/config
+      - wazuh-dashboard-custom:/usr/share/wazuh-dashboard/plugins/wazuh/public/assets/custom
+    ports:
+      - "${WAZUH_DASHBOARD_PORT:-443}:5601"
+    networks:
+      - soc-net
+    depends_on:
+      wazuh-manager:
+        condition: service_healthy
+      opensearch-node1:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sfk https://localhost:5601/api/status || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+# =============================================================================
+# Volumes — Persistent storage
+# وحدات التخزين — التخزين الدائم
+# =============================================================================
+volumes:
+  opensearch-data-node1:
+    driver: local
+    name: soc-opensearch-data-node1
+  opensearch-data-node2:
+    driver: local
+    name: soc-opensearch-data-node2
+  opensearch-logs-node1:
+    driver: local
+    name: soc-opensearch-logs-node1
+  opensearch-logs-node2:
+    driver: local
+    name: soc-opensearch-logs-node2
+  wazuh-api-configuration:
+    driver: local
+    name: soc-wazuh-api-configuration
+  wazuh-etc:
+    driver: local
+    name: soc-wazuh-etc
+  wazuh-logs:
+    driver: local
+    name: soc-wazuh-logs
+  wazuh-queue:
+    driver: local
+    name: soc-wazuh-queue
+  wazuh-var-multigroups:
+    driver: local
+    name: soc-wazuh-var-multigroups
+  wazuh-integrations:
+    driver: local
+    name: soc-wazuh-integrations
+  wazuh-active-response:
+    driver: local
+    name: soc-wazuh-active-response
+  wazuh-agentless:
+    driver: local
+    name: soc-wazuh-agentless
+  wazuh-wodles:
+    driver: local
+    name: soc-wazuh-wodles
+  filebeat-etc:
+    driver: local
+    name: soc-filebeat-etc
+  filebeat-var:
+    driver: local
+    name: soc-filebeat-var
+  wazuh-dashboard-config:
+    driver: local
+    name: soc-wazuh-dashboard-config
+  wazuh-dashboard-custom:
+    driver: local
+    name: soc-wazuh-dashboard-custom
+
+# =============================================================================
+# Networks — Shared SOC network
+# الشبكات — شبكة مركز العمليات المشتركة
+# =============================================================================
+networks:
+  soc-net:
+    external: true
+    name: soc-net

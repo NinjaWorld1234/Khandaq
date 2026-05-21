@@ -1,0 +1,192 @@
+###############################################################################
+# SOC Platform — Monitoring Services
+# مركز العمليات الأمنية — خدمات المراقبة
+#
+# Services: Grafana, Prometheus, Uptime Kuma, Node Exporter
+#
+# Usage:
+#   docker compose -f docker-compose.monitor.yml --env-file ../.env up -d
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Prometheus — Metrics collection and alerting
+  # بروميثيوس — جمع المقاييس والتنبيهات
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: soc-prometheus
+    hostname: prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    volumes:
+      - prometheus-data:/prometheus
+      - ../config/prometheus:/etc/prometheus:ro
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+        reservations:
+          memory: 512m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:9090/-/healthy || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Grafana — Dashboard and visualization platform
+  # غرافانا — منصة لوحات المعلومات والتصور
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: soc-grafana
+    hostname: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-Ch@ngeMe_Grafana_2024!}
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource,grafana-worldmap-panel
+      - GF_SERVER_ROOT_URL=http://${HOST_IP:-localhost}:${GRAFANA_PORT:-3000}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_LOG_LEVEL=warn
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - grafana-provisioning:/etc/grafana/provisioning
+      - ../config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    networks:
+      - soc-net
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${GRAFANA_MEM_LIMIT:-512m}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:3000/api/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Uptime Kuma — Service uptime monitoring
+  # مراقب الجهوزية — مراقبة وقت تشغيل الخدمات
+  # ===========================================================================
+  uptime-kuma:
+    image: louislam/uptime-kuma:latest
+    container_name: soc-uptime-kuma
+    hostname: uptime-kuma
+    restart: unless-stopped
+    volumes:
+      - uptime-kuma-data:/app/data
+    ports:
+      - "${UPTIME_KUMA_PORT:-3002}:3001"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:3001/api/status-page/heartbeat || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Node Exporter — Host system metrics exporter for Prometheus
+  # مصدر مقاييس النظام — تصدير مقاييس الجهاز المضيف لبروميثيوس
+  # ===========================================================================
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: soc-node-exporter
+    hostname: node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.rootfs=/host"
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    # pid: host gives access to host process info
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -qO- http://localhost:9100/metrics > /dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+# =============================================================================
+# Volumes — Persistent storage
+# وحدات التخزين — التخزين الدائم
+# =============================================================================
+volumes:
+  prometheus-data:
+    driver: local
+    name: soc-prometheus-data
+  grafana-data:
+    driver: local
+    name: soc-grafana-data
+  grafana-provisioning:
+    driver: local
+    name: soc-grafana-provisioning
+  uptime-kuma-data:
+    driver: local
+    name: soc-uptime-kuma-data
+
+# =============================================================================
+# Networks — Shared SOC network
+# الشبكات — شبكة مركز العمليات المشتركة
+# =============================================================================
+networks:
+  soc-net:
+    external: true
+    name: soc-net

@@ -1,0 +1,254 @@
+###############################################################################
+# SOC Platform — Network Monitoring Services
+# مركز العمليات الأمنية — خدمات مراقبة الشبكة
+#
+# Services: Suricata (IDS/IPS), Zeek (NSM), Kafka, Zookeeper, Vector
+#
+# Usage:
+#   docker compose -f docker-compose.network.yml --env-file ../.env up -d
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Suricata — Network Intrusion Detection / Prevention System
+  # سوريكاتا — نظام كشف / منع التسلل الشبكي
+  # ===========================================================================
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: soc-suricata
+    hostname: suricata
+    restart: unless-stopped
+    # Network mode: host is required for af-packet to see raw traffic
+    # وضع الشبكة: المضيف مطلوب لالتقاط حركة المرور الخام
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    environment:
+      - SURICATA_OPTIONS=-i ${SURICATA_INTERFACE:-eth0} --af-packet
+    volumes:
+      - suricata-logs:/var/log/suricata
+      - suricata-rules:/var/lib/suricata/rules
+      - suricata-config:/etc/suricata
+    # Note: When using network_mode: host, ports are not mapped — Suricata
+    # listens on raw sockets via af-packet, not on TCP/UDP ports.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /var/run/suricata.pid && kill -0 $(cat /var/run/suricata.pid) 2>/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Zeek — Network Security Monitor / Protocol Analyzer
+  # زيك — مراقب أمن الشبكة / محلل البروتوكولات
+  # ===========================================================================
+  zeek:
+    image: zeek/zeek:latest
+    container_name: soc-zeek
+    hostname: zeek
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # Zeek runs in standalone mode sniffing the configured interface
+    command: >
+      zeek -i ${ZEEK_INTERFACE:-eth0}
+      local
+      LogAscii::use_json=T
+    volumes:
+      - zeek-logs:/opt/zeek/logs
+      - zeek-spool:/opt/zeek/spool
+      - zeek-config:/opt/zeek/etc
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pgrep -x zeek > /dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Zookeeper — Coordination service for Kafka
+  # زوكيبر — خدمة التنسيق لكافكا
+  # ===========================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:${KAFKA_VERSION:-7.5.0}
+    container_name: soc-zookeeper
+    hostname: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: ${ZOOKEEPER_PORT:-2181}
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    ports:
+      - "${ZOOKEEPER_PORT:-2181}:2181"
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "echo ruok | nc localhost ${ZOOKEEPER_PORT:-2181} | grep -q imok || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Kafka — Distributed event streaming platform
+  # كافكا — منصة بث الأحداث الموزعة
+  # ===========================================================================
+  kafka:
+    image: confluentinc/cp-kafka:${KAFKA_VERSION:-7.5.0}
+    container_name: soc-kafka
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:${ZOOKEEPER_PORT:-2181}
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://${HOST_IP:-localhost}:${KAFKA_BROKER_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      KAFKA_HEAP_OPTS: ${KAFKA_HEAP_OPTS:--Xms512m -Xmx1g}
+      # Auto-create topics for SOC data streams
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+      - kafka-logs:/var/log/kafka
+    ports:
+      - "${KAFKA_BROKER_PORT:-9092}:9092"
+    networks:
+      - soc-net
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${KAFKA_MEM_LIMIT:-2g}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "kafka-broker-api-versions --bootstrap-server localhost:29092 > /dev/null 2>&1 || exit 1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+
+  # ===========================================================================
+  # Vector — High-performance log shipper and transformer
+  # فيكتور — ناقل ومحول سجلات عالي الأداء
+  # ===========================================================================
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: soc-vector
+    hostname: vector
+    restart: unless-stopped
+    environment:
+      - VECTOR_CONFIG=/etc/vector/vector.yaml
+      - VECTOR_LOG=info
+    volumes:
+      - vector-data:/var/lib/vector
+      # Mount log directories from Suricata and Zeek (via host paths)
+      - suricata-logs:/var/log/suricata:ro
+      - zeek-logs:/opt/zeek/logs:ro
+      # Configuration file — create config/vector/vector.yaml
+      - ../config/vector:/etc/vector:ro
+    ports:
+      # Vector API for health checks and metrics
+      - "8686:8686"
+    networks:
+      - soc-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -sf http://localhost:8686/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+# =============================================================================
+# Volumes — Persistent storage
+# وحدات التخزين — التخزين الدائم
+# =============================================================================
+volumes:
+  suricata-logs:
+    driver: local
+    name: soc-suricata-logs
+  suricata-rules:
+    driver: local
+    name: soc-suricata-rules
+  suricata-config:
+    driver: local
+    name: soc-suricata-config
+  zeek-logs:
+    driver: local
+    name: soc-zeek-logs
+  zeek-spool:
+    driver: local
+    name: soc-zeek-spool
+  zeek-config:
+    driver: local
+    name: soc-zeek-config
+  zookeeper-data:
+    driver: local
+    name: soc-zookeeper-data
+  zookeeper-logs:
+    driver: local
+    name: soc-zookeeper-logs
+  kafka-data:
+    driver: local
+    name: soc-kafka-data
+  kafka-logs:
+    driver: local
+    name: soc-kafka-logs
+  vector-data:
+    driver: local
+    name: soc-vector-data
+
+# =============================================================================
+# Networks — Shared SOC network
+# الشبكات — شبكة مركز العمليات المشتركة
+# =============================================================================
+networks:
+  soc-net:
+    external: true
+    name: soc-net

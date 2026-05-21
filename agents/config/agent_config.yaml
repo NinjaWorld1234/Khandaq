@@ -1,0 +1,154 @@
+# =============================================================================
+# SOC AI Agent Framework - Central Configuration
+# ملف إعدادات إطار عمل وكلاء مركز العمليات الأمنية
+#
+# All values can be overridden by environment variables.
+# See config.py for the mapping: ENV_VAR -> config field.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# OpenSearch / أوبن سيرش
+# ---------------------------------------------------------------------------
+opensearch:
+  hosts:
+    - "https://opensearch:9200"          # OPENSEARCH_HOSTS
+  username: "admin"                       # OPENSEARCH_USER
+  password: "${OPENSEARCH_PASSWORD:-admin}"  # OPENSEARCH_PASSWORD
+  verify_certs: false                     # OPENSEARCH_VERIFY_CERTS
+  ssl_show_warn: false                    # OPENSEARCH_SSL_WARN
+  timeout: 30                             # OPENSEARCH_TIMEOUT
+  max_retries: 3                          # OPENSEARCH_MAX_RETRIES
+  retry_on_timeout: true                  # OPENSEARCH_RETRY_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# Wazuh API / واجهة وازوه
+# ---------------------------------------------------------------------------
+wazuh:
+  url: "https://wazuh-manager:55000"      # WAZUH_API_URL
+  username: "wazuh-wui"                   # WAZUH_API_USER
+  password: "${WAZUH_API_PASSWORD:-wazuh-wui}"  # WAZUH_API_PASSWORD
+  verify_ssl: false                       # WAZUH_VERIFY_SSL
+  timeout: 30                             # WAZUH_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# MISP / منصة مشاركة معلومات التهديدات
+# ---------------------------------------------------------------------------
+misp:
+  url: "https://misp:8443"                # MISP_URL
+  api_key: "${MISP_API_KEY:-}"            # MISP_API_KEY
+  verify_ssl: false                       # MISP_VERIFY_SSL
+  timeout: 30                             # MISP_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# DFIR-IRIS / آيريس للاستجابة للحوادث
+# ---------------------------------------------------------------------------
+iris:
+  url: "https://iris:8443"                # IRIS_URL
+  api_key: "${IRIS_API_KEY:-}"            # IRIS_API_KEY
+  verify_ssl: false                       # IRIS_VERIFY_SSL
+  timeout: 30                             # IRIS_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# Ollama LLM / نموذج اللغة الكبير
+# ---------------------------------------------------------------------------
+ollama:
+  url: "http://ollama:11434"              # OLLAMA_URL
+  model: "llama3"                         # OLLAMA_MODEL
+  timeout: 120                            # OLLAMA_TIMEOUT (seconds)
+  max_tokens: 2048                        # OLLAMA_MAX_TOKENS
+  temperature: 0.1                        # OLLAMA_TEMPERATURE
+
+# ---------------------------------------------------------------------------
+# Redis / ريدس (message bus)
+# ---------------------------------------------------------------------------
+redis:
+  host: "redis"                           # REDIS_HOST
+  port: 6379                              # REDIS_PORT
+  db: 0                                   # REDIS_DB
+  password: "${REDIS_PASSWORD:-}"         # REDIS_PASSWORD
+  socket_timeout: 10                      # REDIS_SOCKET_TIMEOUT
+
+# ---------------------------------------------------------------------------
+# Alerting / التنبيهات
+# ---------------------------------------------------------------------------
+alerting:
+  rate_limit_seconds: 300                 # Don't repeat same alert within 5 min
+  log_to_opensearch: true                 # Log all alerts to OpenSearch
+  alert_index: "soc-alerts"               # OpenSearch index for alerts
+
+  # Slack webhook / سلاك
+  slack:
+    enabled: false                        # SLACK_ENABLED
+    webhook_url: "${SLACK_WEBHOOK_URL:-}" # SLACK_WEBHOOK_URL
+    channel: "#soc-alerts"                # SLACK_CHANNEL
+
+  # Telegram bot / تليغرام
+  telegram:
+    enabled: false                        # TELEGRAM_ENABLED
+    bot_token: "${TELEGRAM_BOT_TOKEN:-}" # TELEGRAM_BOT_TOKEN
+    chat_id: "${TELEGRAM_CHAT_ID:-}"     # TELEGRAM_CHAT_ID
+
+  # Email (SMTP) / البريد الإلكتروني
+  smtp:
+    host: "smtp.example.com"              # SMTP_HOST
+    port: 587                             # SMTP_PORT
+    username: ""                          # SMTP_USER
+    password: ""                          # SMTP_PASSWORD
+    from_addr: "soc@example.com"          # SMTP_FROM
+    to_addrs: []                          # List of recipient emails
+    use_tls: true                         # SMTP_TLS
+
+# ---------------------------------------------------------------------------
+# Agent Thresholds / عتبات الوكلاء
+# ---------------------------------------------------------------------------
+thresholds:
+  # Brute Force detection (W37)
+  brute_force_fast_threshold: 10          # Max failures before alert (fast)
+  brute_force_fast_window_min: 5          # Time window in minutes (fast)
+  brute_force_slow_threshold: 20          # Max failures before alert (slow)
+  brute_force_slow_window_hours: 24       # Time window in hours (slow)
+  brute_force_distributed_ips: 5          # Unique IPs targeting same account
+  brute_force_distributed_window_min: 60  # Time window in minutes (distributed)
+  brute_force_spray_accounts: 10          # Accounts targeted by same IP
+  brute_force_spray_window_min: 60        # Time window in minutes (spray)
+
+  # Log Tampering detection (W12)
+  log_drop_critical_pct: 100.0            # 100% drop = CRITICAL
+  log_drop_high_pct: 70.0                 # 70% drop = HIGH
+  log_baseline_days: 7                    # Baseline calculation period
+
+  # General
+  health_check_timeout: 10                # Seconds before health check timeout
+
+# ---------------------------------------------------------------------------
+# Prometheus Metrics / مقاييس بروميثيوس
+# ---------------------------------------------------------------------------
+metrics:
+  enabled: true                           # METRICS_ENABLED
+  port: 9100                              # METRICS_PORT
+
+# ---------------------------------------------------------------------------
+# Agent-Specific Overrides / إعدادات خاصة بكل وكيل
+# ---------------------------------------------------------------------------
+agents:
+  w37_brute_force:
+    alert_index: "wazuh-alerts-*"
+    auto_block: false                     # Set true to auto-block attacking IPs
+    block_duration_min: 60
+    src_ip_field: "data.srcip"
+    target_user_field: "data.dstuser"
+    event_id_field: "data.id"
+    ip_whitelist:
+      - "127.0.0.1"
+      - "::1"
+      # Add internal scanner IPs here
+
+  w12_log_tampering:
+    log_index: "wazuh-alerts-*"
+    host_field: "agent.name"
+    min_baseline_events_hr: 10
+    host_whitelist: []
+    # Add test/lab hosts to skip here
+
+  w46_system_health:
+    kafka_rest_url: "http://kafka:8082"
