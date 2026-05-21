@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script to pull and save all Docker images offline for Air-Gapped deployment on Linux
 
-COMPOSE_DIR="./compose"
+COMPOSE_DIR="./docker"
 EXPORT_DIR="./soc_offline_images"
 
 echo "Checking export directory: $EXPORT_DIR"
