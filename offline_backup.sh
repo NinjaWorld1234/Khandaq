@@ -9,13 +9,16 @@ mkdir -p "$EXPORT_DIR"
 
 # Find all docker-compose.yml files and extract image names
 echo "Extracting image names from docker-compose files..."
-IMAGES=$(grep -r "^\s*image:" "$COMPOSE_DIR" | awk '{print $3}' | tr -d '"' | tr -d "'" | sort | uniq)
+IMAGES=$(grep -r "^\s*image:" "$COMPOSE_DIR" | awk '{print $3}' | tr -d '"' | tr -d "'" | grep -E -v "soc-ai-agents|greenbone|tpotce" | sort | uniq)
 
 IMAGE_COUNT=$(echo "$IMAGES" | wc -w)
 echo "Found $IMAGE_COUNT unique images to download."
 echo "------------------------------------------------"
 
-for IMG in $IMAGES; do
+for RAW_IMG in $IMAGES; do
+    # Resolve Docker Compose variables like ${VERSION:-latest} to latest
+    IMG=$(echo "$RAW_IMG" | sed -E 's/\$\{[^:]+:-([^}]+)\}/\1/g')
+    
     echo -e "\e[36mPulling image: $IMG ...\e[0m"
     docker pull "$IMG"
     

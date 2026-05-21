@@ -307,7 +307,7 @@ services:
   # إنتل أول — أتمتة استخبارات التهديدات
   # ===========================================================================
   intelowl:
-    image: intelowlproject/intelowl:latest
+    image: intelowl/intelowl:latest
     container_name: soc-intelowl
     hostname: intelowl
     restart: unless-stopped
@@ -371,7 +371,7 @@ services:
   # إدارة حالات الاستجابة للحوادث
   # ===========================================================================
   dfir-iris:
-    image: ghcr.io/dfir-iris/iriswebapp:latest
+    image: dfir-iris/iris-webapp:latest
     container_name: soc-dfir-iris
     hostname: dfir-iris
     restart: unless-stopped
@@ -437,7 +437,7 @@ services:
   # شافل — تنسيق وأتمتة واستجابة أمنية
   # ===========================================================================
   shuffle-backend:
-    image: shuffleproject/shuffle-backend:latest
+    image: frikky/shuffle:backend
     container_name: soc-shuffle-backend
     hostname: shuffle-backend
     restart: unless-stopped
@@ -475,7 +475,7 @@ services:
       start_period: 60s
 
   shuffle-frontend:
-    image: shuffleproject/shuffle-frontend:latest
+    image: frikky/shuffle:frontend
     container_name: soc-shuffle-frontend
     hostname: shuffle-frontend
     restart: unless-stopped
@@ -505,7 +505,7 @@ services:
       start_period: 30s
 
   shuffle-orborus:
-    image: shuffleproject/shuffle-orborus:latest
+    image: frikky/shuffle:orborus
     container_name: soc-shuffle-orborus
     hostname: shuffle-orborus
     restart: unless-stopped
@@ -513,7 +513,7 @@ services:
       - SHUFFLE_WORKER_VERSION=latest
       - BASE_URL=http://shuffle-backend:5001
       - DOCKER_API_VERSION=1.40
-      - SHUFFLE_BASE_IMAGE_NAME=shuffleproject
+      - SHUFFLE_BASE_IMAGE_NAME=frikky
       - SHUFFLE_APP_SDK_VERSION=latest
       - ENVIRONMENT_NAME=soc-shuffle
       - ORG_ID=soc-org
