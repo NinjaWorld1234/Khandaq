@@ -1,0 +1,39 @@
+###############################################################################
+# Khandaq Dark Server - Outbound WireGuard Tunnel
+# خندق (السيرفر المظلم) - نفق الاتصال الصادر
+#
+# Usage: Run this on the MAIN Khandaq server. It connects outward to the Decoy VPS.
+# الاستخدام: يعمل على سيرفر خندق الأساسي للاتصال بالخادم التمويهي في الخارج.
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # WireGuard Client: Connects securely to the Labyrinth Node
+  # عميل الاتصال: يتصل بالسيرفر الوهمي الخارجي لسحب سجلات الهجمات دون فتح منافذ
+  # ===========================================================================
+  wireguard-client:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: khandaq-wg-client
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Riyadh
+    volumes:
+      # You must place the wg0.conf generated from the VPS into this config folder
+      # يجب وضع ملف الإعدادات wg0.conf المستخرج من السيرفر الوهمي هنا
+      - ./config/wireguard-client:/config
+      - /lib/modules:/lib/modules
+    # Connect this to the main SOC network so internal agents can reach the tunnel
+    networks:
+      - soc-net
+    restart: unless-stopped
+
+networks:
+  soc-net:
+    external: true
+    name: soc-net

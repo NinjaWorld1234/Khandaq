@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Set
 from shared.base_agent import BaseAgent
 from shared.config import SOCConfig
 from shared.alerter import Severity
+from shared.llm_client import LLMClient
 
 logger = logging.getLogger("soc.supervisor.detection")
 
@@ -63,6 +64,9 @@ class DetectionSupervisor(BaseAgent):
         self._insider_risks: Dict[str, float] = {}
         self._escalated_keys: Dict[str, float] = {}
         self._escalate_cooldown = 300  # 5 min
+        
+        # Initialize LLM Client for RAG Analysis
+        self._llm = LLMClient(config=self.config)
 
     # ------------------------------------------------------------------
     # Redis message handler
@@ -228,6 +232,9 @@ class DetectionSupervisor(BaseAgent):
             try:
                 f = action["finding"]
                 if action["action"] == "escalate_to_commander":
+                    # Perform RAG AI Analysis before escalating
+                    ai_analysis = self._llm.rag_analyze_alert(f, self.os_client)
+                    
                     payload = {
                         "supervisor": self.name,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -237,6 +244,7 @@ class DetectionSupervisor(BaseAgent):
                             else str(f.get("severity")),
                         "host": f.get("host", ""),
                         "details": f.get("details", ""),
+                        "ai_analysis": ai_analysis,
                     }
                     self.redis_bus.publish(
                         "soc:supervisor-to-commander", payload,

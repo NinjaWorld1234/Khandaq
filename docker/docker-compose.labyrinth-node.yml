@@ -1,0 +1,90 @@
+###############################################################################
+# Khandaq Labyrinth Node - Decoy VPS Configuration
+# عقدة المتاهة - سيرفر الفخ الخارجي
+#
+# Warning: Do NOT run this on your main SOC server. This is ONLY for external VPS.
+# تحذير: لا تقم بتشغيل هذا الملف على سيرفر خندق الأساسي. هذا مخصص فقط للخوادم الوهمية الخارجية.
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # WireGuard Server: The secure tunnel endpoint that Khandaq connects to.
+  # سيرفر النفق: لاستقبال اتصال سيرفر خندق بشكل مشفر دون فتح منافذ في خندق
+  # ===========================================================================
+  wireguard:
+    image: lscr.io/linuxserver/wireguard:latest
+    container_name: labyrinth-wireguard
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Riyadh
+      - SERVERURL=auto # Optional IP if known
+      - SERVERPORT=51820
+      - PEERS=khandaq-core # Creates client config for the core server
+      - PEERDNS=auto
+      - INTERNAL_SUBNET=10.99.99.0 # Labyrinth Tunnel Subnet
+      - ALLOWEDIPS=0.0.0.0/0
+    volumes:
+      - labyrinth-wg-config:/config
+      - /lib/modules:/lib/modules
+    ports:
+      - "51820:51820/udp"
+    restart: unless-stopped
+
+  # ===========================================================================
+  # Cowrie: SSH and Telnet Honeypot to catch brute force and login attempts.
+  # مصيدة كاوري: لاصطياد محاولات اختراق SSH وتوثيق كلمات المرور المستخدمة
+  # ===========================================================================
+  cowrie:
+    image: cowrie/cowrie:latest
+    container_name: labyrinth-cowrie
+    restart: unless-stopped
+    ports:
+      - "22:2222" # VPS port 22 mapped to cowrie 2222 (Ensure real SSH is moved to 2222 or similar!)
+      - "23:2223"
+    volumes:
+      - labyrinth-cowrie-logs:/cowrie/cowrie-git/var/log/cowrie
+      # Mount the fake filesystem so the attacker finds the Zip Bomb & Canary
+      - /root/khandaq-labyrinth/honeyfs:/cowrie/cowrie-git/honeyfs
+
+  # ===========================================================================
+  # Web Tarpit: Malicious Active Defense for web scanners
+  # سيرفر التسميم: لتجميد ماسحات الويب وإرسال أكواد خبيثة معاكسة للهاكر
+  # ===========================================================================
+  web-tarpit:
+    build: 
+      context: ./tarpit
+    container_name: labyrinth-tarpit
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "8080:80"
+    
+  # ===========================================================================
+  # Dionaea: Malware catching honeypot (SMB, HTTP, FTP, etc).
+  # مصيدة ديونايا: لاصطياد البرمجيات الخبيثة ومحاولات الاستغلال عبر الشبكة
+  # ===========================================================================
+  dionaea:
+    image: dinotools/dionaea:latest
+    container_name: labyrinth-dionaea
+    restart: unless-stopped
+    ports:
+      - "21:21"
+      - "42:42"
+      # Removed 80/443 because Tarpit took over them
+      - "443:443"
+      - "445:445"
+      - "1433:1433"
+      - "3306:3306"
+    volumes:
+      - labyrinth-dionaea-logs:/opt/dionaea/var/log/dionaea
+
+volumes:
+  labyrinth-wg-config:
+  labyrinth-cowrie-logs:
+  labyrinth-dionaea-logs:

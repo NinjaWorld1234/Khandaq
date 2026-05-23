@@ -126,6 +126,52 @@ class LLMClient:
         logger.info("Analyzing alert via LLM: %s", alert_data.get("title", "unknown"))
         return self._generate(prompt, system_prompt=self._SYSTEM_SOC)
 
+    def rag_analyze_alert(self, alert_data: dict[str, Any], os_client: Any) -> str:
+        """
+        RAG-enhanced analysis. Fetches similar/recent alerts from OpenSearch 
+        before sending to the LLM to provide historical context.
+        
+        Args:
+            alert_data: The current alert dict.
+            os_client: OpenSearchClient instance.
+            
+        Returns:
+            Free-text analysis string.
+        """
+        try:
+            # Simple RAG implementation: fetch alerts from same host or IP in last 24h
+            host = alert_data.get("host", "unknown")
+            if host != "unknown":
+                query = {"match": {"host": host}}
+                recent_alerts = os_client.get_events_since(
+                    index="wazuh-alerts-*", 
+                    minutes=1440, 
+                    query=query, 
+                    size=10
+                )
+            else:
+                recent_alerts = []
+                
+            context_str = json.dumps([a.get("description", "") for a in recent_alerts], indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"RAG context fetch failed: {e}")
+            context_str = "[]"
+
+        prompt = (
+            "Analyze the following security alert using the provided historical context.\n\n"
+            "**Task**:\n"
+            "1. **Threat Assessment**: What is happening?\n"
+            "2. **Context Correlation**: How does this relate to the historical alerts on this host?\n"
+            "3. **Risk Level**: LOW / MEDIUM / HIGH / CRITICAL\n"
+            "4. **Recommended Actions**: Specific playbook steps.\n\n"
+            f"**Current Alert Data**:\n```json\n{json.dumps(alert_data, indent=2, default=str)}\n```\n\n"
+            f"**Historical Context (Last 24h on same host)**:\n```json\n{context_str}\n```"
+        )
+        
+        logger.info("RAG Analyzing alert via LLM: %s with %d historical events", 
+                    alert_data.get("title", "unknown"), len(recent_alerts) if 'recent_alerts' in locals() else 0)
+        return self._generate(prompt, system_prompt=self._SYSTEM_SOC)
+
     def generate_report(self, events: list[dict[str, Any]]) -> str:
         """
         Generate a summary report from a collection of events.

@@ -66,9 +66,12 @@ class CommanderAgent(BaseAgent):
         # Active incidents
         self._active_incidents: Dict[str, Dict[str, Any]] = {}
 
-        # Dedup
-        self._escalated_keys: Dict[str, float] = {}
-        self._cooldown = 300
+        # HITL (Human-in-the-Loop) Authorizations
+        self._pending_auths: Dict[str, Dict[str, Any]] = {}
+        self._auth_timeout_seconds = 3600  # 60 minutes
+        
+        # Red Line Definition (Servers)
+        self._red_line_keywords = ["khandaq", "srv-", "server", "db-", "opensearch", "10.99."]
 
         # Statistics
         self._total_escalations = 0
@@ -97,6 +100,14 @@ class CommanderAgent(BaseAgent):
 
     def collect(self) -> List[Dict[str, Any]]:
         now = time.time()
+        
+        # Clean up expired HITL authorizations
+        expired_auths = [auth_id for auth_id, data in self._pending_auths.items() 
+                         if now - data["timestamp"] > self._auth_timeout_seconds]
+        for auth_id in expired_auths:
+            logger.warning(f"HITL Authorization {auth_id} expired. Dropping action.")
+            del self._pending_auths[auth_id]
+
         # Keep last 15 minutes of reports
         self._supervisor_reports = [
             r for r in self._supervisor_reports
@@ -297,40 +308,59 @@ class CommanderAgent(BaseAgent):
                     )
                     results["paged"] += 1
 
-                elif act_type == "isolate_host":
-                    host = action["host"]
-                    try:
-                        self.wazuh_client.active_response(
-                            command="firewall-drop",
-                            agent_name=host,
-                            alert={
-                                "reason": "Commander isolation order",
-                                "type": action["finding"].get("type", ""),
+                elif act_type in ["isolate_host", "trigger_ir_playbook"]:
+                    f = action.get("finding", {})
+                    host = action.get("host") or f.get("host", "Unknown")
+                    
+                    # Check if the host is a Core Server (RED LINE)
+                    is_red_line = False
+                    if act_type == "trigger_ir_playbook":
+                        is_red_line = True # Playbooks always touch servers
+                    else:
+                        is_red_line = any(kw in host.lower() for kw in self._red_line_keywords)
+                    
+                    if not is_red_line:
+                        # Employee Endpoint -> Autonomous Action + Notification
+                        self.alerter.send_alert(
+                            severity=Severity.HIGH,
+                            title=f"🛡️ AUTO-ISOLATION: Employee Host '{host}'",
+                            details={
+                                "host": host,
+                                "reason": f.get("details", ""),
+                                "note": "Commander acted autonomously because the target is a standard employee endpoint, not a core server."
                             },
+                            agent_name="commander",
                         )
-                    except Exception:
-                        pass  # Wazuh may not be reachable
-                    # Log the isolation order
-                    self.os_client.index_document("soc-commander-actions", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "action": "isolate_host",
-                        "host": host,
-                        "reason": action["finding"].get("details", ""),
-                        "threat_level": self._threat_level,
-                    })
-                    results["isolations"] += 1
-                    logger.warning("🔒 ISOLATION ORDER for %s", host)
+                        self._execute_isolation(action)
+                        results["isolations"] += 1
+                        continue
 
-                elif act_type == "trigger_ir_playbook":
-                    f = action["finding"]
-                    self.redis_bus.publish("soc:response-supervisor", {
-                        "source_agent": "commander",
-                        "type": "ir_playbook_trigger",
-                        "host": f.get("host", ""),
-                        "incident_type": f.get("type", ""),
-                        "severity": "CRITICAL",
-                    }, sender=self.name, message_type="ir_command")
-                    results["playbooks"] += 1
+                    # RED LINE -> HUMAN-IN-THE-LOOP (HITL) Logic
+                    import uuid
+                    auth_id = str(uuid.uuid4())[:8] # Short 8-char ID
+                    
+                    self._pending_auths[auth_id] = {
+                        "timestamp": time.time(),
+                        "action": action
+                    }
+                    
+                    self.alerter.send_alert(
+                        severity=Severity.CRITICAL,
+                        title=f"⚠️ RED LINE AUTHORIZATION REQUIRED: {act_type.upper()}",
+                        details={
+                            "auth_id": auth_id,
+                            "action_type": act_type,
+                            "host": host,
+                            "reason": f.get("details", ""),
+                            "instructions": f"Run 'python scripts/authorize.py {auth_id} approve' to execute."
+                        },
+                        agent_name="commander",
+                    )
+                    logger.warning(f"RED LINE Action {act_type} for {host} frozen. Awaiting HITL Auth ID: {auth_id}")
+                    if act_type == "isolate_host":
+                        results["isolations"] += 1
+                    else:
+                        results["playbooks"] += 1
 
                 elif act_type == "update_threat_level":
                     self.redis_bus.publish("soc:commander-broadcast", {
@@ -367,10 +397,73 @@ class CommanderAgent(BaseAgent):
                 logger.error("Commander action failed (%s): %s", action.get("action"), exc)
 
         if results["paged"] or results["isolations"]:
-            logger.info("Commander cycle: paged=%d, isolations=%d, playbooks=%d, level_changes=%d",
+            logger.info("Commander cycle: paged=%d, isolations(frozen)=%d, playbooks(frozen)=%d, level_changes=%d",
                         results["paged"], results["isolations"],
                         results["playbooks"], results["level_changes"])
         return results
+
+    # ------------------------------------------------------------------
+    # HITL Execution Helpers
+    # ------------------------------------------------------------------
+
+    def _execute_isolation(self, action: Dict[str, Any]) -> None:
+        host = action.get("host", "")
+        try:
+            self.wazuh_client.active_response(
+                command="firewall-drop",
+                agent_name=host,
+                alert={
+                    "reason": "Commander isolation order (HITL Approved)",
+                    "type": action.get("finding", {}).get("type", ""),
+                },
+            )
+        except Exception:
+            pass
+        self.os_client.index_document("soc-commander-actions", {
+            "@timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": "isolate_host",
+            "host": host,
+            "reason": action.get("finding", {}).get("details", ""),
+            "threat_level": self._threat_level,
+        })
+        logger.warning("🔒 ISOLATION ORDER EXECUTED for %s", host)
+
+    def _execute_ir_playbook(self, action: Dict[str, Any]) -> None:
+        f = action.get("finding", {})
+        self.redis_bus.publish("soc:response-supervisor", {
+            "source_agent": "commander",
+            "type": "ir_playbook_trigger",
+            "host": f.get("host", ""),
+            "incident_type": f.get("type", ""),
+            "severity": "CRITICAL",
+        }, sender=self.name, message_type="ir_command")
+        logger.warning("🚨 IR PLAYBOOK EXECUTED for %s", f.get("host", ""))
+
+    def _on_human_auth_message(self, message: dict) -> None:
+        try:
+            data = message if isinstance(message, dict) else json.loads(message)
+            auth_id = data.get("auth_id")
+            decision = data.get("decision", "").lower()
+            
+            if auth_id in self._pending_auths:
+                pending = self._pending_auths[auth_id]
+                action = pending["action"]
+                
+                if decision == "approve":
+                    logger.info(f"✅ HITL APPROVAL received for {auth_id}. Executing action {action['action']}.")
+                    if action["action"] == "isolate_host":
+                        self._execute_isolation(action)
+                    elif action["action"] == "trigger_ir_playbook":
+                        self._execute_ir_playbook(action)
+                        
+                elif decision == "reject":
+                    logger.info(f"❌ HITL REJECTION received for {auth_id}. Action dropped.")
+                
+                del self._pending_auths[auth_id]
+            else:
+                logger.warning(f"Received HITL response for unknown or expired Auth ID: {auth_id}")
+        except Exception as exc:
+            logger.error("Failed to parse human auth message: %s", exc)
 
     # ------------------------------------------------------------------
     # Threat level management
@@ -449,7 +542,10 @@ class CommanderAgent(BaseAgent):
         self.redis_bus.subscribe(
             "soc:supervisor-to-commander", self._on_supervisor_message
         )
-        logger.info("🏰 Commander Agent online | Threat Level: %s", self._threat_level)
+        self.redis_bus.subscribe(
+            "soc:human-auth", self._on_human_auth_message
+        )
+        logger.info("🏰 Commander Agent online | Threat Level: %s | HITL Enforced", self._threat_level)
         super().run_loop()
 
 

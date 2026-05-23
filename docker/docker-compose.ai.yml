@@ -30,11 +30,11 @@ services:
       resources:
         limits:
           memory: ${OLLAMA_MEM_LIMIT:-8g}
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+#        reservations:
+#          devices:
+#            - driver: nvidia
+#              count: all
+#              capabilities: [gpu]
     volumes:
       - ollama-models:/root/.ollama
     ports:
@@ -57,12 +57,12 @@ services:
       start_period: 30s
 
   # ===========================================================================
-  # Redis — Message queue for AI agent communication
-  # ريديس — قائمة رسائل لتواصل وكلاء الذكاء الاصطناعي
+  # Redis Primary — Message queue for AI agent communication
+  # ريديس الأساسي — قائمة رسائل لتواصل وكلاء الذكاء الاصطناعي
   # ===========================================================================
   redis:
     image: redis:7-alpine
-    container_name: soc-redis-ai
+    container_name: soc-redis-ai-primary
     hostname: redis-ai
     restart: unless-stopped
     command: >
@@ -97,6 +97,34 @@ services:
       start_period: 10s
 
   # ===========================================================================
+  # Redis Replica — High Availability for Message queue
+  # ريديس الاحتياطي — لضمان استمرارية التواصل بين الوكلاء إذا سقط الأساسي
+  # ===========================================================================
+  redis-replica:
+    image: redis:7-alpine
+    container_name: soc-redis-ai-replica
+    hostname: redis-ai-replica
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_AI_PASSWORD:-Ch@ngeMe_Redis_AI_2024!}
+      --masterauth ${REDIS_AI_PASSWORD:-Ch@ngeMe_Redis_AI_2024!}
+      --replicaof redis-ai 6379
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-ai-replica-data:/data
+    networks:
+      - soc-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ===========================================================================
   # AI Agents — Custom SOC AI agents (52 agents)
   # وكلاء الذكاء الاصطناعي — وكلاء ذكاء اصطناعي مخصصون (52 وكيل)
   # ===========================================================================
@@ -111,7 +139,7 @@ services:
     environment:
       # Ollama connection / اتصال أولاما
       - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=${AI_AGENTS_OLLAMA_MODEL:-mistral}
+      - OLLAMA_MODEL=${AI_AGENTS_OLLAMA_MODEL:-llama3}
       # Redis connection / اتصال ريديس
       - REDIS_HOST=redis-ai
       - REDIS_PORT=6379
@@ -123,15 +151,17 @@ services:
       - WAZUH_API_URL=https://wazuh-manager:55000
       - WAZUH_API_USER=${WAZUH_API_USER:-wazuh-wui}
       - WAZUH_API_PASSWORD=${WAZUH_API_PASSWORD:-Ch@ngeMe_Wazuh_API_2024!}
-      # MISP connection / اتصال منصة مشاركة المعلومات
-      - MISP_URL=https://misp:443
       # Agent configuration / إعدادات الوكلاء
       - LOG_LEVEL=${AI_AGENTS_LOG_LEVEL:-INFO}
       - WORKERS=${AI_AGENTS_WORKERS:-4}
       - TZ=${TZ:-Asia/Riyadh}
+      - HUGGINGFACE_HUB_CACHE=/app/.cache/huggingface
     volumes:
       - ai-agents-data:/app/data
       - ai-agents-logs:/app/logs
+      - ai-agents-hf-cache:/app/.cache/huggingface
+      - soc-intel-data:/app/data/intel_feeds:ro
+      - ../soc_models:/app/models
     networks:
       - soc-net
     depends_on:
@@ -139,6 +169,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      redis-replica:
+        condition: service_started
     deploy:
       resources:
         limits:
@@ -167,12 +199,21 @@ volumes:
   redis-ai-data:
     driver: local
     name: soc-redis-ai-data
+  redis-ai-replica-data:
+    driver: local
+    name: soc-redis-ai-replica-data
   ai-agents-data:
     driver: local
     name: soc-ai-agents-data
   ai-agents-logs:
     driver: local
     name: soc-ai-agents-logs
+  ai-agents-hf-cache:
+    driver: local
+    name: soc-ai-agents-hf-cache
+  soc-intel-data:
+    external: true
+    name: soc-intel-data
 
 # =============================================================================
 # Networks — Shared SOC network
