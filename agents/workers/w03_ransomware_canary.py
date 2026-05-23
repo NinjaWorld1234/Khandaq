@@ -107,6 +107,7 @@ class RansomwareCanaryAgent(BaseAgent):
             description="Ransomware Early Warning Agent – canary files and behavioral detection",
             interval_seconds=30,
             config=config,
+            supervisor_channel="soc:endpoint-supervisor",
         )
         self._wazuh: Optional[WazuhClient] = None
 

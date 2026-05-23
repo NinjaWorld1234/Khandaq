@@ -16,7 +16,7 @@ services:
   # سوريكاتا — نظام كشف / منع التسلل الشبكي
   # ===========================================================================
   suricata:
-    image: jasonish/suricata:latest
+    image: jasonish/suricata:${SURICATA_VERSION:-7.0.6}
     container_name: soc-suricata
     hostname: suricata
     restart: unless-stopped
@@ -51,7 +51,7 @@ services:
   # زيك — مراقب أمن الشبكة / محلل البروتوكولات
   # ===========================================================================
   zeek:
-    image: zeek/zeek:latest
+    image: zeek/zeek:${ZEEK_VERSION:-7.0.0}
     container_name: soc-zeek
     hostname: zeek
     restart: unless-stopped
@@ -168,7 +168,7 @@ services:
   # فيكتور — ناقل ومحول سجلات عالي الأداء
   # ===========================================================================
   vector:
-    image: timberio/vector:latest-alpine
+    image: timberio/vector:${VECTOR_VERSION:-0.40.0-alpine}
     container_name: soc-vector
     hostname: vector
     restart: unless-stopped

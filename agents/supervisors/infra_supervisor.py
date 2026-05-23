@@ -61,12 +61,12 @@ logger = logging.getLogger("soc.agent.s01_infra_supervisor")
 # Redis channels this supervisor subscribes to
 # قنوات ريديس التي يشترك فيها المشرف
 WORKER_CHANNELS: dict[str, str] = {
-    "W12": "soc:agent-to-supervisor",  # All workers report on the shared channel
-    "W37": "soc:agent-to-supervisor",
-    "W36": "soc:agent-to-supervisor",
-    "W29": "soc:agent-to-supervisor",
-    "W43": "soc:agent-to-supervisor",
-    "W46": "soc:agent-to-supervisor",
+    "W12": "soc:infra-supervisor",  # All infra workers report on the dedicated channel
+    "W37": "soc:infra-supervisor",
+    "W36": "soc:infra-supervisor",
+    "W29": "soc:infra-supervisor",
+    "W43": "soc:infra-supervisor",
+    "W46": "soc:infra-supervisor",
 }
 
 # Worker name mapping for identification in messages
@@ -190,9 +190,9 @@ class InfraSupervisor(BaseAgent):
             )
 
         try:
-            self.redis_bus.subscribe("soc:agent-to-supervisor", _on_message)
+            self.redis_bus.subscribe("soc:infra-supervisor", _on_message)
             self._subscriber_started = True
-            logger.info("📡 Subscribed to agent-to-supervisor channel")
+            logger.info("📡 Subscribed to soc:infra-supervisor channel")
         except Exception as exc:
             logger.error("Failed to subscribe to worker channel: %s", exc)
 
@@ -448,8 +448,9 @@ class InfraSupervisor(BaseAgent):
                     self.redis_bus.escalate_to_commander(
                         sender=self.name,
                         payload={
-                            "title": action["title"],
+                            "type": action["details"].get("correlation_rule", "infrastructure_alert"),
                             "severity": action["severity"].name,
+                            "host": action["details"].get("hostname") or action["details"].get("source_ip", ""),
                             "details": action["details"],
                         },
                     )
@@ -500,10 +501,19 @@ class InfraSupervisor(BaseAgent):
         }
 
         if any(v > 0 for v in result.values()):
-            self.report_to_supervisor({
-                "type": "supervisor_report",
-                **result,
-            })
+            try:
+                self.redis_bus.publish(
+                    channel=CHANNEL_SUPERVISOR_TO_COMMANDER,
+                    payload={
+                        "type": "supervisor_report",
+                        "supervisor": self.name,
+                        **result,
+                    },
+                    sender=self.name,
+                    message_type="supervisor_summary",
+                )
+            except Exception as exc:
+                logger.error("Failed to report to commander: %s", exc)
 
         return result
 

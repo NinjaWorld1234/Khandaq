@@ -1,21 +1,18 @@
-import time
 import logging
 from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W01-ProcessBehavior")
 
 class ProcessBehaviorAgent(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self):
         super().__init__(
             name="W01_ProcessBehavior",
             description="Monitors process creation for suspicious parent-child chains and LOLBins",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=30
+            interval_seconds=30,
+            supervisor_channel="soc:endpoint-supervisor"
         )
-        self.config = SOCConfig()
         self.known_bad_pairs = {
             "winword.exe": ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe"],
             "excel.exe": ["cmd.exe", "powershell.exe", "wscript.exe", "cscript.exe"],
@@ -141,10 +138,5 @@ class ProcessBehaviorAgent(BaseAgent):
         return results
 
 if __name__ == "__main__":
-    agent = ProcessBehaviorAgent(supervisor_queue="soc:endpoint-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = ProcessBehaviorAgent()
+    agent.run_loop()

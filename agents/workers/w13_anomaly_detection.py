@@ -153,6 +153,7 @@ class AnomalyDetectionAgent(BaseAgent):
             description="Statistical Anomaly Detection – OpenSearch AD plugin + local Z-score/IQR",
             interval_seconds=300,
             config=config,
+            supervisor_channel="soc:detection-supervisor",
         )
 
         # Detector ID registry: detector_name → OpenSearch detector_id

@@ -41,6 +41,7 @@ class LogTamperingAgent(BaseAgent):
             description="Log Tampering Detection - monitors event volume per host for anomalies",
             interval_seconds=300,  # 5 minutes
             config=config,
+            supervisor_channel="soc:infra-supervisor",
         )
         # Thresholds from config
         thresholds = self.config.thresholds

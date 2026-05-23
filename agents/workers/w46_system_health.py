@@ -48,6 +48,7 @@ class SystemHealthAgent(BaseAgent):
             description="SOC Platform Health Monitor - monitors all SOC components",
             interval_seconds=60,
             config=config,
+            supervisor_channel="soc:infra-supervisor",
         )
         self._wazuh: Optional[WazuhClient] = None
         self._http = httpx.Client(timeout=10, verify=False)

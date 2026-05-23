@@ -1,22 +1,20 @@
-import json
-import time
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
+from shared.config import SOCConfig
 
 logger = logging.getLogger("NetworkSupervisor")
 
 class NetworkSupervisor(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self, config: Optional[SOCConfig] = None):
         super().__init__(
             name="NetworkSupervisor",
             description="Supervises network-focused agents and correlates events",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=10
+            interval_seconds=10,
+            config=config,
+            supervisor_channel="soc:network-supervisor"
         )
-        self.config = SOCConfig()
         self.managed_workers = ["W06_DNSTunneling", "W07_C2Beaconing", "W08_DataExfiltration"]
         self.recent_alerts = [] # Keep a sliding window of alerts in memory
 
@@ -96,10 +94,14 @@ class NetworkSupervisor(BaseAgent):
         results = {"escalated": 0, "blocked": 0}
         for action in actions:
             if action["action"] == "escalate":
-                self.redis_bus.publish("soc:supervisor-to-commander", json.dumps({
+                f = action["data"]
+                self.redis_bus.publish("soc:supervisor-to-commander", {
                     "supervisor": self.name,
-                    "alert": action["data"]
-                }))
+                    "type": f.get("type"),
+                    "severity": f.get("severity").name if hasattr(f.get("severity"), "name") else str(f.get("severity")),
+                    "host": f.get("src_ip", ""),
+                    "details": f.get("details", "")
+                }, sender=self.name, message_type="escalation")
                 results["escalated"] += 1
             elif action["action"] == "block_ip":
                 try:
@@ -113,13 +115,12 @@ class NetworkSupervisor(BaseAgent):
                     logger.error(f"Failed to block IP: {e}")
         return results
 
-    def handle_worker_message(self, message: str):
+    def handle_worker_message(self, message: dict):
         try:
-            data = json.loads(message)
-            source = data.get("source_agent")
+            source = message.get("source_agent")
             if source in self.managed_workers:
                 logger.info(f"Received alert from {source}")
-                alert_data = data.get("data", {})
+                alert_data = message.get("data", {})
                 alert_data["agent_source"] = source
                 self.recent_alerts.append(alert_data)
         except Exception as e:
@@ -127,16 +128,10 @@ class NetworkSupervisor(BaseAgent):
 
     def run_loop(self):
         # Subscribe to worker channel
-        self.redis_bus.subscribe(self.supervisor_queue, self.handle_worker_message)
+        self.redis_bus.subscribe(self.supervisor_channel, self.handle_worker_message)
         # Call base run_loop
         super().run_loop()
 
 if __name__ == "__main__":
-    # Typically spawned by main.py, but can be run standalone
-    agent = NetworkSupervisor(supervisor_queue="soc:network-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = NetworkSupervisor()
+    agent.run_loop()

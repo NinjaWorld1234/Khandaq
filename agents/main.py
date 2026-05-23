@@ -21,6 +21,13 @@ import threading
 import time
 from typing import Any
 
+# Force UTF-8 encoding for stdout
+if sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        pass
+
 # ---------------------------------------------------------------------------
 # Setup logging before any other imports
 # إعداد التسجيل قبل أي استيرادات أخرى
@@ -39,26 +46,43 @@ logger = logging.getLogger("soc.main")
 # سجل الوكلاء المتاحين
 # ---------------------------------------------------------------------------
 
-# Import agent classes
-from workers.w12_log_tampering import LogTamperingAgent
-from workers.w37_brute_force import BruteForceAgent
-from workers.w46_system_health import SystemHealthAgent
+import importlib
+import pkgutil
+import inspect
+import os
+from shared.base_agent import BaseAgent
 
 # Registry: agent_key -> (class, description)
-AGENT_REGISTRY: dict[str, tuple[type, str]] = {
-    "w46_system_health": (
-        SystemHealthAgent,
-        "System Health Monitor - checks all SOC components every 60s",
-    ),
-    "w12_log_tampering": (
-        LogTamperingAgent,
-        "Log Tampering Detection - monitors event volume anomalies every 5min",
-    ),
-    "w37_brute_force": (
-        BruteForceAgent,
-        "Smart Brute Force Detection - detects login attack patterns every 60s",
-    ),
-}
+AGENT_REGISTRY: dict[str, tuple[type, str]] = {}
+
+def _discover_agents():
+    # Add current dir to sys.path if not there
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.insert(0, current_dir)
+
+    for package_name in ["workers", "supervisors", "commander"]:
+        try:
+            package = importlib.import_module(package_name)
+        except ImportError as exc:
+            logger.error("Could not import package '%s': %s", package_name, exc)
+            continue
+
+        if hasattr(package, "__path__"):
+            for _, module_name, is_pkg in pkgutil.walk_packages(package.__path__, package.__name__ + "."):
+                try:
+                    module = importlib.import_module(module_name)
+                    for name, obj in inspect.getmembers(module, inspect.isclass):
+                        if issubclass(obj, BaseAgent) and obj is not BaseAgent:
+                            try:
+                                temp_instance = obj()
+                                AGENT_REGISTRY[temp_instance.name] = (obj, temp_instance.description)
+                            except Exception as e:
+                                logger.debug("Skipping %s.%s during discovery: %s", module_name, obj.__name__, e)
+                except Exception as exc:
+                    logger.debug("Failed to import module '%s': %s", module_name, exc)
+
+_discover_agents()
 
 
 def list_agents() -> None:

@@ -49,6 +49,7 @@ class BruteForceAgent(BaseAgent):
             description="Smart Brute Force Detection - detects fast, slow, distributed, and spray attacks",
             interval_seconds=60,
             config=config,
+            supervisor_channel="soc:infra-supervisor",
         )
 
         # Thresholds from config

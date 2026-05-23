@@ -1,22 +1,19 @@
-import time
 import logging
 import numpy as np
 from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W07-C2Beaconing")
 
 class C2BeaconingAgent(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self):
         super().__init__(
             name="W07_C2Beaconing",
             description="Monitors connections for periodic beaconing patterns indicative of C2",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=120
+            interval_seconds=120,
+            supervisor_channel="soc:network-supervisor"
         )
-        self.config = SOCConfig()
         self.min_connections = 10
 
     def collect(self) -> List[Dict[str, Any]]:
@@ -141,10 +138,5 @@ class C2BeaconingAgent(BaseAgent):
         return results
 
 if __name__ == "__main__":
-    agent = C2BeaconingAgent(supervisor_queue="soc:network-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = C2BeaconingAgent()
+    agent.run_loop()

@@ -16,7 +16,7 @@ services:
   # بروميثيوس — جمع المقاييس والتنبيهات
   # ===========================================================================
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:${PROMETHEUS_VERSION:-v2.53.1}
     container_name: soc-prometheus
     hostname: prometheus
     restart: unless-stopped
@@ -57,7 +57,7 @@ services:
   # غرافانا — منصة لوحات المعلومات والتصور
   # ===========================================================================
   grafana:
-    image: grafana/grafana-oss:latest
+    image: grafana/grafana-oss:${GRAFANA_VERSION:-11.1.0}
     container_name: soc-grafana
     hostname: grafana
     restart: unless-stopped
@@ -100,7 +100,7 @@ services:
   # مراقب الجهوزية — مراقبة وقت تشغيل الخدمات
   # ===========================================================================
   uptime-kuma:
-    image: louislam/uptime-kuma:latest
+    image: louislam/uptime-kuma:${UPTIME_KUMA_VERSION:-1.23.13}
     container_name: soc-uptime-kuma
     hostname: uptime-kuma
     restart: unless-stopped
@@ -130,7 +130,7 @@ services:
   # مصدر مقاييس النظام — تصدير مقاييس الجهاز المضيف لبروميثيوس
   # ===========================================================================
   node-exporter:
-    image: prom/node-exporter:latest
+    image: prom/node-exporter:${NODE_EXPORTER_VERSION:-v1.8.2}
     container_name: soc-node-exporter
     hostname: node-exporter
     restart: unless-stopped

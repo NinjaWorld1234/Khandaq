@@ -20,7 +20,7 @@ services:
   # أولاما — خادم استدلال نماذج اللغة المحلية
   # ===========================================================================
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:${OLLAMA_VERSION:-0.3.1}
     container_name: soc-ollama
     hostname: ollama
     restart: unless-stopped

@@ -1,21 +1,18 @@
-import time
 import logging
 from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W08-DataExfiltration")
 
 class DataExfiltrationAgent(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self):
         super().__init__(
             name="W08_DataExfiltration",
             description="Monitors outbound data volume for exfiltration",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=120
+            interval_seconds=120,
+            supervisor_channel="soc:network-supervisor"
         )
-        self.config = SOCConfig()
         self.whitelist_ips = ["8.8.8.8", "8.8.4.4"] # Example whitelist
         self.single_transfer_threshold = 500 * 1024 * 1024 # 500MB
 
@@ -140,10 +137,5 @@ class DataExfiltrationAgent(BaseAgent):
         return results
 
 if __name__ == "__main__":
-    agent = DataExfiltrationAgent(supervisor_queue="soc:network-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = DataExfiltrationAgent()
+    agent.run_loop()

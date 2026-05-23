@@ -1,9 +1,7 @@
-import time
 import logging
 import math
 from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W06-DNSTunneling")
@@ -16,14 +14,13 @@ def calculate_entropy(s: str) -> float:
     return entropy
 
 class DNSTunnelingAgent(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self):
         super().__init__(
             name="W06_DNSTunneling",
             description="Monitors DNS queries for tunneling patterns and DGA",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=60
+            interval_seconds=60,
+            supervisor_channel="soc:network-supervisor"
         )
-        self.config = SOCConfig()
         self.whitelist = ["google.com", "microsoft.com", "windowsupdate.com", "amazon.com", "apple.com"]
 
     def collect(self) -> List[Dict[str, Any]]:
@@ -159,10 +156,5 @@ class DNSTunnelingAgent(BaseAgent):
         return results
 
 if __name__ == "__main__":
-    agent = DNSTunnelingAgent(supervisor_queue="soc:network-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = DNSTunnelingAgent()
+    agent.run_loop()

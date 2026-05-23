@@ -144,6 +144,7 @@ class CanaryTokensAgent(BaseAgent):
             description="Canary Tokens Agent – decoy files and credentials for intrusion detection",
             interval_seconds=30,
             config=config,
+            supervisor_channel="soc:detection-supervisor",
         )
 
         # Token registry: maps file path → token metadata

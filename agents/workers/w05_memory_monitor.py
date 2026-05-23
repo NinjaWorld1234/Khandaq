@@ -1,21 +1,18 @@
-import time
 import logging
 from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W05-MemoryMonitor")
 
 class MemoryMonitorAgent(BaseAgent):
-    def __init__(self, supervisor_queue):
+    def __init__(self):
         super().__init__(
             name="W05_MemoryMonitor",
             description="Monitors memory access and credential dumping attempts",
-            supervisor_queue=supervisor_queue,
-            interval_seconds=30
+            interval_seconds=30,
+            supervisor_channel="soc:endpoint-supervisor"
         )
-        self.config = SOCConfig()
 
     def collect(self) -> List[Dict[str, Any]]:
         # Fetch Sysmon Event ID 10 (ProcessAccess), 8 (CreateRemoteThread), 25 (ProcessTampering)
@@ -133,10 +130,5 @@ class MemoryMonitorAgent(BaseAgent):
         return results
 
 if __name__ == "__main__":
-    agent = MemoryMonitorAgent(supervisor_queue="soc:endpoint-supervisor")
-    agent.start_in_thread()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        agent.stop()
+    agent = MemoryMonitorAgent()
+    agent.run_loop()

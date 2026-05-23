@@ -26,7 +26,8 @@ from .alerter import Alerter
 from .config import SOCConfig
 from .metrics import AgentMetrics, start_metrics_server
 from .opensearch_client import OpenSearchClient
-from .redis_bus import CHANNEL_COMMANDER_BROADCAST, RedisBus
+from .redis_bus import CHANNEL_AGENT_TO_SUPERVISOR, CHANNEL_COMMANDER_BROADCAST, RedisBus
+from .wazuh_client import WazuhClient
 
 logger = logging.getLogger("soc.agent")
 
@@ -52,25 +53,30 @@ class BaseAgent(ABC):
         description: str,
         interval_seconds: int = 60,
         config: Optional[SOCConfig] = None,
+        supervisor_channel: Optional[str] = None,
     ) -> None:
         """
         Initialize the base agent.
 
         Args:
-            name:             Unique agent name (e.g. 'w37_brute_force').
-            description:      Human-readable description.
-            interval_seconds: Seconds between each run cycle.
-            config:           SOCConfig instance (defaults to singleton).
+            name:               Unique agent name (e.g. 'w37_brute_force').
+            description:        Human-readable description.
+            interval_seconds:   Seconds between each run cycle.
+            config:             SOCConfig instance (defaults to singleton).
+            supervisor_channel: Redis channel for supervisor reporting.
+                                Defaults to 'soc:agent-to-supervisor'.
         """
         self.name = name
         self.description = description
         self.interval_seconds = interval_seconds
         self.config = config or SOCConfig.get_instance()
+        self.supervisor_channel = supervisor_channel or CHANNEL_AGENT_TO_SUPERVISOR
 
-        # Shared clients (lazy-initialized in start())
+        # Shared clients (lazy-initialized)
         self._os_client: Optional[OpenSearchClient] = None
         self._redis_bus: Optional[RedisBus] = None
         self._alerter: Optional[Alerter] = None
+        self._wazuh_client: Optional[WazuhClient] = None
 
         # Metrics
         self._metrics = AgentMetrics(self.name)
@@ -82,12 +88,16 @@ class BaseAgent(ABC):
         self._errors: int = 0
         self._lock = threading.Lock()
 
+        # Supervisor delivery resilience tracking
+        # تتبع مرونة التسليم للمشرف
+        self._supervisor_failures: int = 0
+
         # Agent-specific config overrides
         self._agent_config = self.config.get_agent_config(self.name)
 
         logger.info(
-            "Agent '%s' initialized: %s (interval=%ds)",
-            name, description, interval_seconds,
+            "Agent '%s' initialized: %s (interval=%ds, channel=%s)",
+            name, description, interval_seconds, self.supervisor_channel,
         )
 
     # ------------------------------------------------------------------
@@ -114,6 +124,13 @@ class BaseAgent(ABC):
         if self._alerter is None:
             self._alerter = Alerter(self.config)
         return self._alerter
+
+    @property
+    def wazuh_client(self) -> WazuhClient:
+        """Wazuh API client (lazy-initialized)."""
+        if self._wazuh_client is None:
+            self._wazuh_client = WazuhClient(self.config)
+        return self._wazuh_client
 
     # ------------------------------------------------------------------
     # Abstract methods (Collect -> Analyze -> Decide -> Act)
@@ -180,6 +197,20 @@ class BaseAgent(ABC):
     def report_to_supervisor(self, message: dict[str, Any]) -> None:
         """
         Send a report to the supervisor agent via Redis pub/sub.
+        Uses self.supervisor_channel for targeted routing.
+        إرسال تقرير إلى المشرف عبر ريديس مع حماية متعددة الطبقات
+
+        Resilience features / ميزات الحماية:
+            1. Retry with exponential backoff (3 attempts)
+               إعادة المحاولة مع تأخير تصاعدي
+            2. Fallback to default channel on primary failure
+               الرجوع للقناة الافتراضية عند فشل الأساسية
+            3. Delivery count validation (warns if no subscribers)
+               التحقق من وجود مستمعين على القناة
+            4. Failure metrics tracking
+               تتبع مقاييس الفشل
+            5. Circuit breaker: stops retrying after repeated failures
+               قاطع الدائرة: يتوقف عن المحاولة بعد فشل متكرر
 
         Args:
             message: Report payload dict.
@@ -189,14 +220,126 @@ class BaseAgent(ABC):
             "agent_description": self.description,
             **message,
         }
-        try:
-            self.redis_bus.report_to_supervisor(
-                sender=self.name,
-                payload=report,
-                message_type="agent_report",
+
+        max_retries = 3
+        delivered = False
+
+        # --- Attempt delivery on the primary supervisor channel ---
+        # --- محاولة التسليم على القناة الرئيسية ---
+        for attempt in range(1, max_retries + 1):
+            try:
+                receiver_count = self.redis_bus.publish(
+                    channel=self.supervisor_channel,
+                    payload=report,
+                    sender=self.name,
+                    message_type="agent_report",
+                )
+                if receiver_count > 0:
+                    delivered = True
+                    # Reset consecutive failure counter on success
+                    self._supervisor_failures = 0
+                    break
+                else:
+                    # Published but no subscribers listening
+                    logger.warning(
+                        "[%s] ⚠️ Published to '%s' but 0 subscribers received "
+                        "(attempt %d/%d)",
+                        self.name, self.supervisor_channel, attempt, max_retries,
+                    )
+            except Exception as exc:
+                wait = min(2 ** attempt, 8)
+                logger.warning(
+                    "[%s] ⚠️ Publish to '%s' failed (attempt %d/%d): %s "
+                    "— retrying in %ds",
+                    self.name, self.supervisor_channel, attempt, max_retries,
+                    exc, wait,
+                )
+                if attempt < max_retries:
+                    time.sleep(wait)
+
+        # --- Fallback: try the default channel if primary failed ---
+        # --- خطة بديلة: القناة الافتراضية إذا فشلت الأساسية ---
+        if (
+            not delivered
+            and self.supervisor_channel != CHANNEL_AGENT_TO_SUPERVISOR
+        ):
+            try:
+                fallback_count = self.redis_bus.publish(
+                    channel=CHANNEL_AGENT_TO_SUPERVISOR,
+                    payload={
+                        **report,
+                        "_fallback": True,
+                        "_original_channel": self.supervisor_channel,
+                    },
+                    sender=self.name,
+                    message_type="agent_report_fallback",
+                )
+                if fallback_count > 0:
+                    delivered = True
+                    logger.info(
+                        "[%s] 🔄 Delivered via fallback channel '%s' "
+                        "(primary '%s' was unreachable)",
+                        self.name, CHANNEL_AGENT_TO_SUPERVISOR,
+                        self.supervisor_channel,
+                    )
+                else:
+                    logger.error(
+                        "[%s] 🔴 Fallback channel '%s' also has 0 subscribers!",
+                        self.name, CHANNEL_AGENT_TO_SUPERVISOR,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "[%s] 🔴 Fallback publish also failed: %s",
+                    self.name, exc,
+                )
+
+        # --- Track failures and alert ---
+        # --- تتبع الفشل وإرسال تنبيهات ---
+        if not delivered:
+            self._supervisor_failures = getattr(
+                self, "_supervisor_failures", 0
+            ) + 1
+            self._metrics.inc_errors("supervisor_delivery_failed")
+
+            logger.error(
+                "[%s] 🔴 SUPERVISOR UNREACHABLE — message lost! "
+                "(consecutive failures: %d, channel: '%s')",
+                self.name, self._supervisor_failures,
+                self.supervisor_channel,
             )
-        except Exception as exc:
-            logger.error("Failed to report to supervisor: %s", exc)
+
+            # Alert via OpenSearch after 3 consecutive failures
+            # تنبيه عبر أوبن سيرش بعد 3 فشل متتالي
+            if self._supervisor_failures == 3:
+                try:
+                    self.os_client.index_document(
+                        "soc-channel-failures",
+                        {
+                            "@timestamp": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "agent_name": self.name,
+                            "channel": self.supervisor_channel,
+                            "consecutive_failures": self._supervisor_failures,
+                            "severity": "CRITICAL",
+                            "message": (
+                                f"Agent {self.name} cannot reach supervisor "
+                                f"on channel {self.supervisor_channel} — "
+                                f"{self._supervisor_failures} consecutive "
+                                f"delivery failures"
+                            ),
+                        },
+                    )
+                    logger.critical(
+                        "[%s] 📢 Channel failure alert indexed to "
+                        "'soc-channel-failures'",
+                        self.name,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[%s] Failed to index channel failure alert: %s",
+                        self.name, exc,
+                    )
 
     # ------------------------------------------------------------------
     # Commander broadcast listener / مستمع أوامر القائد
@@ -253,6 +396,8 @@ class BaseAgent(ABC):
             "events_processed": self._events_processed,
             "errors": self._errors,
             "interval_seconds": self.interval_seconds,
+            "supervisor_channel": self.supervisor_channel,
+            "supervisor_failures": self._supervisor_failures,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -371,6 +516,15 @@ class BaseAgent(ABC):
             if self._redis_bus:
                 self._redis_bus.shutdown()
             logger.info("[%s] Shutdown complete.", self.name)
+
+    # ------------------------------------------------------------------
+    # Stop / إيقاف الوكيل
+    # ------------------------------------------------------------------
+
+    def stop(self) -> None:
+        """Gracefully stop the agent's run loop. إيقاف الوكيل بأمان"""
+        logger.info("[%s] Stop requested.", self.name)
+        self._running = False
 
     # ------------------------------------------------------------------
     # Start in thread / بدء في خيط

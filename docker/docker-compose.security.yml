@@ -76,7 +76,7 @@ services:
   # أوبن فاس / غرينبون — ماسح الثغرات الأمنية
   # ===========================================================================
   openvas:
-    image: greenbone/community-edition:latest
+    image: greenbone/community-edition:${GREENBONE_VERSION:-22.4.1}
     container_name: soc-openvas
     hostname: openvas
     restart: unless-stopped
@@ -113,7 +113,7 @@ services:
   # كيكلوك — إدارة الهوية والوصول (تسجيل دخول موحد / تحكم بالأدوار)
   # ===========================================================================
   keycloak:
-    image: quay.io/keycloak/keycloak:latest
+    image: quay.io/keycloak/keycloak:${KEYCLOAK_VERSION:-25.0.2}
     container_name: soc-keycloak
     hostname: keycloak
     restart: unless-stopped
@@ -185,7 +185,7 @@ services:
   # ملاحظة: مصمم للعمل على جهاز مخصص. للوظائف الكاملة، انشره على جهاز منفصل
   # ===========================================================================
   tpot-ce:
-    image: telekom-security/tpotce:latest
+    image: telekom-security/tpotce:${TPOT_VERSION:-24.04}
     container_name: soc-tpot-ce
     hostname: tpot-ce
     restart: unless-stopped
