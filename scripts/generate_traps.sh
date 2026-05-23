@@ -1,7 +1,7 @@
 #!/bin/bash
 ###############################################################################
 # Khandaq Active Defense - Traps Generator
-# سكربت توليد فخاخ الدفاع النشط (قنبلة البيانات وملفات التعقب)
+# سكربت توليد فخاخ الدفاع النشط (ملفات استدراج وتعقب)
 #
 # Run this script ON THE DECOY VPS before starting the honeypot.
 ###############################################################################
@@ -16,16 +16,17 @@ mkdir -p /root/khandaq-labyrinth/honeyfs/etc
 mkdir -p /root/khandaq-labyrinth/honeyfs/root
 mkdir -p /root/khandaq-labyrinth/honeyfs/home/admin
 
-# 1. Generate Zip Bomb (Data Bomb)
-# We will create a highly compressible file, compress it multiple times.
-# When a hacker unzips it on their machine, it will consume hundreds of GBs.
-echo "[*] Generating Zip Bomb (Database_Backup_2026.zip)..."
-dd if=/dev/zero bs=1M count=1024 | gzip > /tmp/1gb_zero.gz
-# We use dd to make a sparse file or just a big file of zeros which compresses tiny
-cat /tmp/1gb_zero.gz /tmp/1gb_zero.gz /tmp/1gb_zero.gz /tmp/1gb_zero.gz > /tmp/4gb_zero.gz
-zip -j /root/khandaq-labyrinth/honeyfs/root/Database_Backup_2026.zip /tmp/4gb_zero.gz
-rm /tmp/1gb_zero.gz /tmp/4gb_zero.gz
-echo "[+] Zip Bomb placed in /root directory of the honeypot."
+# 1. Generate Fake Credentials (Deception / Sinkholing)
+# These files look extremely attractive to an attacker but contain trackable fake data.
+echo "[*] Generating Fake Credentials (Database_Backup_2026_Credentials.txt)..."
+cat << 'EOF' > /root/khandaq-labyrinth/honeyfs/root/Database_Backup_2026_Credentials.txt
+# MASTER DATABASE EXPORT - STRICTLY CONFIDENTIAL
+DB_HOST=10.0.0.99
+DB_USER=root
+DB_PASS=Sup3rS3cr3tP@ssw0rd!
+# If you are reading this, your IP has been logged and contained.
+EOF
+echo "[+] Fake credentials placed in /root directory of the honeypot."
 
 # 2. Setup Canary Token instructions
 echo "[*] Generating Canary Token Placeholder..."
@@ -44,5 +45,5 @@ echo "[+] Canary token instructions generated."
 
 echo "============================================================"
 echo "✅ Traps Generated successfully."
-echo "   WARNING: DO NOT unzip Database_Backup_2026.zip on your own machine!"
+echo "   NOTE: Deception assets are placed. No destructive payloads are included."
 echo "============================================================"

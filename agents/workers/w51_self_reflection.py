@@ -5,7 +5,8 @@ This agent wakes up at a specific time (e.g., 3:00 AM) and reviews
 all alerts, Commander decisions, and specifically HITL (Human-in-the-Loop) 
 rejections from the previous day. 
 It then formulates new logic/Sigma rules or updates the whitelist to 
-prevent future false positives and false negatives.
+prevent future false positives and false negatives, BUT only proposes 
+them to the HITL Commander for human approval.
 """
 
 import time
@@ -23,7 +24,7 @@ class SelfReflectionAgent(BaseAgent):
     def __init__(self, config: Optional[SOCConfig] = None) -> None:
         super().__init__(
             name="w51_self_reflection",
-            description="Reviews past decisions and auto-tunes system rules.",
+            description="Reviews past decisions and proposes auto-tuning system rules (Semi-Supervised).",
             interval_seconds=86400, # Run once a day
             config=config,
         )
@@ -53,8 +54,8 @@ class SelfReflectionAgent(BaseAgent):
                     "type": "RULE_TUNING_REQUIRED",
                     "severity": Severity.MEDIUM,
                     "host": host,
-                    "details": f"Human rejected isolation for {host} yesterday. Auto-generating a whitelist rule to ignore similar behavior during backup windows.",
-                    "response": "UPDATE_WAZUH_WHITELIST"
+                    "details": f"Human rejected isolation for {host} yesterday. Proposing a whitelist rule to ignore similar behavior during backup windows.",
+                    "response": "PROPOSE_WAZUH_WHITELIST"
                 })
         return findings
 
@@ -62,19 +63,20 @@ class SelfReflectionAgent(BaseAgent):
         actions = []
         for finding in findings:
             actions.append({
-                "action": "generate_whitelist_rule",
+                "action": "propose_whitelist_rule",
                 "finding": finding
             })
         return actions
 
     def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = {"rules_updated": 0}
+        results = {"rules_proposed": 0}
         for action in actions:
-            if action["action"] == "generate_whitelist_rule":
-                # In a live environment, this would write a new XML rule 
-                # to /var/ossec/etc/rules/local_rules.xml via Wazuh API.
-                logger.info(f"🧠 Self-Reflection applied: {action['finding']['details']}")
-                results["rules_updated"] += 1
+            if action["action"] == "propose_whitelist_rule":
+                # In a live environment, this would send a message to the Commander
+                # which then places it in the HITL (Human-in-the-Loop) queue for approval.
+                # It DOES NOT write to /var/ossec/etc/rules/local_rules.xml directly.
+                logger.info(f"🧠 Self-Reflection PROPOSAL drafted (Pending Human Approval): {action['finding']['details']}")
+                results["rules_proposed"] += 1
         return results
 
 if __name__ == "__main__":
