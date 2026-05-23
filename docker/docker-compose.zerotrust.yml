@@ -1,0 +1,102 @@
+###############################################################################
+# SOC Platform — Zero Trust & Isolation Workspaces
+# مركز العمليات الأمنية — بيئة الثقة المعدومة والعمل المعزول
+#
+# Services: Webtop (Browser Isolation), Cloudflared (External Tunnels), NetBird (Internal)
+#
+# Usage:
+#   docker compose -f docker-compose.zerotrust.yml --env-file ../.env up -d
+###############################################################################
+
+version: "3.8"
+
+services:
+  # ===========================================================================
+  # Webtop (Docker Bubble) — Disposable isolated workspaces for employees
+  # ويب توب (فقاعة العمل) — بيئة عمل معزولة للموظفين لمنع تسرب البرمجيات الخبيثة
+  # ===========================================================================
+  webtop:
+    image: lscr.io/linuxserver/webtop:${WEBTOP_VERSION:-ubuntu-xfce}
+    container_name: soc-webtop
+    hostname: webtop
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Asia/Riyadh}
+      - SUBFOLDER=/ # Use /webtop if placed behind a reverse proxy subpath
+      - TITLE=Khandaq Secure Workspace
+    volumes:
+      - webtop-config:/config
+    ports:
+      - "${WEBTOP_PORT:-3000}:3000"
+    networks:
+      - soc-net
+    shm_size: "2gb" # Required for modern browsers to prevent crashing
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ===========================================================================
+  # Cloudflared — External secure tunnels without inbound ports
+  # كلاود فلير — أنفاق خارجية آمنة للنشر الخارجي بدون فتح منافذ في جدار الحماية
+  # ===========================================================================
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-latest}
+    container_name: soc-cloudflared
+    hostname: cloudflared
+    restart: unless-stopped
+    command: tunnel run
+    environment:
+      # To use this, you must set TUNNEL_TOKEN in your .env file
+      - TUNNEL_TOKEN=${CLOUDFLARED_TUNNEL_TOKEN:-}
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  # ===========================================================================
+  # NetBird — Internal Zero Trust Overlay Network client
+  # نت بيرد — عميل شبكة الثقة المعدومة الداخلية للموظفين
+  # ===========================================================================
+  netbird:
+    image: netbirdio/netbird:${NETBIRD_VERSION:-latest}
+    container_name: soc-netbird
+    hostname: netbird
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NB_SETUP_KEY=${NETBIRD_SETUP_KEY:-}
+    volumes:
+      - netbird-config:/etc/netbird
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+# =============================================================================
+# Volumes — Persistent storage
+# وحدات التخزين — التخزين الدائم
+# =============================================================================
+volumes:
+  webtop-config:
+    driver: local
+    name: soc-webtop-config
+  netbird-config:
+    driver: local
+    name: soc-netbird-config
+
+# =============================================================================
+# Networks — Shared SOC network
+# الشبكات — شبكة مركز العمليات المشتركة
+# =============================================================================
+networks:
+  soc-net:
+    external: true
+    name: soc-net
