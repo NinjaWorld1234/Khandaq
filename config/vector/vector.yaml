@@ -31,6 +31,8 @@ transforms:
     source: |
       . = parse_json!(.message)
       .source = "zeek"
+      # Extract Zeek log type (e.g., 'dns', 'conn', 'http') from _path if available
+      .zeek_type = ._path ?? "unknown"
 
 sinks:
   kafka_suricata:
@@ -51,12 +53,35 @@ sinks:
     encoding:
       codec: json
 
-  opensearch_all:
+  opensearch_suricata:
     type: elasticsearch
     inputs:
       - parse_suricata
+    endpoints:
+      - "https://opensearch-node1:9200"
+    auth:
+      strategy: basic
+      user: "${OPENSEARCH_USER:-admin}"
+      password: "${OPENSEARCH_PASSWORD:-admin}"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
+    bulk:
+      index: "suricata-%Y.%m.%d"
+
+  opensearch_zeek:
+    type: elasticsearch
+    inputs:
       - parse_zeek
     endpoints:
-      - "http://opensearch-node1:9200"
+      - "https://opensearch-node1:9200"
+    auth:
+      strategy: basic
+      user: "${OPENSEARCH_USER:-admin}"
+      password: "${OPENSEARCH_PASSWORD:-admin}"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
     bulk:
-      index: "soc-network-logs-%Y.%m.%d"
+      # Use dynamic indexing based on the Zeek log type (e.g., zeek-dns-2024.05.24)
+      index: "zeek-{{ zeek_type }}-%Y.%m.%d"

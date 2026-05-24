@@ -304,6 +304,8 @@ transforms:
     source: |
       . = parse_json!(.message)
       .source = "zeek"
+      # Extract Zeek log type (e.g., 'dns', 'conn', 'http') from _path if available
+      .zeek_type = ._path ?? "unknown"
 
 sinks:
   # Forward to Kafka
@@ -325,16 +327,39 @@ sinks:
     encoding:
       codec: json
 
-  # Also forward to OpenSearch directly
-  opensearch_all:
+  # Forward to OpenSearch directly
+  opensearch_suricata:
     type: elasticsearch
     inputs:
       - parse_suricata
+    endpoints:
+      - "https://opensearch-node1:9200"
+    auth:
+      strategy: basic
+      user: "${OPENSEARCH_USER:-admin}"
+      password: "${OPENSEARCH_PASSWORD:-admin}"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
+    bulk:
+      index: "suricata-%Y.%m.%d"
+
+  opensearch_zeek:
+    type: elasticsearch
+    inputs:
       - parse_zeek
     endpoints:
-      - "http://opensearch-node1:9200"
+      - "https://opensearch-node1:9200"
+    auth:
+      strategy: basic
+      user: "${OPENSEARCH_USER:-admin}"
+      password: "${OPENSEARCH_PASSWORD:-admin}"
+    tls:
+      verify_certificate: false
+      verify_hostname: false
     bulk:
-      index: "soc-network-logs-%Y.%m.%d"
+      # Use dynamic indexing based on the Zeek log type
+      index: "zeek-{{ zeek_type }}-%Y.%m.%d"
 VECEOF
         log_info "Created default Vector config"
     fi

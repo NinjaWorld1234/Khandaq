@@ -175,6 +175,8 @@ services:
     environment:
       - VECTOR_CONFIG=/etc/vector/vector.yaml
       - VECTOR_LOG=info
+      - OPENSEARCH_USER=${OPENSEARCH_USER:-admin}
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_PASSWORD:-admin}
     volumes:
       - vector-data:/var/lib/vector
       # Mount log directories from Suricata and Zeek (via host paths)
