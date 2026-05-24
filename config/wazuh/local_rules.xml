@@ -1,0 +1,9 @@
+<group name="local,canary,">
+  <!-- Catch Canary Token Trigger -->
+  <rule id="100001" level="12">
+    <if_sid>550</if_sid> <!-- FIM (File Integrity Monitoring) modification rule -->
+    <match>honeyfs</match>
+    <description>Khandaq Alert: Labyrinth Canary Token accessed or modified!</description>
+    <group>canary_token_trigger,pci_dss_11.4,</group>
+  </rule>
+</group>
