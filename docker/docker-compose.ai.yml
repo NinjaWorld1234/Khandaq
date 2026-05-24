@@ -172,12 +172,19 @@ services:
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_AI_PASSWORD:-Ch@ngeMe_Redis_AI_2024!}
       # OpenSearch connection / اتصال محرك البحث
-      - OPENSEARCH_HOST=opensearch-node1
-      - OPENSEARCH_PORT=9200
+      - OPENSEARCH_HOSTS=["https://opensearch-node1:9200"]
+      - OPENSEARCH_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-admin}
       # Wazuh API connection / اتصال واجهة وازه
       - WAZUH_API_URL=https://wazuh-manager:55000
       - WAZUH_API_USER=${WAZUH_API_USER:-wazuh-wui}
       - WAZUH_API_PASSWORD=${WAZUH_API_PASSWORD:-Ch@ngeMe_Wazuh_API_2024!}
+      # Threat Intel & SOAR / الاستخبارات والأتمتة
+      - MISP_API_KEY=${MISP_API_KEY:-}
+      - IRIS_API_KEY=${IRIS_API_KEY:-}
+      # Alerting / التنبيهات الخارجية
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       # Agent configuration / إعدادات الوكلاء
       - LOG_LEVEL=${AI_AGENTS_LOG_LEVEL:-INFO}
       - WORKERS=${AI_AGENTS_WORKERS:-4}
