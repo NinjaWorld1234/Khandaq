@@ -1,0 +1,62 @@
+api:
+  enabled: true
+  address: "0.0.0.0:8686"
+
+sources:
+  suricata_logs:
+    type: file
+    include:
+      - /var/log/suricata/eve.json
+    read_from: beginning
+
+  zeek_logs:
+    type: file
+    include:
+      - /opt/zeek/logs/current/*.log
+    read_from: beginning
+
+transforms:
+  parse_suricata:
+    type: remap
+    inputs:
+      - suricata_logs
+    source: |
+      . = parse_json!(.message)
+      .source = "suricata"
+
+  parse_zeek:
+    type: remap
+    inputs:
+      - zeek_logs
+    source: |
+      . = parse_json!(.message)
+      .source = "zeek"
+
+sinks:
+  kafka_suricata:
+    type: kafka
+    inputs:
+      - parse_suricata
+    bootstrap_servers: "kafka:29092"
+    topic: "soc-suricata"
+    encoding:
+      codec: json
+
+  kafka_zeek:
+    type: kafka
+    inputs:
+      - parse_zeek
+    bootstrap_servers: "kafka:29092"
+    topic: "soc-zeek"
+    encoding:
+      codec: json
+
+  opensearch_all:
+    type: elasticsearch
+    inputs:
+      - parse_suricata
+      - parse_zeek
+    endpoints:
+      - "http://opensearch-node1:9200"
+    bulk:
+      index: "soc-network-logs-%Y.%m.%d"

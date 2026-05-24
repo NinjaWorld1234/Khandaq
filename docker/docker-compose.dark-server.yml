@@ -26,7 +26,7 @@ services:
     volumes:
       # You must place the wg0.conf generated from the VPS into this config folder
       # يجب وضع ملف الإعدادات wg0.conf المستخرج من السيرفر الوهمي هنا
-      - ./config/wireguard-client:/config
+      - ../config/wireguard-client:/config
       - /lib/modules:/lib/modules
     # Connect this to the main SOC network so internal agents can reach the tunnel
     networks:
