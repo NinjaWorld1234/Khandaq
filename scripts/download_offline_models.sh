@@ -24,11 +24,16 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 mkdir -p "${MODELS_DIR}"
 cd "${MODELS_DIR}"
 
-log_step "Checking prerequisites (hf)..."
+log_step "Checking prerequisites (hf & hf_transfer)..."
 if ! command -v hf &> /dev/null; then
-    log_info "Installing huggingface_hub..."
-    pip3 install -U "huggingface_hub[cli]"
+    log_info "Installing huggingface_hub via pipx..."
+    pipx install "huggingface_hub[cli]"
 fi
+
+log_info "Ensuring hf_transfer is installed for ultra-fast parallel downloads..."
+pipx runpip huggingface-hub install hf_transfer || true
+
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # =============================================================================
 # 1. القائد والمشرفين (Kimi 2.6-Mini)
