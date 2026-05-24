@@ -24,7 +24,7 @@ services:
     container_name: soc-vllm-commander
     hostname: vllm-commander
     restart: unless-stopped
-    command: --model "MoonshotAI/Kimi-K2.6-Mini" --port 8000 --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remote-code
+    command: --model /root/models/Kimi-K2.6-Mini --served-model-name "MoonshotAI/Kimi-K2.6-Mini" --port 8000 --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remote-code
     deploy:
       resources:
         reservations:
@@ -33,14 +33,13 @@ services:
               count: 1
               capabilities: [gpu]
     volumes:
-      - vllm-models:/root/.cache/huggingface
+      - ../soc_models:/root/models:ro
     ports:
       - "8000:8000"
     networks:
       - soc-net
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
       interval: 30s
@@ -57,7 +56,7 @@ services:
     container_name: soc-vllm-workers
     hostname: vllm-workers
     restart: unless-stopped
-    command: --model "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" --port 8001 --max-model-len 16384 --gpu-memory-utilization 0.9
+    command: --model /root/models/WhiteRabbitNeo-13B-v1 --served-model-name "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" --port 8001 --max-model-len 16384 --gpu-memory-utilization 0.9
     deploy:
       resources:
         reservations:
@@ -66,14 +65,13 @@ services:
               count: 1
               capabilities: [gpu]
     volumes:
-      - vllm-models:/root/.cache/huggingface
+      - ../soc_models:/root/models:ro
     ports:
       - "8001:8001"
     networks:
       - soc-net
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8001/v1/models || exit 1"]
       interval: 30s
@@ -229,9 +227,6 @@ services:
 # وحدات التخزين — التخزين الدائم
 # =============================================================================
 volumes:
-  vllm-models:
-    driver: local
-    name: soc-vllm-models
   redis-ai-data:
     driver: local
     name: soc-redis-ai-data
