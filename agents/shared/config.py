@@ -68,12 +68,12 @@ class IRISConfig:
 
 
 @dataclass(frozen=True)
-class OllamaConfig:
-    """Ollama LLM connection settings. إعدادات اتصال نموذج اللغة"""
-    url: str = "http://localhost:11434"
-    model: str = "llama3"
-    timeout: int = 120
-    max_tokens: int = 2048
+class VLLMConfig:
+    """vLLM connection settings. إعدادات اتصال محرك vLLM"""
+    url: str = "http://localhost:8000/v1"
+    model: str = "MoonshotAI/Kimi-K2.6-Mini"
+    timeout: int = 300
+    max_tokens: int = 8192
     temperature: float = 0.1
 
 
@@ -227,7 +227,8 @@ class SOCConfig:
         self.wazuh = self._build_wazuh()
         self.misp = self._build_misp()
         self.iris = self._build_iris()
-        self.ollama = self._build_ollama()
+        self.vllm_commander = self._build_vllm_commander()
+        self.vllm_worker = self._build_vllm_worker()
         self.redis = self._build_redis()
         self.alerting = self._build_alerting()
         self.thresholds = self._build_thresholds()
@@ -314,14 +315,24 @@ class SOCConfig:
             timeout=self._env("IRIS_TIMEOUT", s.get("timeout", 30), int),
         )
 
-    def _build_ollama(self) -> OllamaConfig:
-        s = self._section("ollama")
-        return OllamaConfig(
-            url=self._env("OLLAMA_URL", s.get("url", "http://localhost:11434")),
-            model=self._env("OLLAMA_MODEL", s.get("model", "llama3")),
-            timeout=self._env("OLLAMA_TIMEOUT", s.get("timeout", 120), int),
-            max_tokens=self._env("OLLAMA_MAX_TOKENS", s.get("max_tokens", 2048), int),
-            temperature=self._env("OLLAMA_TEMPERATURE", s.get("temperature", 0.1), float),
+    def _build_vllm_commander(self) -> VLLMConfig:
+        s = self._section("vllm_commander")
+        return VLLMConfig(
+            url=self._env("VLLM_COMMANDER_URL", s.get("url", "http://localhost:8000/v1")),
+            model=self._env("VLLM_COMMANDER_MODEL", s.get("model", "MoonshotAI/Kimi-K2.6-Mini")),
+            timeout=self._env("VLLM_COMMANDER_TIMEOUT", s.get("timeout", 300), int),
+            max_tokens=self._env("VLLM_COMMANDER_MAX_TOKENS", s.get("max_tokens", 8192), int),
+            temperature=self._env("VLLM_COMMANDER_TEMPERATURE", s.get("temperature", 0.1), float),
+        )
+
+    def _build_vllm_worker(self) -> VLLMConfig:
+        s = self._section("vllm_worker")
+        return VLLMConfig(
+            url=self._env("VLLM_WORKER_URL", s.get("url", "http://localhost:8001/v1")),
+            model=self._env("VLLM_WORKER_MODEL", s.get("model", "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1")),
+            timeout=self._env("VLLM_WORKER_TIMEOUT", s.get("timeout", 120), int),
+            max_tokens=self._env("VLLM_WORKER_MAX_TOKENS", s.get("max_tokens", 4096), int),
+            temperature=self._env("VLLM_WORKER_TEMPERATURE", s.get("temperature", 0.2), float),
         )
 
     def _build_redis(self) -> RedisConfig:

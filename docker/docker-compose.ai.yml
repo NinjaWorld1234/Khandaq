@@ -16,45 +16,70 @@ version: "3.8"
 
 services:
   # ===========================================================================
-  # Ollama — Local LLM inference server
-  # أولاما — خادم استدلال نماذج اللغة المحلية
+  # vLLM Commander — Serving Kimi K2.6-Mini
+  # محرك القيادة — تشغيل نموذج كيمي للقائد
   # ===========================================================================
-  ollama:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.3.1}
-    container_name: soc-ollama
-    hostname: ollama
+  vllm-commander:
+    image: vllm/vllm-openai:latest
+    container_name: soc-vllm-commander
+    hostname: vllm-commander
     restart: unless-stopped
-    # GPU passthrough via NVIDIA Container Toolkit
-    # تمرير وحدة معالجة الرسوميات عبر أدوات NVIDIA
+    command: --model "MoonshotAI/Kimi-K2.6-Mini" --port 8000 --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remote-code
     deploy:
       resources:
-        limits:
-          memory: ${OLLAMA_MEM_LIMIT:-8g}
-#        reservations:
-#          devices:
-#            - driver: nvidia
-#              count: all
-#              capabilities: [gpu]
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     volumes:
-      - ollama-models:/root/.ollama
+      - vllm-models:/root/.cache/huggingface
     ports:
-      - "${OLLAMA_PORT:-11434}:11434"
+      - "8000:8000"
     networks:
       - soc-net
     environment:
-      - OLLAMA_HOST=0.0.0.0
-      - OLLAMA_KEEP_ALIVE=24h
       - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "curl -sf http://localhost:11434/api/tags || exit 1",
-        ]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 60s
+
+  # ===========================================================================
+  # vLLM Workers — Serving WhiteRabbitNeo
+  # محرك العمال — تشغيل نموذج الأرنب الأبيض
+  # ===========================================================================
+  vllm-workers:
+    image: vllm/vllm-openai:latest
+    container_name: soc-vllm-workers
+    hostname: vllm-workers
+    restart: unless-stopped
+    command: --model "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" --port 8001 --max-model-len 16384 --gpu-memory-utilization 0.9
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - vllm-models:/root/.cache/huggingface
+    ports:
+      - "8001:8001"
+    networks:
+      - soc-net
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
 
   # ===========================================================================
   # Redis Primary — Message queue for AI agent communication
@@ -137,9 +162,11 @@ services:
     hostname: ai-agents
     restart: unless-stopped
     environment:
-      # Ollama connection / اتصال أولاما
-      - OLLAMA_BASE_URL=http://ollama:11434
-      - OLLAMA_MODEL=${AI_AGENTS_OLLAMA_MODEL:-llama3}
+      # vLLM connection / اتصال محركات الذكاء المتعددة
+      - VLLM_COMMANDER_URL=http://vllm-commander:8000/v1
+      - VLLM_COMMANDER_MODEL=MoonshotAI/Kimi-K2.6-Mini
+      - VLLM_WORKER_URL=http://vllm-workers:8001/v1
+      - VLLM_WORKER_MODEL=WhiteRabbitNeo/WhiteRabbitNeo-13B-v1
       # Redis connection / اتصال ريديس
       - REDIS_HOST=redis-ai
       - REDIS_PORT=6379
@@ -165,7 +192,9 @@ services:
     networks:
       - soc-net
     depends_on:
-      ollama:
+      vllm-commander:
+        condition: service_healthy
+      vllm-workers:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -193,9 +222,9 @@ services:
 # وحدات التخزين — التخزين الدائم
 # =============================================================================
 volumes:
-  ollama-models:
+  vllm-models:
     driver: local
-    name: soc-ollama-models
+    name: soc-vllm-models
   redis-ai-data:
     driver: local
     name: soc-redis-ai-data

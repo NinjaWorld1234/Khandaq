@@ -180,7 +180,8 @@ configure_firewall() {
     iptables -A SOC-RULES -p tcp --dport 8000 -j ACCEPT -m comment --comment "SOC: CAPEv2"
 
     # AI
-    iptables -A SOC-RULES -p tcp --dport 11434 -j ACCEPT -m comment --comment "SOC: Ollama"
+    iptables -A SOC-RULES -p tcp --dport 8000 -j ACCEPT -m comment --comment "SOC: vLLM Commander"
+    iptables -A SOC-RULES -p tcp --dport 8001 -j ACCEPT -m comment --comment "SOC: vLLM Worker"
 
     # Hook SOC-RULES into INPUT chain (avoid duplicates)
     if ! iptables -C INPUT -j SOC-RULES &>/dev/null 2>&1; then

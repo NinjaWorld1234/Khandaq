@@ -180,9 +180,9 @@ check_prerequisites() {
     if command -v nvidia-smi &>/dev/null; then
         local gpu_info
         gpu_info=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-        log_info "NVIDIA GPU found: ${gpu_info} ✓ (Ollama will use GPU acceleration)"
+        log_info "NVIDIA GPU found: ${gpu_info} ✓ (vLLM will use GPU acceleration)"
     else
-        log_warn "No NVIDIA GPU detected. Ollama will run in CPU-only mode."
+        log_warn "No NVIDIA GPU detected. vLLM requires a GPU for production deployment."
     fi
 
     if [ "$errors" -gt 0 ]; then
@@ -616,10 +616,11 @@ KC_DB_PASSWORD=${kc_db_pw}
 # T-Pot
 TPOT_WEB_PORT=64297
 
-# Ollama
-OLLAMA_PORT=11434
-OLLAMA_MODELS=mistral,codellama,llama3
-OLLAMA_MEM_LIMIT=8g
+# vLLM
+VLLM_COMMANDER_PORT=8000
+VLLM_WORKER_PORT=8001
+VLLM_COMMANDER_MODEL=MoonshotAI/Kimi-K2.6-Mini
+VLLM_WORKER_MODEL=WhiteRabbitNeo/WhiteRabbitNeo-13B-v1
 
 # Redis (AI Agents)
 REDIS_AI_PORT=6379
@@ -627,8 +628,7 @@ REDIS_AI_PASSWORD=${redis_ai_pw}
 
 # AI Agents
 AI_AGENTS_LOG_LEVEL=INFO
-AI_AGENTS_WORKERS=4
-AI_AGENTS_OLLAMA_MODEL=mistral
+AI_AGENTS_WORKERS=51
 ENVEOF
 
     chmod 600 "${ENV_FILE}"
@@ -726,7 +726,7 @@ start_services() {
     log_info "Monitoring services started ✓"
 
     # --- Optional: AI Agents ---
-    log_step "Starting AI Agents infrastructure (Ollama, Redis)..."
+    log_step "Starting AI Agents infrastructure (vLLM, Redis)..."
     docker compose -f "${DOCKER_DIR}/docker-compose.ai.yml" \
         --env-file "${ENV_FILE}" up -d --no-build 2>/dev/null || \
     log_warn "AI agents stack may require manual build: docker compose -f docker/docker-compose.ai.yml build"
@@ -764,7 +764,8 @@ print_summary() {
     echo -e "${GREEN}║${NC}  ${CYAN}Prometheus${NC}             http://${HOST_IP}:${PROMETHEUS_PORT}          ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}  ${CYAN}Keycloak${NC}               http://${HOST_IP}:${KEYCLOAK_PORT}          ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}  ${CYAN}OpenVAS${NC}                https://${HOST_IP}:${OPENVAS_PORT}          ${GREEN}║${NC}"
-    echo -e "${GREEN}║${NC}  ${CYAN}Ollama API${NC}             http://${HOST_IP}:${OLLAMA_PORT}         ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}vLLM Commander${NC}         http://${HOST_IP}:${VLLM_COMMANDER_PORT}          ${GREEN}║${NC}"
+    echo -e "${GREEN}║${NC}  ${CYAN}vLLM Worker${NC}            http://${HOST_IP}:${VLLM_WORKER_PORT}          ${GREEN}║${NC}"
     echo -e "${GREEN}║${NC}                                                              ${GREEN}║${NC}"
     echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${GREEN}║${NC}  Credentials are stored in: ${ENV_FILE}                        ${GREEN}║${NC}"
