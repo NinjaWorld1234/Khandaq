@@ -34,7 +34,7 @@ fi
 # 1. القائد والمشرفين (Kimi 2.6-Mini)
 # =============================================================================
 log_step "Downloading Commander Model: Kimi K2.6-Mini (13B) into Naser Server..."
-hf download MoonshotAI/Kimi-K2.6-Mini --local-dir "${MODELS_DIR}/Kimi-K2.6-Mini"
+hf download moonshotai/Kimi-K2.6 --local-dir "${MODELS_DIR}/Kimi-K2.6-Mini"
 
 # =============================================================================
 # 2. الوكلاء الميدانيين (WhiteRabbitNeo)
