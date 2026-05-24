@@ -1,14 +1,3 @@
-"""
-Worker 51: Self-Reflection & Auto-Tuning (وكيل التأمل الذاتي وإعادة البرمجة)
-
-This agent wakes up at a specific time (e.g., 3:00 AM) and reviews
-all alerts, Commander decisions, and specifically HITL (Human-in-the-Loop) 
-rejections from the previous day. 
-It then formulates new logic/Sigma rules or updates the whitelist to 
-prevent future false positives and false negatives, BUT only proposes 
-them to the HITL Commander for human approval.
-"""
-
 import time
 import logging
 from typing import Any, Dict, List, Optional
@@ -27,36 +16,56 @@ class SelfReflectionAgent(BaseAgent):
             description="Reviews past decisions and proposes auto-tuning system rules (Semi-Supervised).",
             interval_seconds=86400, # Run once a day
             config=config,
+            supervisor_channel="soc:detection-supervisor"
         )
 
     def collect(self) -> List[Dict[str, Any]]:
-        # In production, query OpenSearch for all HITL "reject" decisions 
-        # and all alerts generated in the last 24 hours.
-        logger.info("Gathering yesterday's SOC events and HITL decisions for self-reflection...")
-        
-        # Simulated HITL Rejection log
-        simulated_history = [
-            {
-                "type": "HITL_REJECTION",
-                "host": "opensearch-node1",
-                "action": "isolate_host",
-                "reason": "Human decided this was a false positive during DB backup."
+        # Query OpenSearch for all HITL "reject" decisions and false positives
+        query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"match": {"action": "HITL_REJECTION"}},
+                    ]
+                }
             }
-        ]
-        return simulated_history
+        }
+        try:
+            return self.os_client.get_events_since(
+                index="soc-metrics-*",
+                minutes=1440, # last 24 hours
+                query=query
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch HITL rejections: {e}")
+            return []
 
     def analyze(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         findings = []
+        host_rejection_counts = {}
+
         for event in data:
-            if event.get("type") == "HITL_REJECTION":
-                host = event.get("host", "unknown")
+            host = event.get("host", "unknown")
+            rule_id = event.get("rule_id", "unknown")
+            reason = event.get("reason", "Human decided this was a false positive.")
+            
+            key = f"{host}_{rule_id}"
+            if key not in host_rejection_counts:
+                host_rejection_counts[key] = {"host": host, "rule_id": rule_id, "count": 0, "reason": reason}
+            
+            host_rejection_counts[key]["count"] += 1
+
+        for key, info in host_rejection_counts.items():
+            if info["count"] >= 3: # If human rejected the same rule on the same host 3+ times
                 findings.append({
                     "type": "RULE_TUNING_REQUIRED",
                     "severity": Severity.MEDIUM,
-                    "host": host,
-                    "details": f"Human rejected isolation for {host} yesterday. Proposing a whitelist rule to ignore similar behavior during backup windows.",
+                    "host": info["host"],
+                    "rule_id": info["rule_id"],
+                    "details": f"Human rejected rule {info['rule_id']} for {info['host']} {info['count']} times yesterday. Reason: {info['reason']}. Proposing a whitelist rule.",
                     "response": "PROPOSE_WAZUH_WHITELIST"
                 })
+
         return findings
 
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -66,17 +75,22 @@ class SelfReflectionAgent(BaseAgent):
                 "action": "propose_whitelist_rule",
                 "finding": finding
             })
+            # Escalate the proposal to the commander
+            actions.append({
+                "action": "escalate",
+                "finding": finding
+            })
         return actions
 
     def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = {"rules_proposed": 0}
+        results = {"rules_proposed": 0, "escalated": 0}
         for action in actions:
             if action["action"] == "propose_whitelist_rule":
-                # In a live environment, this would send a message to the Commander
-                # which then places it in the HITL (Human-in-the-Loop) queue for approval.
-                # It DOES NOT write to /var/ossec/etc/rules/local_rules.xml directly.
                 logger.info(f"🧠 Self-Reflection PROPOSAL drafted (Pending Human Approval): {action['finding']['details']}")
                 results["rules_proposed"] += 1
+            elif action["action"] == "escalate":
+                self.report_to_supervisor(action["finding"])
+                results["escalated"] += 1
         return results
 
 if __name__ == "__main__":

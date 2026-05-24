@@ -48,7 +48,7 @@ FIM_RULE_GROUP = "syscheck"
 DEFAULT_CANARY_TOKENS: list[dict[str, str]] = [
     {
         "filename": "passwords_backup.docx.txt",
-        "deploy_dir": "/opt/share/IT",
+        "deploy_dir": "/app/docker/tarpit/honeyfs/IT",
         "description": "Fake password backup file",
         "content_template": (
             "=== CONFIDENTIAL - IT Password Backup ===\n"
@@ -64,7 +64,7 @@ DEFAULT_CANARY_TOKENS: list[dict[str, str]] = [
     },
     {
         "filename": "admin_creds.txt",
-        "deploy_dir": "/home/admin/Desktop",
+        "deploy_dir": "/app/docker/tarpit/honeyfs/Desktop",
         "description": "Fake admin credentials file",
         "content_template": (
             "# Admin Credentials - KEEP SAFE\n"
@@ -78,7 +78,7 @@ DEFAULT_CANARY_TOKENS: list[dict[str, str]] = [
     },
     {
         "filename": "customer_db_backup.sql",
-        "deploy_dir": "/opt/backups",
+        "deploy_dir": "/app/docker/tarpit/honeyfs/backups",
         "description": "Fake database dump file",
         "content_template": (
             "-- MySQL dump: customer_production\n"
@@ -100,7 +100,7 @@ DEFAULT_CANARY_TOKENS: list[dict[str, str]] = [
     },
     {
         "filename": "id_rsa_admin",
-        "deploy_dir": "/opt/share/IT/keys",
+        "deploy_dir": "/app/docker/tarpit/honeyfs/keys",
         "description": "Fake SSH private key",
         "content_template": (
             "-----BEGIN OPENSSH PRIVATE KEY-----\n"
@@ -114,7 +114,7 @@ DEFAULT_CANARY_TOKENS: list[dict[str, str]] = [
     },
     {
         "filename": "credentials",
-        "deploy_dir": "/home/admin/.aws",
+        "deploy_dir": "/app/docker/tarpit/honeyfs/.aws",
         "description": "Fake AWS credentials file",
         "content_template": (
             "[default]\n"

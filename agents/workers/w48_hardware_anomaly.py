@@ -1,82 +1,114 @@
-import time
-import json
 import logging
-from typing import Dict, Any
-
+import time
+from typing import Dict, Any, List
 from shared.base_agent import BaseAgent
-from shared.wazuh_client import WazuhClient
+from shared.alerter import Severity
+
+logger = logging.getLogger("W48-HardwareAnomaly")
 
 class HardwareAnomalyAgent(BaseAgent):
-    """
-    Agent 48: Hardware Anomaly & Physical Breach Monitor
-    Monitors for spy chips, covert microcode execution, and physical chassis intrusions.
-    """
-
     def __init__(self):
         super().__init__(
-            name="w48_hardware_anomaly",
-            description="Detects hardware-level espionage: Thermal/Load discrepancies, unauthorized PCIe/USB devices, and chassis intrusion.",
-            interval_seconds=60,
-            supervisor_channel="soc:commander" # Direct to Commander due to critical physical threat
+            name="W48_HardwareAnomaly",
+            description="Monitors hardware metrics (CPU, Temp) for cryptojacking",
+            interval_seconds=300, # Run every 5 minutes
+            supervisor_channel="soc:endpoint-supervisor"
         )
-        self.wazuh = WazuhClient()
-        self.baseline_devices = set()
-
-    def run(self):
-        self.logger.info("Polling hardware sensors and PCI/USB telemetry...")
+        self.cpu_threshold_pct = 95.0
+        self.cpu_sustained_minutes = 30
         
-        # 1. Thermal vs OS Load Discrepancy (The Spy Chip Detector)
-        # If CPU temp is high but OS reports 0% load, a hardware implant or ring-2 malware is executing.
-        thermal_alerts = self.wazuh.get_alerts(rule_id="100048") # Custom rule ID for hardware sensors
-        
-        for alert in thermal_alerts:
-            cpu_temp = alert.get("data", {}).get("cpu_temp_c", 0)
-            os_load = alert.get("data", {}).get("os_cpu_load_pct", 0)
-            
-            if cpu_temp > 75 and os_load < 5:
-                self.logger.critical(f"THERMAL ANOMALY DETECTED! CPU Temp: {cpu_temp}C, OS Load: {os_load}%")
-                self.publish_alert(
-                    level="CRITICAL",
-                    title="Potential Hardware Spy Chip or Covert Execution",
-                    description=f"Massive thermal output ({cpu_temp}C) with zero OS-level utilization ({os_load}%). Hardware-level covert channel suspected.",
-                    source="hardware_sensors",
-                    raw_data=alert
-                )
+    def collect(self) -> List[Dict[str, Any]]:
+        # Fetch Wazuh system inventory or Metricbeat data indicating high CPU / Temp
+        query = {
+            "query": {
+                "bool": {
+                    "must": [
+                        {"match": {"rule.groups": "hardware_monitor"}},
+                    ]
+                }
+            }
+        }
+        try:
+            return self.os_client.get_events_since(
+                index="wazuh-alerts-*",
+                minutes=self.cpu_sustained_minutes,
+                query=query
+            )
+        except Exception as e:
+            logger.error(f"Failed to collect hardware events: {e}")
+            return []
 
-        # 2. Unauthorized PCIe / USB Device Addition (Rubber Ducky / DMA Attack)
-        device_alerts = self.wazuh.get_alerts(rule_id="100049") # Custom rule for udev/PCI additions
-        for alert in device_alerts:
-            device_id = alert.get("data", {}).get("vendor_product_id")
-            device_name = alert.get("data", {}).get("device_name", "Unknown")
-            
-            if device_id not in self.baseline_devices and self.baseline_devices:
-                self.logger.critical(f"UNAUTHORIZED HARDWARE ADDED: {device_name} ({device_id})")
-                self.publish_alert(
-                    level="CRITICAL",
-                    title="Unauthorized Physical Device Connected",
-                    description=f"A new hardware device {device_name} was plugged into the server physically.",
-                    source="udev_monitor",
-                    raw_data=alert
-                )
-            
-            # Update baseline
-            if device_id:
-                self.baseline_devices.add(device_id)
+    def analyze(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        findings = []
+        host_cpu_counts = {}
 
-        # 3. Chassis Intrusion Detection
-        intrusion_alerts = self.wazuh.get_alerts(rule_id="100050") # Custom rule for IPMI/BMC chassis intrusion
-        for alert in intrusion_alerts:
-            status = alert.get("data", {}).get("chassis_status")
-            if status == "OPEN":
-                self.logger.critical("SERVER CHASSIS OPENED!")
-                self.publish_alert(
-                    level="CRITICAL",
-                    title="Physical Server Breach (Chassis Intrusion)",
-                    description="The server's physical case has been opened. Immediate physical security response required.",
-                    source="ipmi_bmc",
-                    raw_data=alert
+        for event in data:
+            try:
+                agent_name = event.get("agent", {}).get("name", "unknown")
+                cpu_usage = event.get("data", {}).get("hardware", {}).get("cpu_pct", 0)
+                temp_celsius = event.get("data", {}).get("hardware", {}).get("temp_c", 0)
+
+                if agent_name not in host_cpu_counts:
+                    host_cpu_counts[agent_name] = {"high_cpu_hits": 0, "max_temp": 0}
+
+                if float(cpu_usage) > self.cpu_threshold_pct:
+                    host_cpu_counts[agent_name]["high_cpu_hits"] += 1
+                
+                if float(temp_celsius) > host_cpu_counts[agent_name]["max_temp"]:
+                    host_cpu_counts[agent_name]["max_temp"] = float(temp_celsius)
+
+            except Exception as e:
+                logger.error(f"Error parsing hardware event: {e}")
+
+        for host, stats in host_cpu_counts.items():
+            # If CPU is maxed out in most of our 5-minute polling intervals over the last 30 minutes
+            # (Assuming Wazuh sends metrics every 5 mins -> 6 hits max)
+            if stats["high_cpu_hits"] >= (self.cpu_sustained_minutes / 5) * 0.8:
+                severity = Severity.HIGH
+                if stats["max_temp"] > 85:
+                    severity = Severity.CRITICAL
+
+                findings.append({
+                    "type": "suspected_cryptojacking",
+                    "severity": severity,
+                    "agent": host,
+                    "max_temp": stats["max_temp"],
+                    "details": f"Sustained 95%+ CPU usage over {self.cpu_sustained_minutes} mins on {host}. Max Temp: {stats['max_temp']}C"
+                })
+
+        return findings
+
+    def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        actions = []
+        for finding in findings:
+            alert = {
+                "severity": finding["severity"],
+                "title": f"Hardware Anomaly: {finding['type']}",
+                "details": finding["details"],
+                "agent_name": finding["agent"]
+            }
+            actions.append({"action": "alert", "data": alert})
+            if finding["severity"] == Severity.CRITICAL:
+                actions.append({"action": "escalate", "data": finding})
+        return actions
+
+    def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        results = {"alerts_sent": 0, "escalations": 0}
+        for action in actions:
+            if action["action"] == "alert":
+                alert_data = action["data"]
+                self.alerter.send_alert(
+                    severity=alert_data["severity"],
+                    title=alert_data["title"],
+                    details=alert_data["details"],
+                    agent_name=alert_data["agent_name"]
                 )
+                results["alerts_sent"] += 1
+            elif action["action"] == "escalate":
+                self.report_to_supervisor(action["data"])
+                results["escalations"] += 1
+        return results
 
 if __name__ == "__main__":
     agent = HardwareAnomalyAgent()
-    agent.start()
+    agent.run_loop()
