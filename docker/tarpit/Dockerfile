@@ -2,8 +2,8 @@ FROM python:3.9-alpine
 
 WORKDIR /app
 
-# Install aiohttp
-RUN pip install aiohttp
+# Install dependencies
+RUN pip install aiohttp redis
 
 # Copy the tarpit script
 COPY app.py .

@@ -2,6 +2,17 @@ import asyncio
 import random
 import time
 from aiohttp import web
+import redis
+import json
+import datetime
+
+# Setup Redis connection (pointing to the Broker in the Khandaq Core)
+# In production, this will route through the WireGuard tunnel
+try:
+    redis_client = redis.Redis(host='redis-broker', port=6379, db=0, socket_timeout=2)
+except Exception as e:
+    print(f"[-] Redis connection failed: {e}")
+    redis_client = None
 
 # ==============================================================================
 # Tarpit Server (حفرة القطران) - Malicious Active Defense
@@ -17,8 +28,23 @@ async def tarpit_handler(request):
     and send back 1 random byte every 10-20 seconds... forever.
     """
     attacker_ip = request.remote
-    print(f"[!] Tarpit engaged: Trapped scanner from {attacker_ip} on path {request.path}")
+    path = request.path
+    print(f"[!] Tarpit engaged: Trapped scanner from {attacker_ip} on path {path}")
     
+    # Send silent alert to Kimi via Redis Broker
+    if redis_client:
+        try:
+            alert = {
+                "source": "Labyrinth-Tarpit",
+                "attacker_ip": attacker_ip,
+                "path_scanned": path,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "action": "Connection Frozen"
+            }
+            redis_client.publish("labyrinth_alerts", json.dumps(alert))
+        except Exception:
+            pass
+
     response = web.StreamResponse()
     response.headers['Content-Type'] = 'text/html'
     response.headers['Server'] = 'Apache/2.4.41 (Ubuntu)' # Fake header
