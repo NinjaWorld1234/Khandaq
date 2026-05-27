@@ -380,6 +380,45 @@ class HoneypotMonitorAgent(BaseAgent):
         return {"alerts_sent": alerts_sent, "ips_blocked": ips_blocked, "intel_stored": intel_stored}
 
 
+    def handle_labyrinth_alert(self, message: dict[str, Any]) -> None:
+        """Handle direct alerts from Labyrinth Tarpit / HoneyFS"""
+        try:
+            payload = message.get("payload", {})
+            if isinstance(payload, str):
+                import json
+                payload = json.loads(payload)
+                
+            attacker_ip = payload.get("attacker_ip")
+            if not attacker_ip: return
+            
+            finding = {
+                "source_ip": attacker_ip,
+                "is_internal": self._is_internal(attacker_ip),
+                "in_production": False,
+                "attack_types": {payload.get("action", "honeyfs_trap")},
+                "event_count": 1,
+                "first_seen": payload.get("timestamp"),
+                "last_seen": payload.get("timestamp"),
+                "credentials_tried": [],
+                "commands": [f"Scanned path: {payload.get('path_scanned')}"],
+                "description": f"Direct Tarpit/HoneyFS Hit: {payload.get('action')}"
+            }
+            
+            # Immediately act on it
+            self.act([
+                {"type": "block_ip", "source_ip": attacker_ip},
+                {"type": "alert", "severity": Severity.CRITICAL, "title": "Deception Mesh Trap Triggered", "details": finding, "cooldown_key": f"trap:{attacker_ip}"},
+                {"type": "store_intel", "finding": finding},
+                {"type": "escalate", "finding": finding}
+            ])
+        except Exception as e:
+            logger.error(f"Failed to handle labyrinth alert: {e}")
+
+    def run_loop(self) -> None:
+        if hasattr(self, 'redis_bus') and self.redis_bus:
+            self.redis_bus.subscribe("labyrinth_alerts", self.handle_labyrinth_alert)
+        super().run_loop()
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------

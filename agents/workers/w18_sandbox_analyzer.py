@@ -208,7 +208,34 @@ class SandboxAnalyzerAgent(BaseAgent):
                 "description": f"Extension mismatch – {ext} file is actually executable: {path}",
             })
 
+        # Submit suspicious files to Cuckoo Sandbox if they are unknown
+        if results and ext in _MALICIOUS_EXTS:
+            self._submit_to_cuckoo(path, host)
+
         return results
+
+    def _submit_to_cuckoo(self, file_path: str, host: str) -> None:
+        """Submit suspicious file to local Cuckoo Sandbox via REST API"""
+        # Note: In production, the file must be accessible (e.g. via shared network volume or fetched from Zeek/Wazuh extraction)
+        cuckoo_api_url = "http://localhost:8090/tasks/create/file"
+        try:
+            import requests
+            import os
+            # If we don't have the file locally, we just log the intent.
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as f:
+                    files = {"file": (os.path.basename(file_path), f)}
+                    resp = requests.post(cuckoo_api_url, files=files, timeout=5)
+                    if resp.status_code == 200:
+                        task_id = resp.json().get("task_id")
+                        logger.info(f"Successfully submitted {file_path} to Cuckoo Sandbox. Task ID: {task_id}")
+                    else:
+                        logger.warning(f"Cuckoo submission failed with status {resp.status_code}")
+            else:
+                logger.info(f"File {file_path} from host {host} not available locally for Sandbox submission. Requesting endpoint agent to upload.")
+                # We could dispatch a message to the agent to retrieve it.
+        except Exception as e:
+            logger.debug(f"Cuckoo API unavailable or request failed: {e}")
 
     def _check_hashes_bulk(self, hashes: list[str]) -> dict[str, str]:
         """Look up file hashes against the known malware hash index."""

@@ -71,8 +71,47 @@ async def tarpit_handler(request):
     
     return response
 
+async def backup_trap_handler(request):
+    """
+    Serves the fake database backup and triggers a CRITICAL alert.
+    """
+    attacker_ip = request.remote
+    print(f"[!] CRITICAL TRAP TRIGGERED: Attacker {attacker_ip} tried to download database backup!")
+    
+    # Send critical alert to Kimi via Redis Broker
+    if redis_client:
+        try:
+            alert = {
+                "source": "Labyrinth-HoneyFS",
+                "attacker_ip": attacker_ip,
+                "path_scanned": request.path,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+                "action": "Database Backup Download Attempt",
+                "severity": "CRITICAL"
+            }
+            redis_client.publish("labyrinth_alerts", json.dumps(alert))
+        except Exception:
+            pass
+
+    # Read the fake backup file from the mounted volume
+    fake_db_path = "/honeyfs/database_backup_2026.sql"
+    content = b"-- MySQL dump 10.13  Distrib 8.0.26, for Linux (x86_64)\n-- Fake Database Structure\n"
+    if os.path.exists(fake_db_path):
+        try:
+            with open(fake_db_path, "rb") as f:
+                content = f.read()
+        except Exception:
+            pass
+
+    response = web.Response(body=content, content_type='application/sql')
+    response.headers['Content-Disposition'] = 'attachment; filename="database_backup_2026.sql"'
+    return response
+
 app = web.Application()
-# Catch all routes
+# Trap routes
+app.router.add_route('GET', '/backup/database_backup_2026.sql', backup_trap_handler)
+app.router.add_route('GET', '/database_backup_2026.sql', backup_trap_handler)
+# Catch all routes (Tarpit)
 app.router.add_route('*', '/{tail:.*}', tarpit_handler)
 
 if __name__ == '__main__':

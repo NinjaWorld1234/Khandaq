@@ -22,24 +22,46 @@ CTI_URL = "https://cti.api.crowdsec.net/v2/smoke/decisions"
 SHARED_VOLUME_PATH = "/shared/crowdsec_intel.json"
 
 def fetch_threat_intel():
-    """Fetch the latest malicious IPs from CrowdSec."""
-    logging.info("Connecting to CrowdSec CTI...")
+    """Fetch the latest malicious IPs from FireHOL Level 1 as CrowdSec fallback."""
+    logging.info("Connecting to Threat Intel Feed (FireHOL Level 1)...")
     
-    # Mocking the fetch for demonstration. In reality, you'd pass the API key in headers:
-    # headers = {"x-api-key": CTI_API_KEY}
-    # response = requests.get(CTI_URL, headers=headers)
+    FIREHOL_URL = "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
+    bad_ips = []
     
-    # For this Air-Gapped demo, we simulate fetching a list of known bad IPs.
-    # Replace this block with actual requests.get() logic.
-    mock_bad_ips = [
-        {"ip": "185.153.196.15", "reason": "ssh_brute_force", "confidence": 100},
-        {"ip": "45.133.1.20", "reason": "port_scanning", "confidence": 98},
-        {"ip": "194.26.29.111", "reason": "http_cve_exploit", "confidence": 100},
-        {"ip": "103.145.13.10", "reason": "botnet_c2", "confidence": 95}
-    ]
-    
-    logging.info(f"Successfully downloaded {len(mock_bad_ips)} high-confidence malicious IPs.")
-    return mock_bad_ips
+    try:
+        response = requests.get(FIREHOL_URL, timeout=10)
+        response.raise_for_status()
+        
+        for line in response.text.splitlines():
+            line = line.strip()
+            # Skip comments and empty lines
+            if not line or line.startswith("#"):
+                continue
+            
+            # FireHOL Level 1 contains subnets and IPs.
+            bad_ips.append({
+                "ip": line,
+                "reason": "firehol_level1_malicious",
+                "confidence": 100
+            })
+            
+            # Limit to 5000 records to prevent memory bloat in the offline JSON
+            if len(bad_ips) >= 5000:
+                break
+                
+        logging.info(f"Successfully downloaded {len(bad_ips)} high-confidence malicious IPs/Subnets.")
+    except Exception as e:
+        logging.error(f"Failed to fetch Threat Intel: {e}")
+        # Fallback to mock data if no internet
+        bad_ips = [
+            {"ip": "185.153.196.15", "reason": "ssh_brute_force", "confidence": 100},
+            {"ip": "45.133.1.20", "reason": "port_scanning", "confidence": 98},
+            {"ip": "194.26.29.111", "reason": "http_cve_exploit", "confidence": 100},
+            {"ip": "103.145.13.10", "reason": "botnet_c2", "confidence": 95}
+        ]
+        logging.info("Using local fallback malicious IPs.")
+        
+    return bad_ips
 
 def write_to_shared_volume(data):
     """Write the intel to the one-way shared volume."""
