@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -64,7 +65,8 @@ class DetectionSupervisor(BaseAgent):
         self._insider_risks: Dict[str, float] = {}
         self._escalated_keys: Dict[str, float] = {}
         self._escalate_cooldown = 300  # 5 min
-        
+        self._cache_lock = threading.Lock()
+
         # Initialize LLM Client for RAG Analysis
         self._llm = LLMClient(config=self.config)
 
@@ -76,11 +78,14 @@ class DetectionSupervisor(BaseAgent):
         """Callback for messages from managed workers via Redis."""
         try:
             data = message if isinstance(message, dict) else json.loads(message)
-            source = data.get("source_agent", data.get("agent_name", data.get("sender", "")))
-            data["_received_at"] = time.time()
-            data["_source"] = source
-            self._recent_alerts.append(data)
-            logger.debug("Received report from %s", source)
+            sender = data.get("sender", "unknown")
+            payload = data.get("payload", {})
+            payload["_received_at"] = time.time()
+            payload["_source"] = sender
+            with self._cache_lock:
+
+                self._recent_alerts.append(payload)
+            logger.debug("Received report from %s", sender)
         except Exception as exc:
             logger.error("Failed to parse worker message: %s", exc)
 
@@ -97,7 +102,9 @@ class DetectionSupervisor(BaseAgent):
             if now - a.get("_received_at", 0) < 600
         ]
         batch = list(self._recent_alerts)
-        self._recent_alerts.clear()
+        with self._cache_lock:
+
+            self._recent_alerts.clear()
         return batch
 
     # ------------------------------------------------------------------
@@ -109,62 +116,71 @@ class DetectionSupervisor(BaseAgent):
         now = time.time()
 
         for alert in data:
-            source = alert.get("_source", "")
-            host = alert.get("host", alert.get("agent_name", ""))
-            severity_raw = alert.get("severity", "MEDIUM")
-            severity = self._parse_severity(severity_raw)
-            alert_type = alert.get("type", alert.get("rule", ""))
-            src_ip = alert.get("src_ip", alert.get("source_ip", ""))
+            try:
+                source = alert.get("_source", "")
+                host = alert.get("host", alert.get("agent_name", ""))
+                severity_raw = alert.get("severity", "MEDIUM")
+                severity = self._parse_severity(severity_raw)
+                alert.get("type", alert.get("rule", ""))
+                src_ip = alert.get("src_ip", alert.get("source_ip", ""))
 
-            # Categorize by source agent type
-            if "anomaly" in source.lower() or "w13" in source.lower():
-                self._host_anomalies[host].append({"time": now, "alert": alert})
-            elif "threat_feed" in source.lower() or "w19" in source.lower():
-                if "ioc" in str(alert).lower():
-                    for h in self._host_anomalies:
-                        self._ioc_matches[h].append({"time": now, "ioc_alert": alert})
-            elif "honeypot" in source.lower() or "w35" in source.lower():
-                if src_ip:
-                    self._honeypot_ips.add(src_ip)
-            elif "ueba" in source.lower() or "w38" in source.lower():
-                user = alert.get("user", host)
-                self._ueba_risks[user] = alert.get("risk_score", 0)
-            elif "insider" in source.lower() or "w42" in source.lower():
-                user = alert.get("user", host)
-                self._insider_risks[user] = alert.get("risk_score", 0)
+                # Categorize by source agent type
+                if "anomaly" in source.lower() or "w13" in source.lower():
+                    self._host_anomalies[host].append({"time": now, "alert": alert})
+                elif "threat_feed" in source.lower() or "w19" in source.lower():
+                    if "ioc" in str(alert).lower():
+                        for h in self._host_anomalies:
+                            self._ioc_matches[h].append({"time": now, "ioc_alert": alert})
+                elif "honeypot" in source.lower() or "w35" in source.lower():
+                    if src_ip:
+                        self._honeypot_ips.add(src_ip)
+                elif "ueba" in source.lower() or "w38" in source.lower():
+                    user = alert.get("user", host)
+                    self._ueba_risks[user] = alert.get("risk_score", 0)
+                elif "insider" in source.lower() or "w42" in source.lower():
+                    user = alert.get("user", host)
+                    self._insider_risks[user] = alert.get("risk_score", 0)
 
-            # Always forward HIGH/CRITICAL
-            if severity >= Severity.HIGH:
-                findings.append({
-                    "type": "worker_alert",
-                    "source": source,
-                    "severity": severity,
-                    "host": host,
-                    "details": alert,
-                })
+                # Always forward HIGH/CRITICAL
+                if severity >= Severity.HIGH:
+                    findings.append({
+                        "type": "worker_alert",
+                        "source": source,
+                        "severity": severity,
+                        "host": host,
+                        "details": alert,
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating alert: %s", e)
 
         # ── Correlation Rule 1: Anomaly + IOC match ──
         for host, anomalies in self._host_anomalies.items():
-            recent_anomalies = [a for a in anomalies if now - a["time"] < _CORRELATION_WINDOW]
-            ioc_hits = [m for m in self._ioc_matches.get(host, [])
-                        if now - m["time"] < _CORRELATION_WINDOW]
-            if recent_anomalies and ioc_hits:
-                key = f"anomaly_ioc:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "KNOWN_THREAT_CONFIRMED",
-                        "severity": Severity.CRITICAL,
-                        "host": host,
-                        "details": f"Anomaly detected on {host} matches known IOC from threat feed",
-                        "anomaly_count": len(recent_anomalies),
-                        "ioc_count": len(ioc_hits),
-                    })
+            try:
+                recent_anomalies = [a for a in anomalies if now - a["time"] < _CORRELATION_WINDOW]
+                ioc_hits = [m for m in self._ioc_matches.get(host, [])
+                            if now - m["time"] < _CORRELATION_WINDOW]
+                if recent_anomalies and ioc_hits:
+                    key = f"anomaly_ioc:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "KNOWN_THREAT_CONFIRMED",
+                            "severity": Severity.CRITICAL,
+                            "host": host,
+                            "details": f"Anomaly detected on {host} matches known IOC from threat feed",
+                            "anomaly_count": len(recent_anomalies),
+                            "ioc_count": len(ioc_hits),
+                        })
+            except Exception as e:
+                logger.warning("Error processing rule 1 correlation: %s", e)
 
         # ── Correlation Rule 3: Campaign detection ──
         hosts_with_anomalies = set()
         for host, anomalies in self._host_anomalies.items():
-            if any(now - a["time"] < _CORRELATION_WINDOW for a in anomalies):
-                hosts_with_anomalies.add(host)
+            try:
+                if any(now - a["time"] < _CORRELATION_WINDOW for a in anomalies):
+                    hosts_with_anomalies.add(host)
+            except Exception as e:
+                logger.warning("Error collecting campaign anomalies: %s", e)
         if len(hosts_with_anomalies) >= _CAMPAIGN_THRESHOLD:
             key = "campaign:" + ",".join(sorted(hosts_with_anomalies)[:5])
             if self._should_escalate(key, now):
@@ -177,33 +193,39 @@ class DetectionSupervisor(BaseAgent):
 
         # ── Correlation Rule 4: Honeypot IP in production ──
         for alert in data:
-            src_ip = alert.get("src_ip", alert.get("source_ip", ""))
-            if src_ip and src_ip in self._honeypot_ips:
-                host = alert.get("host", "")
-                key = f"honeypot_prod:{src_ip}:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "HONEYPOT_IP_IN_PRODUCTION",
-                        "severity": Severity.CRITICAL,
-                        "host": host,
-                        "src_ip": src_ip,
-                        "details": f"IP {src_ip} seen in honeypot is now active in production on {host}",
-                    })
+            try:
+                src_ip = alert.get("src_ip", alert.get("source_ip", ""))
+                if src_ip and src_ip in self._honeypot_ips:
+                    host = alert.get("host", "")
+                    key = f"honeypot_prod:{src_ip}:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "HONEYPOT_IP_IN_PRODUCTION",
+                            "severity": Severity.CRITICAL,
+                            "host": host,
+                            "src_ip": src_ip,
+                            "details": f"IP {src_ip} seen in honeypot is now active in production on {host}",
+                        })
+            except Exception as e:
+                logger.warning("Error processing rule 4 honeypot alert: %s", e)
 
         # ── Correlation Rule 5: UEBA + Insider threat ──
         for user in set(self._ueba_risks) & set(self._insider_risks):
-            combined = self._ueba_risks[user] + self._insider_risks[user]
-            if combined > 120:
-                key = f"insider_ueba:{user}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "COMPOUND_INSIDER_RISK",
-                        "severity": Severity.CRITICAL,
-                        "user": user,
-                        "ueba_score": self._ueba_risks[user],
-                        "dlp_score": self._insider_risks[user],
-                        "details": f"User {user} has compound risk: UEBA={self._ueba_risks[user]}, DLP={self._insider_risks[user]}",
-                    })
+            try:
+                combined = self._ueba_risks[user] + self._insider_risks[user]
+                if combined > 120:
+                    key = f"insider_ueba:{user}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "COMPOUND_INSIDER_RISK",
+                            "severity": Severity.CRITICAL,
+                            "user": user,
+                            "ueba_score": self._ueba_risks[user],
+                            "dlp_score": self._insider_risks[user],
+                            "details": f"User {user} has compound risk: UEBA={self._ueba_risks[user]}, DLP={self._insider_risks[user]}",
+                        })
+            except Exception as e:
+                logger.warning("Error processing rule 5 ueba/insider alert: %s", e)
 
         # Prune old data
         self._prune_windows(now)
@@ -216,10 +238,13 @@ class DetectionSupervisor(BaseAgent):
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = []
         for f in findings:
-            severity = f.get("severity", Severity.MEDIUM)
-            actions.append({"action": "escalate_to_commander", "finding": f})
-            if severity >= Severity.CRITICAL:
-                actions.append({"action": "log_correlation", "finding": f})
+            try:
+                severity = f.get("severity", Severity.MEDIUM)
+                actions.append({"action": "escalate_to_commander", "finding": f})
+                if severity >= Severity.CRITICAL:
+                    actions.append({"action": "log_correlation", "finding": f})
+            except Exception as e:
+                logger.warning("Error escalating finding: %s", e)
         return actions
 
     # ------------------------------------------------------------------
@@ -234,14 +259,14 @@ class DetectionSupervisor(BaseAgent):
                 if action["action"] == "escalate_to_commander":
                     # Perform RAG AI Analysis before escalating
                     ai_analysis = self._llm.rag_analyze_alert(f, self.os_client)
-                    
+
                     payload = {
                         "supervisor": self.name,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "type": f.get("type", "detection_alert"),
                         "severity": f.get("severity", Severity.MEDIUM).name
-                            if hasattr(f.get("severity"), "name")
-                            else str(f.get("severity")),
+                        if hasattr(f.get("severity"), "name")
+                        else str(f.get("severity")),
                         "host": f.get("host", ""),
                         "details": f.get("details", ""),
                         "ai_analysis": ai_analysis,

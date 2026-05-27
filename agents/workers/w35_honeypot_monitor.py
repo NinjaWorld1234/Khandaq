@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -82,6 +83,7 @@ class HoneypotMonitorAgent(BaseAgent):
         self._known_attackers: Dict[str, Dict[str, Any]] = {}
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown = 300  # 5 min cooldown per attacker IP
+        self._cache_lock = threading.Lock()
 
     @staticmethod
     def _is_internal(ip: str) -> bool:
@@ -90,7 +92,9 @@ class HoneypotMonitorAgent(BaseAgent):
 
     @staticmethod
     def _extract(doc: Dict[str, Any], dotted_key: str) -> Optional[str]:
-        """Extract a nested value from a dict using dotted key notation."""
+        """Extract a nested or flattened value from a dict."""
+        if dotted_key in doc:
+            return str(doc[dotted_key])
         current: Any = doc
         for key in dotted_key.split("."):
             if isinstance(current, dict):
@@ -118,7 +122,7 @@ class HoneypotMonitorAgent(BaseAgent):
                 }
             }
             honeypot_events = self.os_client.get_events_since(
-                index=self._alert_index, minutes=2, query=hp_query, size=2000,
+                index=self._alert_index, minutes=2, query=hp_query, size=10000,
             )
             production_ips: Set[str] = set()
             if honeypot_events:
@@ -135,7 +139,7 @@ class HoneypotMonitorAgent(BaseAgent):
                         }
                     }
                     prod_events = self.os_client.get_events_since(
-                        index=self._alert_index, minutes=60, query=prod_query, size=500,
+                        index=self._alert_index, minutes=60, query=prod_query, size=10000,
                     )
                     production_ips = {
                         self._extract(e, "data.srcip") for e in prod_events
@@ -163,67 +167,75 @@ class HoneypotMonitorAgent(BaseAgent):
         })
 
         for event in events:
-            src_ip = self._extract(event, "data.srcip")
-            if not src_ip:
-                continue
+            try:
+                src_ip = self._extract(event, "data.srcip")
+                if not src_ip:
+                    self._events_processed += 1
+                    self._metrics.inc_events(1)
+                    continue
 
-            rule_id = self._extract(event, "rule.id") or "unknown"
-            timestamp = self._extract(event, "@timestamp") or ""
-            attack_type = _RULE_TO_ATTACK.get(rule_id, "unknown_interaction")
-            command = self._extract(event, "data.command")
-            username = self._extract(event, "data.dstuser") or self._extract(event, "data.username")
-            password = self._extract(event, "data.password")
+                rule_id = self._extract(event, "rule.id") or "unknown"
+                timestamp = self._extract(event, "@timestamp") or ""
+                attack_type = _RULE_TO_ATTACK.get(rule_id, "unknown_interaction")
+                command = self._extract(event, "data.command")
+                username = self._extract(event, "data.dstuser") or self._extract(event, "data.username")
+                password = self._extract(event, "data.password")
 
-            prof = profiles[src_ip]
-            prof["attack_types"].add(attack_type)
-            prof["rule_ids"].add(rule_id)
-            prof["event_count"] += 1
-            if not prof["first_seen"] or timestamp < prof["first_seen"]:
-                prof["first_seen"] = timestamp
-            if not prof["last_seen"] or timestamp > prof["last_seen"]:
-                prof["last_seen"] = timestamp
-            if command and len(prof["commands"]) < 20:
-                prof["commands"].append(command)
-            if username and password:
-                cred = f"{username}:{password}"
-                if cred not in prof["credentials"] and len(prof["credentials"]) < 20:
-                    prof["credentials"].append(cred)
-            if src_ip in prod_ips:
-                prof["in_production"] = True
+                prof = profiles[src_ip]
+                prof["attack_types"].add(attack_type)
+                prof["rule_ids"].add(rule_id)
+                prof["event_count"] += 1
+                if not prof["first_seen"] or timestamp < prof["first_seen"]:
+                    prof["first_seen"] = timestamp
+                if not prof["last_seen"] or timestamp > prof["last_seen"]:
+                    prof["last_seen"] = timestamp
+                if command and len(prof["commands"]) < 20:
+                    prof["commands"].append(command)
+                if username and password:
+                    cred = f"{username}:{password}"
+                    if cred not in prof["credentials"] and len(prof["credentials"]) < 20:
+                        prof["credentials"].append(cred)
+                if src_ip in prod_ips:
+                    prof["in_production"] = True
 
-        self._events_processed += len(events)
-        self._metrics.inc_events(len(events))
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing Honeypot event: %s", e)
 
         for src_ip, prof in profiles.items():
-            is_internal = self._is_internal(src_ip)
-            in_prod = prof["in_production"]
+            try:
+                is_internal = self._is_internal(src_ip)
+                in_prod = prof["in_production"]
 
-            if is_internal or in_prod:
-                severity = Severity.CRITICAL
-            elif prof["event_count"] >= 20 or len(prof["attack_types"]) >= 3:
-                severity = Severity.CRITICAL
-            else:
-                severity = Severity.HIGH
+                if is_internal or in_prod:
+                    severity = Severity.CRITICAL
+                elif prof["event_count"] >= 20 or len(prof["attack_types"]) >= 3:
+                    severity = Severity.CRITICAL
+                else:
+                    severity = Severity.HIGH
 
-            desc_parts = [f"Honeypot interaction from {src_ip}"]
-            if is_internal:
-                desc_parts.append("INTERNAL IP — possible compromised host")
-            if in_prod:
-                desc_parts.append("Also seen in production network traffic")
+                desc_parts = [f"Honeypot interaction from {src_ip}"]
+                if is_internal:
+                    desc_parts.append("INTERNAL IP — possible compromised host")
+                if in_prod:
+                    desc_parts.append("Also seen in production network traffic")
 
-            findings.append({
-                "source_ip": src_ip,
-                "severity": severity,
-                "is_internal": is_internal,
-                "in_production": in_prod,
-                "attack_types": sorted(prof["attack_types"]),
-                "event_count": prof["event_count"],
-                "first_seen": prof["first_seen"],
-                "last_seen": prof["last_seen"],
-                "commands": prof["commands"][:10],
-                "credentials_tried": len(prof["credentials"]),
-                "description": " | ".join(desc_parts),
-            })
+                findings.append({
+                    "source_ip": src_ip,
+                    "severity": severity,
+                    "is_internal": is_internal,
+                    "in_production": in_prod,
+                    "attack_types": sorted(prof["attack_types"]),
+                    "event_count": prof["event_count"],
+                    "first_seen": prof["first_seen"],
+                    "last_seen": prof["last_seen"],
+                    "commands": prof["commands"][:10],
+                    "credentials_tried": len(prof["credentials"]),
+                    "description": " | ".join(desc_parts),
+                })
+            except Exception as e:
+                logger.warning("Error processing Honeypot profile: %s", e)
 
         if findings:
             logger.warning("Detected %d honeypot attacker(s)", len(findings))
@@ -239,37 +251,40 @@ class HoneypotMonitorAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            src_ip = finding["source_ip"]
-            cooldown_key = f"hp:{src_ip}"
-            last = self._alerted_cache.get(cooldown_key, 0.0)
+            try:
+                src_ip = finding["source_ip"]
+                cooldown_key = f"hp:{src_ip}"
+                last = self._alerted_cache.get(cooldown_key, 0.0)
 
-            if now - last >= self._alert_cooldown:
-                actions.append({
-                    "type": "alert",
-                    "severity": finding["severity"],
-                    "title": "Honeypot Interaction — Confirmed Attacker",
-                    "details": {
-                        "source_ip": src_ip,
-                        "is_internal": finding["is_internal"],
-                        "in_production": finding["in_production"],
-                        "attack_types": ", ".join(finding["attack_types"]),
-                        "event_count": finding["event_count"],
-                        "credentials_tried": finding["credentials_tried"],
-                        "description": finding["description"],
-                    },
-                    "cooldown_key": cooldown_key,
-                })
+                if now - last >= self._alert_cooldown:
+                    actions.append({
+                        "type": "alert",
+                        "severity": finding["severity"],
+                        "title": "Honeypot Interaction — Confirmed Attacker",
+                        "details": {
+                            "source_ip": src_ip,
+                            "is_internal": finding["is_internal"],
+                            "in_production": finding["in_production"],
+                            "attack_types": ", ".join(finding["attack_types"]),
+                            "event_count": finding["event_count"],
+                            "credentials_tried": finding["credentials_tried"],
+                            "description": finding["description"],
+                        },
+                        "cooldown_key": cooldown_key,
+                    })
 
-            if self._auto_block:
-                actions.append({"type": "block_ip", "source_ip": src_ip})
+                if self._auto_block:
+                    actions.append({"type": "block_ip", "source_ip": src_ip})
 
-            actions.append({"type": "store_intel", "finding": finding})
+                actions.append({"type": "store_intel", "finding": finding})
 
-            if finding["is_internal"] or finding["in_production"]:
-                actions.append({
-                    "type": "escalate",
-                    "finding": finding,
-                })
+                if finding["is_internal"] or finding["in_production"]:
+                    actions.append({
+                        "type": "escalate",
+                        "finding": finding,
+                    })
+            except Exception as e:
+                logger.warning("Error deciding for Honeypot finding: %s", e)
 
         return actions
 
@@ -284,69 +299,75 @@ class HoneypotMonitorAgent(BaseAgent):
         intel_stored = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["cooldown_key"]] = time.time()
-
-            elif action["type"] == "block_ip":
-                try:
-                    self.redis_bus.publish("soc:firewall-commands", {
-                        "action": "block",
-                        "ip": action["source_ip"],
-                        "reason": "honeypot_interaction",
-                        "agent": self.name,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    ips_blocked += 1
-                    logger.warning("Issued block for attacker IP %s", action["source_ip"])
-                except Exception as exc:
-                    logger.error("Failed to block IP %s: %s", action["source_ip"], exc)
-
-            elif action["type"] == "store_intel":
-                try:
-                    finding = action["finding"]
-                    doc_id = hashlib.sha256(finding["source_ip"].encode()).hexdigest()[:16]
-                    self.os_client.index_document(
-                        index=self._intel_index,
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "source_ip": finding["source_ip"],
-                            "is_internal": finding["is_internal"],
-                            "in_production": finding["in_production"],
-                            "attack_types": finding["attack_types"],
-                            "event_count": finding["event_count"],
-                            "first_seen": finding["first_seen"],
-                            "last_seen": finding["last_seen"],
-                            "credentials_tried": finding["credentials_tried"],
-                            "commands_sample": finding["commands"],
-                        },
-                        doc_id=doc_id,
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    intel_stored += 1
-                except Exception as exc:
-                    logger.error("Failed to store honeypot intel: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        with self._cache_lock:
 
-            elif action["type"] == "escalate":
-                finding = action["finding"]
-                self.report_to_supervisor({
-                    "type": "honeypot_critical",
-                    "source_ip": finding["source_ip"],
-                    "is_internal": finding["is_internal"],
-                    "in_production": finding["in_production"],
-                    "description": finding["description"],
-                })
+                            self._alerted_cache[action["cooldown_key"]] = time.time()
+
+                elif action["type"] == "block_ip":
+                    try:
+                        self.redis_bus.publish("soc:firewall-commands", {
+                            "action": "block",
+                            "ip": action["source_ip"],
+                            "reason": "honeypot_interaction",
+                            "agent": self.name,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        })
+                        ips_blocked += 1
+                        logger.warning("Issued block for attacker IP %s", action["source_ip"])
+                    except Exception as exc:
+                        logger.error("Failed to block IP %s: %s", action["source_ip"], exc)
+
+                elif action["type"] == "store_intel":
+                    try:
+                        finding = action["finding"]
+                        doc_id = hashlib.sha256(finding["source_ip"].encode()).hexdigest()[:16]
+                        self.os_client.index_document(
+                            index=self._intel_index,
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "source_ip": finding["source_ip"],
+                                "is_internal": finding["is_internal"],
+                                "in_production": finding["in_production"],
+                                "attack_types": list(finding["attack_types"]),
+                                "event_count": finding["event_count"],
+                                "first_seen": finding["first_seen"],
+                                "last_seen": finding["last_seen"],
+                                "credentials_tried": finding["credentials_tried"],
+                                "commands_sample": finding["commands"],
+                            },
+                            doc_id=doc_id,
+                        )
+                        intel_stored += 1
+                    except Exception as exc:
+                        logger.error("Failed to store honeypot intel: %s", exc)
+
+                elif action["type"] == "escalate":
+                    finding = action["finding"]
+                    self.report_to_supervisor({
+                        "type": "honeypot_critical",
+                        "source_ip": finding["source_ip"],
+                        "is_internal": finding["is_internal"],
+                        "in_production": finding["in_production"],
+                        "description": finding["description"],
+                    })
+            except Exception as e:
+                logger.warning("Error executing Honeypot action: %s", e)
 
         # Prune stale cooldown entries
         cutoff = time.time() - self._alert_cooldown * 3
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         if alerts_sent or ips_blocked:
             self.report_to_supervisor({

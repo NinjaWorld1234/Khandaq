@@ -20,7 +20,6 @@ Interval: 3600 seconds (hourly)
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -121,7 +120,7 @@ class ComplianceMonitorAgent(BaseAgent):
                         "minimum_should_match": 1,
                     }
                 },
-                size=5000,
+                size=10000,
             )
 
             # Collect vulnerability / patch status events
@@ -129,14 +128,17 @@ class ComplianceMonitorAgent(BaseAgent):
                 index="wazuh-alerts-*",
                 minutes=65,
                 query={"match": {"rule.groups": "vulnerability-detector"}},
-                size=2000,
+                size=10000,
             )
 
             # Group events by host (agent name)
             hosts: Dict[str, List[Dict[str, Any]]] = {}
             for event in sca_events + vuln_events:
-                host = event.get("agent", {}).get("name", "unknown")
-                hosts.setdefault(host, []).append(event)
+                try:
+                    host = (event.get("agent") or {}).get("name", "unknown")
+                    hosts.setdefault(host, []).append(event)
+                except Exception as e:
+                    logger.warning("Error grouping event: %s", e)
 
             logger.info("Collected compliance data from %d hosts", len(hosts))
             return hosts if hosts else None
@@ -154,51 +156,54 @@ class ComplianceMonitorAgent(BaseAgent):
         findings: List[Dict[str, Any]] = []
 
         for host, events in data.items():
-            check_results = self._evaluate_host(host, events)
-            score = self._compute_score(check_results)
+            try:
+                check_results = self._evaluate_host(host, events)
+                score = self._compute_score(check_results)
 
-            # Determine severity based on score
-            if score < self._critical_score:
-                severity = Severity.CRITICAL
-            elif score < self._warning_score:
-                severity = Severity.HIGH
-            elif score < 90:
-                severity = Severity.MEDIUM
-            else:
-                severity = Severity.LOW
+                # Determine severity based on score
+                if score < self._critical_score:
+                    severity = Severity.CRITICAL
+                elif score < self._warning_score:
+                    severity = Severity.HIGH
+                elif score < 90:
+                    severity = Severity.MEDIUM
+                else:
+                    severity = Severity.LOW
 
-            # Detect score trends
-            previous = self._previous_scores.get(host)
-            trend = "stable"
-            if previous is not None:
-                delta = score - previous
-                if delta <= -10:
-                    trend = "degrading"
-                elif delta >= 10:
-                    trend = "improving"
+                # Detect score trends
+                previous = self._previous_scores.get(host)
+                trend = "stable"
+                if previous is not None:
+                    delta = score - previous
+                    if delta <= -10:
+                        trend = "degrading"
+                    elif delta >= 10:
+                        trend = "improving"
 
-            failed_checks = [
-                name for name, result in check_results.items()
-                if result["status"] == "fail"
-            ]
+                failed_checks = [
+                    name for name, result in check_results.items()
+                    if result["status"] == "fail"
+                ]
 
-            findings.append({
-                "host": host,
-                "score": score,
-                "severity": severity,
-                "trend": trend,
-                "previous_score": previous,
-                "check_results": check_results,
-                "failed_checks": failed_checks,
-                "total_events": len(events),
-                "description": (
-                    f"Host '{host}' compliance score: {score}/100 "
-                    f"({len(failed_checks)} failed checks, trend: {trend})"
-                ),
-            })
+                findings.append({
+                    "host": host,
+                    "score": score,
+                    "severity": severity,
+                    "trend": trend,
+                    "previous_score": previous,
+                    "check_results": check_results,
+                    "failed_checks": failed_checks,
+                    "total_events": len(events),
+                    "description": (
+                        f"Host '{host}' compliance score: {score}/100 "
+                        f"({len(failed_checks)} failed checks, trend: {trend})"
+                    ),
+                })
 
-            # Update stored score for next cycle
-            self._previous_scores[host] = score
+                # Update stored score for next cycle
+                self._previous_scores[host] = score
+            except Exception as e:
+                logger.warning("Error evaluating compliance for host: %s", e)
 
         self._events_processed += sum(len(evts) for evts in data.values())
         return findings
@@ -213,56 +218,65 @@ class ComplianceMonitorAgent(BaseAgent):
         pending_patches = 0
 
         for event in events:
-            rule_id = str(event.get("rule", {}).get("id", ""))
-            sca_result = event.get("data", {}).get("sca", {}).get("check", {}).get("result", "")
-            rule_level = int(event.get("rule", {}).get("level", 0))
+            try:
+                rule_dict = event.get("rule") or {}
+                rule_id = str(rule_dict.get("id", ""))
+                
+                data_dict = event.get("data") or {}
+                sca_result = ((data_dict.get("sca") or {}).get("check") or {}).get("result", "")
+                rule_level = int(rule_dict.get("level", 0))
 
-            if sca_result == "passed" or rule_level <= 3:
-                passed_rules.add(rule_id)
-            else:
-                failed_rules.add(rule_id)
+                if sca_result == "passed" or rule_level <= 3:
+                    passed_rules.add(rule_id)
+                else:
+                    failed_rules.add(rule_id)
 
-            # Count pending vulnerability patches
-            if event.get("rule", {}).get("groups", []) == ["vulnerability-detector"]:
-                vuln_status = event.get("data", {}).get("vulnerability", {}).get("status", "")
-                if vuln_status in ("Active", "active"):
-                    pending_patches += 1
+                # Count pending vulnerability patches
+                if rule_dict.get("groups", []) == ["vulnerability-detector"]:
+                    vuln_status = (data_dict.get("vulnerability") or {}).get("status", "")
+                    if vuln_status in ("Active", "active"):
+                        pending_patches += 1
+            except Exception as e:
+                logger.warning("Error evaluating host event: %s", e)
 
         results: Dict[str, Dict[str, Any]] = {}
         for check_name, check_cfg in _COMPLIANCE_CHECKS.items():
-            expected_ids = set(check_cfg["rule_ids"])
-            matched_pass = expected_ids & passed_rules
-            matched_fail = expected_ids & failed_rules
+            try:
+                expected_ids = set(check_cfg["rule_ids"])
+                matched_pass = expected_ids & passed_rules
+                matched_fail = expected_ids & failed_rules
 
-            if check_name == "patch_compliance":
-                # Special handling: fail if there are pending patches
-                if pending_patches > 5:
+                if check_name == "patch_compliance":
+                    # Special handling: fail if there are pending patches
+                    if pending_patches > 5:
+                        status = "fail"
+                        pct = max(0, 100 - pending_patches * 5)
+                    elif pending_patches > 0:
+                        status = "partial"
+                        pct = max(50, 100 - pending_patches * 10)
+                    else:
+                        status = "pass"
+                        pct = 100
+                elif matched_fail:
                     status = "fail"
-                    pct = max(0, 100 - pending_patches * 5)
-                elif pending_patches > 0:
-                    status = "partial"
-                    pct = max(50, 100 - pending_patches * 10)
-                else:
+                    pct = int(len(matched_pass) / max(len(expected_ids), 1) * 100)
+                elif matched_pass:
                     status = "pass"
                     pct = 100
-            elif matched_fail:
-                status = "fail"
-                pct = int(len(matched_pass) / max(len(expected_ids), 1) * 100)
-            elif matched_pass:
-                status = "pass"
-                pct = 100
-            else:
-                # No data — assume unknown/partial compliance
-                status = "unknown"
-                pct = 50
+                else:
+                    # No data — assume unknown/partial compliance
+                    status = "unknown"
+                    pct = 50
 
-            results[check_name] = {
-                "status": status,
-                "pass_pct": pct,
-                "weight": check_cfg["weight"],
-                "description": check_cfg["description"],
-                "pending_patches": pending_patches if check_name == "patch_compliance" else None,
-            }
+                results[check_name] = {
+                    "status": status,
+                    "pass_pct": pct,
+                    "weight": check_cfg["weight"],
+                    "description": check_cfg["description"],
+                    "pending_patches": pending_patches if check_name == "patch_compliance" else None,
+                }
+            except Exception as e:
+                logger.warning("Error evaluating check %s: %s", check_name, e)
 
         return results
 
@@ -270,7 +284,10 @@ class ComplianceMonitorAgent(BaseAgent):
         """Compute a weighted compliance score (0-100)."""
         weighted_sum = 0.0
         for result in check_results.values():
-            weighted_sum += (result["pass_pct"] / 100.0) * result["weight"]
+            try:
+                weighted_sum += (result["pass_pct"] / 100.0) * result["weight"]
+            except Exception as e:
+                logger.warning("Error computing score for result: %s", e)
         return round((weighted_sum / _TOTAL_WEIGHT) * 100, 1)
 
     # ------------------------------------------------------------------
@@ -282,27 +299,30 @@ class ComplianceMonitorAgent(BaseAgent):
         actions: List[Dict[str, Any]] = []
 
         for finding in findings:
-            # Always store compliance results
-            actions.append({"type": "store_compliance", "finding": finding})
+            try:
+                # Always store compliance results
+                actions.append({"type": "store_compliance", "finding": finding})
 
-            # Alert only on non-compliant or degrading hosts
-            if finding["score"] < self._warning_score or finding["trend"] == "degrading":
-                actions.append({
-                    "type": "alert",
-                    "severity": finding["severity"],
-                    "title": f"Compliance Alert: {finding['host']} ({finding['score']}/100)",
-                    "details": {
-                        "host": finding["host"],
-                        "score": finding["score"],
-                        "trend": finding["trend"],
-                        "failed_checks": ", ".join(finding["failed_checks"]) or "none",
-                        "previous_score": finding.get("previous_score", "N/A"),
-                    },
-                })
+                # Alert only on non-compliant or degrading hosts
+                if finding["score"] < self._warning_score or finding["trend"] == "degrading":
+                    actions.append({
+                        "type": "alert",
+                        "severity": finding["severity"],
+                        "title": f"Compliance Alert: {finding['host']} ({finding['score']}/100)",
+                        "details": {
+                            "host": finding["host"],
+                            "score": finding["score"],
+                            "trend": finding["trend"],
+                            "failed_checks": ", ".join(finding["failed_checks"]) or "none",
+                            "previous_score": finding.get("previous_score", "N/A"),
+                        },
+                    })
 
-            # Escalate critical non-compliance
-            if finding["severity"] >= Severity.HIGH:
-                actions.append({"type": "escalate", "finding": finding})
+                # Escalate critical non-compliance
+                if finding["severity"] >= Severity.HIGH:
+                    actions.append({"type": "escalate", "finding": finding})
+            except Exception as e:
+                logger.warning("Error evaluating compliance action: %s", e)
 
         return actions
 
@@ -317,57 +337,60 @@ class ComplianceMonitorAgent(BaseAgent):
         escalations = 0
 
         for action in actions:
-            if action["type"] == "store_compliance":
-                try:
-                    finding = action["finding"]
-                    # Serialize check_results for OpenSearch
-                    serialized_checks = {}
-                    for name, result in finding["check_results"].items():
-                        serialized_checks[name] = {
-                            "status": result["status"],
-                            "pass_pct": result["pass_pct"],
-                        }
+            try:
+                if action["type"] == "store_compliance":
+                    try:
+                        finding = action["finding"]
+                        # Serialize check_results for OpenSearch
+                        serialized_checks = {}
+                        for name, result in finding["check_results"].items():
+                            serialized_checks[name] = {
+                                "status": result["status"],
+                                "pass_pct": result["pass_pct"],
+                            }
 
-                    self.os_client.index_document(
-                        index="soc-compliance",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "host": finding["host"],
-                            "score": finding["score"],
-                            "trend": finding["trend"],
-                            "previous_score": finding.get("previous_score"),
-                            "severity": finding["severity"].name,
-                            "failed_checks": finding["failed_checks"],
-                            "check_results": serialized_checks,
-                            "total_events": finding["total_events"],
-                        },
+                        self.os_client.index_document(
+                            index="soc-compliance",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "host": finding["host"],
+                                "score": finding["score"],
+                                "trend": finding["trend"],
+                                "previous_score": finding.get("previous_score"),
+                                "severity": finding["severity"].name,
+                                "failed_checks": finding["failed_checks"],
+                                "check_results": serialized_checks,
+                                "total_events": finding["total_events"],
+                            },
+                        )
+                        stored += 1
+                    except Exception as exc:
+                        logger.error("Failed to store compliance results: %s", exc)
+
+                elif action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    stored += 1
-                except Exception as exc:
-                    logger.error("Failed to store compliance results: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
 
-            elif action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-
-            elif action["type"] == "escalate":
-                finding = action["finding"]
-                self.report_to_supervisor({
-                    "type": "compliance_escalation",
-                    "host": finding["host"],
-                    "score": finding["score"],
-                    "failed_checks": finding["failed_checks"],
-                    "trend": finding["trend"],
-                })
-                escalations += 1
+                elif action["type"] == "escalate":
+                    finding = action["finding"]
+                    self.report_to_supervisor({
+                        "type": "compliance_escalation",
+                        "host": finding["host"],
+                        "score": finding["score"],
+                        "failed_checks": finding["failed_checks"],
+                        "trend": finding["trend"],
+                    })
+                    escalations += 1
+            except Exception as e:
+                logger.warning("Error executing compliance action: %s", e)
 
         if stored:
             self.report_to_supervisor({

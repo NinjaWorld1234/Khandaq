@@ -24,6 +24,7 @@ import hashlib
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -183,6 +184,7 @@ class SecretScannerAgent(BaseAgent):
         # Dedup: fingerprint → last_alert_ts
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown: int = self._agent_config.get("alert_cooldown", 1800)
+        self._cache_lock = threading.Lock()
 
         # Track unique secrets per cycle for summary reporting
         self._cycle_stats: Dict[str, int] = {}
@@ -223,7 +225,7 @@ class SecretScannerAgent(BaseAgent):
                 index="wazuh-alerts-*",
                 minutes=6,
                 query=query,
-                size=5000,
+                size=10000,
             )
         except Exception as exc:
             logger.error("Failed to collect FIM/log events: %s", exc)
@@ -239,48 +241,54 @@ class SecretScannerAgent(BaseAgent):
         self._cycle_stats.clear()
 
         for event in data:
-            host = event.get("agent", {}).get("name", "unknown-host")
-            host_ip = event.get("agent", {}).get("ip", "")
-            syscheck = event.get("syscheck", {})
-            file_path = syscheck.get("path", event.get("location", ""))
-            full_log = event.get("full_log", "")
-            diff_content = syscheck.get("diff", "")
+            try:
+                host = (event.get("agent") or {}).get("name", "unknown-host")
+                host_ip = (event.get("agent") or {}).get("ip", "")
+                syscheck = event.get("syscheck", {})
+                file_path = syscheck.get("path", event.get("location", ""))
+                full_log = event.get("full_log", "")
+                diff_content = syscheck.get("diff", "")
 
-            # Skip known-safe paths
-            if any(safe in file_path for safe in _SAFE_PATHS):
-                continue
-
-            # Combine all searchable text
-            searchable = f"{full_log}\n{diff_content}"
-            if not searchable.strip():
-                continue
-
-            # Run every pattern against the text
-            for secret_type, (pattern, severity, description) in _SECRET_PATTERNS.items():
-                match = pattern.search(searchable)
-                if not match:
+                # Skip known-safe paths
+                if any(safe in file_path for safe in _SAFE_PATHS):
                     continue
 
-                matched_text = match.group(0)
-                fp = _fingerprint(secret_type, host, file_path, matched_text)
+                # Combine all searchable text
+                searchable = f"{full_log}\n{diff_content}"
+                if not searchable.strip():
+                    continue
 
-                findings.append({
-                    "secret_type": secret_type,
-                    "severity": severity,
-                    "host": host,
-                    "host_ip": host_ip,
-                    "file_path": file_path,
-                    "description": description,
-                    "matched_redacted": _redact(matched_text),
-                    "fingerprint": fp,
-                    "event_timestamp": event.get(
-                        "timestamp", datetime.now(timezone.utc).isoformat()
-                    ),
-                })
+                # Run every pattern against the text
+                for secret_type, (pattern, severity, description) in _SECRET_PATTERNS.items():
+                    try:
+                        match = pattern.search(searchable)
+                        if not match:
+                            continue
 
-                self._cycle_stats[secret_type] = (
-                    self._cycle_stats.get(secret_type, 0) + 1
-                )
+                        matched_text = match.group(0)
+                        fp = _fingerprint(secret_type, host, file_path, matched_text)
+
+                        findings.append({
+                            "secret_type": secret_type,
+                            "severity": severity,
+                            "host": host,
+                            "host_ip": host_ip,
+                            "file_path": file_path,
+                            "description": description,
+                            "matched_redacted": _redact(matched_text),
+                            "fingerprint": fp,
+                            "event_timestamp": event.get(
+                                "timestamp", datetime.now(timezone.utc).isoformat()
+                            ),
+                        })
+
+                        self._cycle_stats[secret_type] = (
+                            self._cycle_stats.get(secret_type, 0) + 1
+                        )
+                    except Exception as e:
+                        logger.warning("Error searching pattern %s: %s", secret_type, e)
+            except Exception as e:
+                logger.warning("Error processing event: %s", e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -296,30 +304,35 @@ class SecretScannerAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            fp = finding["fingerprint"]
+            try:
+                fp = finding["fingerprint"]
 
-            # Always store the finding
-            actions.append({"type": "log_secret", "finding": finding})
+                # Always store the finding
+                actions.append({"type": "log_secret", "finding": finding})
 
-            # Cooldown check for alerting
-            if now - self._alerted_cache.get(fp, 0.0) < self._alert_cooldown:
-                continue
+                # Cooldown check for alerting
+                with self._cache_lock:
+                    last_alert = self._alerted_cache.get(fp, 0.0)
+                if now - last_alert < self._alert_cooldown:
+                    continue
 
-            # Create alert — always CRITICAL for secrets (override to at least CRITICAL)
-            alert_severity = max(finding["severity"], Severity.CRITICAL)
-            actions.append({
-                "type": "alert",
-                "severity": alert_severity,
-                "title": f"Exposed Secret: {finding['secret_type'].replace('_', ' ').title()}",
-                "details": {
-                    k: v for k, v in finding.items()
-                    if k not in ("severity", "fingerprint")
-                },
-                "fingerprint": fp,
-            })
+                # Create alert — always CRITICAL for secrets (override to at least CRITICAL)
+                alert_severity = max(finding["severity"], Severity.CRITICAL)
+                actions.append({
+                    "type": "alert",
+                    "severity": alert_severity,
+                    "title": f"Exposed Secret: {finding['secret_type'].replace('_', ' ').title()}",
+                    "details": {
+                        k: v for k, v in finding.items()
+                        if k not in ("severity", "fingerprint")
+                    },
+                    "fingerprint": fp,
+                })
 
-            # All secret exposures escalate to supervisor
-            actions.append({"type": "escalate", "finding": finding})
+                # All secret exposures escalate to supervisor
+                actions.append({"type": "escalate", "finding": finding})
+            except Exception as e:
+                logger.warning("Error evaluating secret finding action: %s", e)
 
         return actions
 
@@ -334,58 +347,63 @@ class SecretScannerAgent(BaseAgent):
         secrets_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["fingerprint"]] = time.time()
-
-            elif action["type"] == "escalate":
-                finding = action["finding"]
-                self.report_to_supervisor({
-                    "type": "secret_exposure_escalation",
-                    "secret_type": finding["secret_type"],
-                    "host": finding["host"],
-                    "file_path": finding["file_path"],
-                    "description": finding["description"],
-                    "matched_redacted": finding["matched_redacted"],
-                })
-                escalations += 1
-
-            elif action["type"] == "log_secret":
-                try:
-                    finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-secrets",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "secret_type": finding["secret_type"],
-                            "severity": finding["severity"].name,
-                            "host": finding["host"],
-                            "host_ip": finding.get("host_ip", ""),
-                            "file_path": finding["file_path"],
-                            "description": finding["description"],
-                            "matched_redacted": finding["matched_redacted"],
-                            "fingerprint": finding["fingerprint"],
-                            "event_timestamp": finding["event_timestamp"],
-                        },
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    secrets_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to index secret finding: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+                            self._alerted_cache[action["fingerprint"]] = time.time()
+
+                elif action["type"] == "escalate":
+                    finding = action["finding"]
+                    self.report_to_supervisor({
+                        "type": "secret_exposure_escalation",
+                        "secret_type": finding["secret_type"],
+                        "host": finding["host"],
+                        "file_path": finding["file_path"],
+                        "description": finding["description"],
+                        "matched_redacted": finding["matched_redacted"],
+                    })
+                    escalations += 1
+
+                elif action["type"] == "log_secret":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-secrets",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "secret_type": finding["secret_type"],
+                                "severity": finding["severity"].name,
+                                "host": finding["host"],
+                                "host_ip": finding.get("host_ip", ""),
+                                "file_path": finding["file_path"],
+                                "description": finding["description"],
+                                "matched_redacted": finding["matched_redacted"],
+                                "fingerprint": finding["fingerprint"],
+                                "event_timestamp": finding["event_timestamp"],
+                            },
+                        )
+                        secrets_logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to index secret finding: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing secret action: %s", e)
 
         # Prune stale cooldown entries
         cutoff = time.time() - self._alert_cooldown * 2
-        self._alerted_cache = {
-            k: v for k, v in self._alerted_cache.items() if v > cutoff
-        }
+        with self._cache_lock:
+            self._alerted_cache = {
+                k: v for k, v in self._alerted_cache.items() if v > cutoff
+            }
 
         # Summary report to supervisor
         if alerts_sent or secrets_logged:

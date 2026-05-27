@@ -242,25 +242,40 @@ class RedisBus:
             The subscriber thread.
         """
         def _listener() -> None:
-            pubsub = self.client.pubsub()
-            pubsub.subscribe(channel)
-            logger.info("Subscribed to channel '%s'", channel)
-
-            for raw_msg in pubsub.listen():
-                if not self._running:
-                    break
-                if raw_msg["type"] != "message":
-                    continue
+            pubsub = None
+            while self._running:
                 try:
-                    parsed = self._unwrap_message(raw_msg["data"])
-                    callback(parsed)
-                except Exception as exc:
-                    logger.error(
-                        "Error in subscriber callback for '%s': %s", channel, exc
-                    )
+                    if pubsub is None:
+                        pubsub = self.client.pubsub()
+                        pubsub.subscribe(channel)
+                        logger.info("Subscribed to channel '%s'", channel)
 
-            pubsub.unsubscribe(channel)
-            pubsub.close()
+                    raw_msg = pubsub.get_message(timeout=1.0)
+                    if raw_msg is None:
+                        continue
+                    if raw_msg["type"] != "message":
+                        continue
+                    try:
+                        parsed = self._unwrap_message(raw_msg["data"])
+                        callback(parsed)
+                    except Exception as exc:
+                        logger.error(
+                            "Error in subscriber callback for '%s': %s", channel, exc
+                        )
+                except redis.ConnectionError as exc:
+                    logger.warning("Redis PubSub connection lost on channel '%s': %s. Reconnecting in 5s...", channel, exc)
+                    pubsub = None
+                    time.sleep(5)
+                except Exception as exc:
+                    logger.error("Unexpected error in subscriber for '%s': %s", channel, exc)
+                    time.sleep(1)
+
+            if pubsub:
+                try:
+                    pubsub.unsubscribe(channel)
+                    pubsub.close()
+                except Exception:
+                    pass
             logger.info("Unsubscribed from channel '%s'", channel)
 
         thread = threading.Thread(

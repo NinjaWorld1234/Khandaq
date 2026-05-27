@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -134,6 +135,7 @@ class CloudTrailAgent(BaseAgent):
         # Deduplication: change_key → last_alert_ts
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown: int = self._agent_config.get("alert_cooldown", 900)
+        self._cache_lock = threading.Lock()
 
         # Track per-host change volume for anomaly detection
         self._host_change_counts: Dict[str, int] = defaultdict(int)
@@ -177,7 +179,7 @@ class CloudTrailAgent(BaseAgent):
                 index="wazuh-alerts-*",
                 minutes=3,
                 query=query,
-                size=5000,
+                size=10000,
             )
         except Exception as exc:
             logger.error("Failed to collect infra-trail events: %s", exc)
@@ -193,89 +195,97 @@ class CloudTrailAgent(BaseAgent):
         self._host_change_counts.clear()
 
         for event in data:
-            agent_info = event.get("agent", {})
-            host = agent_info.get("name", "unknown-host")
-            agent_ip = agent_info.get("ip", "")
-            rule = event.get("rule", {})
-            rule_id = rule.get("id", "")
-            rule_desc = rule.get("description", "")
-            full_log = event.get("full_log", "")
-            timestamp = event.get("timestamp", datetime.now(timezone.utc).isoformat())
-            user = (
-                event.get("data", {}).get("srcuser")
-                or event.get("data", {}).get("dstuser")
-                or event.get("data", {}).get("audit", {}).get("loginuid", "")
-                or "unknown"
-            )
-            syscheck_path = event.get("syscheck", {}).get("path", "")
+            try:
+                agent_info = event.get("agent") or {}
+                host = agent_info.get("name", "unknown-host")
+                agent_ip = agent_info.get("ip", "")
+                rule = event.get("rule") or {}
+                rule_id = rule.get("id", "")
+                rule_desc = rule.get("description", "")
+                full_log = event.get("full_log", "")
+                timestamp = event.get("timestamp", datetime.now(timezone.utc).isoformat())
+                data_block = event.get("data") or {}
+                user = (
+                    data_block.get("srcuser")
+                    or data_block.get("dstuser")
+                    or (data_block.get("audit") or {}).get("loginuid", "")
+                    or "unknown"
+                )
+                syscheck_path = (event.get("syscheck") or {}).get("path", "")
 
-            # --- Determine category ---
-            category: Optional[str] = None
+                # --- Determine category ---
+                category: Optional[str] = None
 
-            # First, check Wazuh rule ID mapping
-            if rule_id in _RULE_CATEGORIES:
-                category = _RULE_CATEGORIES[rule_id]
+                # First, check Wazuh rule ID mapping
+                if rule_id in _RULE_CATEGORIES:
+                    category = _RULE_CATEGORIES[rule_id]
 
-            # Second, scan log text against regex patterns
-            if category is None:
-                for cat_name, pattern in _LOG_PATTERNS.items():
-                    if pattern.search(full_log) or pattern.search(rule_desc):
-                        category = cat_name
-                        break
+                # Second, scan log text against regex patterns
+                if category is None:
+                    for cat_name, pattern in _LOG_PATTERNS.items():
+                        if pattern.search(full_log) or pattern.search(rule_desc):
+                            category = cat_name
+                            break
 
-            # Third, fall back on syscheck paths
-            if category is None and syscheck_path:
-                if "cron" in syscheck_path:
-                    category = "crontab_change"
-                elif ".service" in syscheck_path:
-                    category = "systemd_service"
-                elif "authorized_keys" in syscheck_path:
-                    category = "ssh_key_addition"
+                # Third, fall back on syscheck paths
+                if category is None and syscheck_path:
+                    if "cron" in syscheck_path:
+                        category = "crontab_change"
+                    elif ".service" in syscheck_path:
+                        category = "systemd_service"
+                    elif "authorized_keys" in syscheck_path:
+                        category = "ssh_key_addition"
 
-            if category is None:
-                continue  # Not an infra-change we care about
+                if category is None:
+                    self._events_processed += 1
+                    self._metrics.inc_events(1)
+                    continue  # Not an infra-change we care about
 
-            # --- Determine severity ---
-            severity = (
-                Severity.HIGH if category in _PRIVILEGE_CATEGORIES
-                else Severity.MEDIUM
-            )
+                # --- Determine severity ---
+                severity = (
+                    Severity.HIGH if category in _PRIVILEGE_CATEGORIES
+                    else Severity.MEDIUM
+                )
 
-            # --- Extract detail ---
-            detail = rule_desc or full_log[:300]
+                # --- Extract detail ---
+                detail = rule_desc or full_log[:300]
 
-            finding = {
-                "category": category,
-                "severity": severity,
-                "host": host,
-                "host_ip": agent_ip,
-                "who": user,
-                "what": detail,
-                "when": timestamp,
-                "where": syscheck_path or f"rule:{rule_id}",
-                "rule_id": rule_id,
-            }
-            findings.append(finding)
+                finding = {
+                    "category": category,
+                    "severity": severity,
+                    "host": host,
+                    "host_ip": agent_ip,
+                    "who": user,
+                    "what": detail,
+                    "when": timestamp,
+                    "where": syscheck_path or f"rule:{rule_id}",
+                    "rule_id": rule_id,
+                }
+                findings.append(finding)
 
-            self._host_change_counts[host] += 1
+                self._host_change_counts[host] += 1
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing Cloud Trail event: %s", e)
 
         # --- Burst detection: too many changes on a single host ---
         for host, count in self._host_change_counts.items():
-            if count >= self._change_burst_threshold:
-                findings.append({
-                    "category": "change_burst",
-                    "severity": Severity.HIGH,
-                    "host": host,
-                    "host_ip": "",
-                    "who": "multiple",
-                    "what": f"Burst of {count} infrastructure changes on {host} in a single cycle",
-                    "when": datetime.now(timezone.utc).isoformat(),
-                    "where": "aggregate",
-                    "rule_id": "",
-                })
-
-        self._events_processed += len(data)
-        self._metrics.inc_events(len(data))
+            try:
+                if count >= self._change_burst_threshold:
+                    findings.append({
+                        "category": "change_burst",
+                        "severity": Severity.HIGH,
+                        "host": host,
+                        "host_ip": "",
+                        "who": "multiple",
+                        "what": f"Burst of {count} infrastructure changes on {host} in a single cycle",
+                        "when": datetime.now(timezone.utc).isoformat(),
+                        "where": "aggregate",
+                        "rule_id": "",
+                    })
+            except Exception as e:
+                logger.warning("Error processing change burst: %s", e)
         return findings
 
     # ------------------------------------------------------------------
@@ -288,32 +298,35 @@ class CloudTrailAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            change_key = (
-                f"{finding['category']}:{finding['host']}:"
-                f"{finding['who']}:{finding['where']}"
-            )
+            try:
+                change_key = (
+                    f"{finding['category']}:{finding['host']}:"
+                    f"{finding['who']}:{finding['where']}"
+                )
 
-            # Cooldown deduplication
-            if now - self._alerted_cache.get(change_key, 0.0) < self._alert_cooldown:
-                # Still log the change, just skip the alert
+                # Cooldown deduplication
+                if now - self._alerted_cache.get(change_key, 0.0) < self._alert_cooldown:
+                    # Still log the change, just skip the alert
+                    actions.append({"type": "log_change", "finding": finding})
+                    continue
+
+                # Alert
+                actions.append({
+                    "type": "alert",
+                    "severity": finding["severity"],
+                    "title": f"Infra Change: {finding['category'].replace('_', ' ').title()}",
+                    "details": {k: v for k, v in finding.items() if k != "severity"},
+                    "change_key": change_key,
+                })
+
+                # Escalate if HIGH or above
+                if finding["severity"] >= Severity.HIGH:
+                    actions.append({"type": "escalate", "finding": finding})
+
+                # Always log to the tracking index
                 actions.append({"type": "log_change", "finding": finding})
-                continue
-
-            # Alert
-            actions.append({
-                "type": "alert",
-                "severity": finding["severity"],
-                "title": f"Infra Change: {finding['category'].replace('_', ' ').title()}",
-                "details": {k: v for k, v in finding.items() if k != "severity"},
-                "change_key": change_key,
-            })
-
-            # Escalate if HIGH or above
-            if finding["severity"] >= Severity.HIGH:
-                actions.append({"type": "escalate", "finding": finding})
-
-            # Always log to the tracking index
-            actions.append({"type": "log_change", "finding": finding})
+            except Exception as e:
+                logger.warning("Error deciding for Cloud Trail finding: %s", e)
 
         return actions
 
@@ -328,47 +341,52 @@ class CloudTrailAgent(BaseAgent):
         changes_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["change_key"]] = time.time()
-
-            elif action["type"] == "escalate":
-                self.report_to_supervisor({
-                    "type": "infra_change_escalation",
-                    **action["finding"],
-                })
-                escalations += 1
-
-            elif action["type"] == "log_change":
-                try:
-                    finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-infra-changes",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "category": finding["category"],
-                            "severity": finding["severity"].name,
-                            "host": finding["host"],
-                            "host_ip": finding.get("host_ip", ""),
-                            "who": finding["who"],
-                            "what": finding["what"],
-                            "when": finding["when"],
-                            "where": finding["where"],
-                            "rule_id": finding.get("rule_id", ""),
-                        },
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    changes_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to index infra change: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+
+                            self._alerted_cache[action["change_key"]] = time.time()
+
+                elif action["type"] == "escalate":
+                    self.report_to_supervisor({
+                        "type": "infra_change_escalation",
+                        **action["finding"],
+                    })
+                    escalations += 1
+
+                elif action["type"] == "log_change":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-infra-changes",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "category": finding["category"],
+                                "severity": finding["severity"].name,
+                                "host": finding["host"],
+                                "host_ip": finding.get("host_ip", ""),
+                                "who": finding["who"],
+                                "what": finding["what"],
+                                "when": finding["when"],
+                                "where": finding["where"],
+                                "rule_id": finding.get("rule_id", ""),
+                            },
+                        )
+                        changes_logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to index infra change: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing Cloud Trail action: %s", e)
 
         # Prune stale cooldown entries
         cutoff = time.time() - self._alert_cooldown * 2

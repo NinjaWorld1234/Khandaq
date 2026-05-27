@@ -50,7 +50,7 @@ services:
     volumes:
       - labyrinth-cowrie-logs:/cowrie/cowrie-git/var/log/cowrie
       # Mount the fake filesystem so the attacker finds the Zip Bomb & Canary
-      - /root/khandaq-labyrinth/honeyfs:/cowrie/cowrie-git/honeyfs
+      - ./tarpit/honeyfs:/cowrie/cowrie-git/honeyfs
 
   # ===========================================================================
   # Web Tarpit: Malicious Active Defense for web scanners

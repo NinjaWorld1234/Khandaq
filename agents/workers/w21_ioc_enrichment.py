@@ -19,7 +19,6 @@ from __future__ import annotations
 import ipaddress
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -33,7 +32,7 @@ logger = logging.getLogger("soc.agent.w21_ioc_enrichment")
 # Enrichment constants
 # ---------------------------------------------------------------------------
 
-MAX_IOCS_PER_CYCLE = 50
+MAX_IOCS_PER_CYCLE = 10000
 IOC_INDEX = "soc-iocs"
 
 # RFC1918 private ranges
@@ -68,8 +67,8 @@ _COMMON_LEGIT_DOMAINS: list[re.Pattern[str]] = [
 
 # Hash format patterns
 _HASH_PATTERNS: Dict[str, re.Pattern[str]] = {
-    "md5":    re.compile(r"^[a-fA-F0-9]{32}$"),
-    "sha1":   re.compile(r"^[a-fA-F0-9]{40}$"),
+    "md5": re.compile(r"^[a-fA-F0-9]{32}$"),
+    "sha1": re.compile(r"^[a-fA-F0-9]{40}$"),
     "sha256": re.compile(r"^[a-fA-F0-9]{64}$"),
 }
 
@@ -98,7 +97,8 @@ class IOCEnrichmentAgent(BaseAgent):
             supervisor_channel="soc:detection-supervisor",
         )
         self._ioc_index: str = self._agent_config.get("ioc_index", IOC_INDEX)
-        self._max_per_cycle: int = self._agent_config.get("max_per_cycle", MAX_IOCS_PER_CYCLE)
+        self._max_per_cycle: int = self._agent_config.get(
+            "max_per_cycle", MAX_IOCS_PER_CYCLE)
         self._total_enriched: int = 0
 
     # ------------------------------------------------------------------
@@ -118,12 +118,14 @@ class IOCEnrichmentAgent(BaseAgent):
                     ],
                 }
             }
-            critical_iocs = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._ioc_index,
-                minutes=0,
-                query=critical_query,
+                body={"query": critical_query},
                 size=self._max_per_cycle,
             )
+            critical_iocs = [
+                hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])
+            ]
 
             remaining = self._max_per_cycle - len(critical_iocs)
             other_iocs: list[dict[str, Any]] = []
@@ -140,17 +142,21 @@ class IOCEnrichmentAgent(BaseAgent):
                         ],
                     }
                 }
-                other_iocs = self.os_client.get_events_since(
+                results = self.os_client.search(
                     index=self._ioc_index,
-                    minutes=0,
-                    query=other_query,
+                    body={"query": other_query},
                     size=remaining,
                 )
+                other_iocs = [
+                    hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])
+                ]
 
             combined = critical_iocs + other_iocs
             logger.info(
                 "Collected %d unenriched IOCs (%d CRITICAL-priority, %d other)",
-                len(combined), len(critical_iocs), len(other_iocs),
+                len(combined),
+                len(critical_iocs),
+                len(other_iocs),
             )
             return combined if combined else None
         except Exception as exc:
@@ -166,35 +172,38 @@ class IOCEnrichmentAgent(BaseAgent):
         findings: list[dict[str, Any]] = []
 
         for ioc in data:
-            ioc_id = ioc.get("_id", ioc.get("id", "unknown"))
-            ioc_value = ioc.get("value", "").strip()
-            ioc_type = ioc.get("type", "unknown").lower()
+            try:
+                ioc_id = ioc.get("_id", ioc.get("id", "unknown"))
+                ioc_value = ioc.get("value", "").strip()
+                ioc_type = ioc.get("type", "unknown").lower()
 
-            enrichment: Dict[str, Any] = {
-                "ioc_id": ioc_id,
-                "ioc_value": ioc_value,
-                "ioc_type": ioc_type,
-                "is_private": False,
-                "is_common_domain": False,
-                "geo_risk_score": 0.0,
-                "format_valid": True,
-                "enrichment_notes": [],
-            }
+                enrichment: Dict[str, Any] = {
+                    "ioc_id": ioc_id,
+                    "ioc_value": ioc_value,
+                    "ioc_type": ioc_type,
+                    "is_private": False,
+                    "is_common_domain": False,
+                    "geo_risk_score": 0.0,
+                    "format_valid": True,
+                    "enrichment_notes": [],
+                }
 
-            if ioc_type in ("ip", "ipv4", "ip-src", "ip-dst"):
-                enrichment.update(self._enrich_ip(ioc_value))
-            elif ioc_type in ("domain", "hostname", "fqdn"):
-                enrichment.update(self._enrich_domain(ioc_value))
-            elif ioc_type in ("hash", "md5", "sha1", "sha256"):
-                enrichment.update(self._enrich_hash(ioc_value, ioc_type))
-            elif ioc_type == "url":
-                enrichment.update(self._enrich_url(ioc_value))
-            else:
-                enrichment["enrichment_notes"].append(
-                    f"Unknown IOC type '{ioc_type}', no specific enrichment applied"
-                )
+                if ioc_type in ("ip", "ipv4", "ip-src", "ip-dst"):
+                    enrichment.update(self._enrich_ip(ioc_value))
+                elif ioc_type in ("domain", "hostname", "fqdn"):
+                    enrichment.update(self._enrich_domain(ioc_value))
+                elif ioc_type in ("hash", "md5", "sha1", "sha256"):
+                    enrichment.update(self._enrich_hash(ioc_value, ioc_type))
+                elif ioc_type == "url":
+                    enrichment.update(self._enrich_url(ioc_value))
+                else:
+                    enrichment["enrichment_notes"].append(
+                        f"Unknown IOC type '{ioc_type}', no specific enrichment applied"
+                    )
 
-            findings.append(enrichment)
+                findings.append(enrichment)
+            except Exception as e:
+                logger.warning("Error enriching IOC: %s", e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -210,34 +219,37 @@ class IOCEnrichmentAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
 
         for enrichment in findings:
-            actions.append({
-                "type": "update_enrichment",
-                "ioc_id": enrichment["ioc_id"],
-                "enrichment": enrichment,
-            })
-
-            # Flag private IPs / common domains as likely false-positive IOCs
-            if enrichment["is_private"] or enrichment["is_common_domain"]:
+            try:
                 actions.append({
-                    "type": "flag_benign",
+                    "type": "update_enrichment",
                     "ioc_id": enrichment["ioc_id"],
-                    "ioc_value": enrichment["ioc_value"],
-                    "reason": (
-                        "private_ip" if enrichment["is_private"]
-                        else "common_legitimate_domain"
-                    ),
+                    "enrichment": enrichment,
                 })
 
-            # Flag invalid hashes
-            if not enrichment["format_valid"] and enrichment["ioc_type"] in (
-                "hash", "md5", "sha1", "sha256"
-            ):
-                actions.append({
-                    "type": "flag_invalid",
-                    "ioc_id": enrichment["ioc_id"],
-                    "ioc_value": enrichment["ioc_value"],
-                    "reason": "invalid_hash_format",
-                })
+                # Flag private IPs / common domains as likely false-positive IOCs
+                if enrichment["is_private"] or enrichment["is_common_domain"]:
+                    actions.append({
+                        "type": "flag_benign",
+                        "ioc_id": enrichment["ioc_id"],
+                        "ioc_value": enrichment["ioc_value"],
+                        "reason": (
+                            "private_ip" if enrichment["is_private"]
+                            else "common_legitimate_domain"
+                        ),
+                    })
+
+                # Flag invalid hashes
+                if not enrichment["format_valid"] and enrichment["ioc_type"] in (
+                    "hash", "md5", "sha1", "sha256"
+                ):
+                    actions.append({
+                        "type": "flag_invalid",
+                        "ioc_id": enrichment["ioc_id"],
+                        "ioc_value": enrichment["ioc_value"],
+                        "reason": "invalid_hash_format",
+                    })
+            except Exception as e:
+                logger.warning("Error deciding action: %s", e)
 
         return actions
 
@@ -260,7 +272,8 @@ class IOCEnrichmentAgent(BaseAgent):
                         self._ioc_index,
                         document={
                             "enriched": True,
-                            "enriched_at": datetime.now(timezone.utc).isoformat(),
+                            "enriched_at": datetime.now(
+                                timezone.utc).isoformat(),
                             "enriched_by": self.name,
                             "is_private": e["is_private"],
                             "is_common_domain": e["is_common_domain"],
@@ -273,7 +286,7 @@ class IOCEnrichmentAgent(BaseAgent):
                     updated += 1
 
                 elif action["type"] == "flag_benign":
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=Severity.LOW,
                         title="Potentially Benign IOC Detected",
                         details={
@@ -283,6 +296,8 @@ class IOCEnrichmentAgent(BaseAgent):
                         },
                         agent_name=self.name,
                     )
+                    if sent:
+                        self._metrics.inc_alerts(Severity.LOW.name)
                     flagged_benign += 1
 
                 elif action["type"] == "flag_invalid":
@@ -352,10 +367,12 @@ class IOCEnrichmentAgent(BaseAgent):
             first_octet = int(str(addr).split(".")[0])
             if first_octet in _HIGH_RISK_FIRST_OCTETS:
                 result["geo_risk_score"] = 0.8
-                result["enrichment_notes"].append("First-octet maps to higher-risk geography")
+                result["enrichment_notes"].append(
+                    "First-octet maps to higher-risk geography")
             elif first_octet in _LOW_RISK_FIRST_OCTETS:
                 result["geo_risk_score"] = 0.2
-                result["enrichment_notes"].append("First-octet maps to lower-risk geography")
+                result["enrichment_notes"].append(
+                    "First-octet maps to lower-risk geography")
             else:
                 result["geo_risk_score"] = 0.5
                 result["enrichment_notes"].append("Neutral geo-risk band")
@@ -372,7 +389,9 @@ class IOCEnrichmentAgent(BaseAgent):
         }
 
         # Basic domain validation
-        if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*\.)+[a-zA-Z]{2,}$", domain):
+        if not re.match(
+            r"^[a-zA-Z0-9]([a-zA-Z0-9\-]*\.)+[a-zA-Z]{2,}$",
+                domain):
             result["format_valid"] = False
             result["enrichment_notes"].append("Unusual domain format")
 
@@ -405,12 +424,14 @@ class IOCEnrichmentAgent(BaseAgent):
         }
 
         # Determine expected hash type
-        check_types = [ioc_type] if ioc_type in _HASH_PATTERNS else list(_HASH_PATTERNS.keys())
+        check_types = [ioc_type] if ioc_type in _HASH_PATTERNS else list(
+            _HASH_PATTERNS.keys())
 
         for htype in check_types:
             if _HASH_PATTERNS[htype].match(hash_value):
                 result["format_valid"] = True
-                result["enrichment_notes"].append(f"Valid {htype.upper()} format")
+                result["enrichment_notes"].append(
+                    f"Valid {htype.upper()} format")
                 return result
 
         result["enrichment_notes"].append(
@@ -434,7 +455,8 @@ class IOCEnrichmentAgent(BaseAgent):
         for pattern in _COMMON_LEGIT_DOMAINS:
             if pattern.search(url):
                 result["is_common_domain"] = True
-                result["enrichment_notes"].append("URL host matches common legitimate domain")
+                result["enrichment_notes"].append(
+                    "URL host matches common legitimate domain")
                 break
 
         return result

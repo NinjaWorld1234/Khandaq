@@ -19,4 +19,4 @@ scrape_configs:
   - job_name: 'vllm'
     metrics_path: /metrics
     static_configs:
-      - targets: ['147.93.62.42:8000'] # Assuming vLLM metrics are exposed here on the server
+      - targets: ['vllm-commander:8000', 'vllm-worker:8001']

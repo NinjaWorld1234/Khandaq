@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -51,6 +52,7 @@ class SystemHealthAgent(BaseAgent):
             supervisor_channel="soc:infra-supervisor",
         )
         self._wazuh: Optional[WazuhClient] = None
+        self._cache_lock = threading.Lock()
         self._http = httpx.Client(timeout=10, verify=False)
 
         # Track last daily summary time (epoch)
@@ -70,7 +72,9 @@ class SystemHealthAgent(BaseAgent):
     def wazuh(self) -> WazuhClient:
         """Lazy-initialize Wazuh client."""
         if self._wazuh is None:
-            self._wazuh = WazuhClient(self.config)
+            with self._cache_lock:
+                if self._wazuh is None:
+                    self._wazuh = WazuhClient(self.config)
         return self._wazuh
 
     # ------------------------------------------------------------------
@@ -146,7 +150,7 @@ class SystemHealthAgent(BaseAgent):
         """
         try:
             events = self.os_client.get_events_since(
-                index=index, minutes=max_age_minutes, size=1
+                index=index, minutes=max_age_minutes, size=10000
             )
             is_active = len(events) > 0
             return {
@@ -175,7 +179,7 @@ class SystemHealthAgent(BaseAgent):
                 index="metricbeat-*",
                 minutes=5,
                 query={"match": {"metricset.name": "consumergroup"}},
-                size=1,
+                size=10000,
             )
             if events:
                 return {"healthy": True, "check_method": "metrics"}
@@ -255,15 +259,18 @@ class SystemHealthAgent(BaseAgent):
         findings: list[dict[str, Any]] = []
 
         for component, status in data.items():
-            if component == "timestamp":
-                continue
+            try:
+                if component == "timestamp":
+                    continue
 
-            if isinstance(status, dict) and not status.get("healthy", True):
-                findings.append({
-                    "component": component,
-                    "status": "unhealthy",
-                    "details": status,
-                })
+                if isinstance(status, dict) and not status.get("healthy", True):
+                    findings.append({
+                        "component": component,
+                        "status": "unhealthy",
+                        "details": status,
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating system health data: %s", e)
 
         # Track status for daily summary
         summary_entry = {
@@ -295,29 +302,32 @@ class SystemHealthAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
 
         for finding in findings:
-            component = finding["component"]
-            details = finding["details"]
+            try:
+                component = finding["component"]
+                details = finding["details"]
 
-            # Determine severity based on component criticality
-            if component in ("opensearch", "wazuh"):
-                severity = Severity.CRITICAL
-            elif component in ("suricata", "zeek"):
-                severity = Severity.HIGH
-            elif component == "agent_heartbeats":
-                severity = Severity.MEDIUM
-            else:
-                severity = Severity.MEDIUM
+                # Determine severity based on component criticality
+                if component in ("opensearch", "wazuh"):
+                    severity = Severity.CRITICAL
+                elif component in ("suricata", "zeek"):
+                    severity = Severity.HIGH
+                elif component == "agent_heartbeats":
+                    severity = Severity.MEDIUM
+                else:
+                    severity = Severity.MEDIUM
 
-            actions.append({
-                "type": "alert",
-                "severity": severity,
-                "title": f"SOC Component Down: {component.upper()}",
-                "details": {
-                    "component": component,
-                    "error": details.get("error", "Component unhealthy"),
-                    "check_details": details,
-                },
-            })
+                actions.append({
+                    "type": "alert",
+                    "severity": severity,
+                    "title": f"SOC Component Down: {component.upper()}",
+                    "details": {
+                        "component": component,
+                        "error": details.get("error", "Component unhealthy"),
+                        "check_details": details,
+                    },
+                })
+            except Exception as e:
+                logger.warning("Error evaluating system health finding: %s", e)
 
         # Check if daily summary is due
         now = time.time()
@@ -346,21 +356,24 @@ class SystemHealthAgent(BaseAgent):
         summary_generated = False
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
 
-            elif action["type"] == "daily_summary":
-                self._send_daily_summary()
-                summary_generated = True
-                self._last_daily_summary = time.time()
+                elif action["type"] == "daily_summary":
+                    self._send_daily_summary()
+                    summary_generated = True
+                    self._last_daily_summary = time.time()
+            except Exception as e:
+                logger.warning("Error executing system health action: %s", e)
 
         # Update events processed
         self._events_processed += 1

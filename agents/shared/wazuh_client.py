@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -44,6 +45,7 @@ class WazuhClient:
         self._cfg = (config or SOCConfig.get_instance()).wazuh
         self._token: Optional[str] = None
         self._token_expiry: float = 0.0
+        self._auth_lock = threading.Lock()
         self._http = httpx.Client(
             base_url=self._cfg.url,
             verify=self._cfg.verify_ssl,
@@ -59,23 +61,28 @@ class WazuhClient:
         Authenticate with Wazuh and obtain a JWT token.
         المصادقة مع وازوه والحصول على رمز JWT
         """
-        try:
-            resp = self._http.post(
-                _AUTH_PATH,
-                auth=(self._cfg.username, self._cfg.password),
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            self._token = data.get("data", {}).get("token", "")
-            # Wazuh tokens typically expire in 900s; refresh at 800s
-            self._token_expiry = time.time() + 800
-            logger.info("Wazuh authentication successful")
-        except httpx.HTTPStatusError as exc:
-            logger.error("Wazuh authentication failed: HTTP %d", exc.response.status_code)
-            raise
-        except httpx.RequestError as exc:
-            logger.error("Wazuh authentication request error: %s", exc)
-            raise
+        with self._auth_lock:
+            # Check again inside lock to avoid redundant authentications
+            if self._token is not None and time.time() < self._token_expiry:
+                return
+
+            try:
+                resp = self._http.post(
+                    _AUTH_PATH,
+                    auth=(self._cfg.username, self._cfg.password),
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                self._token = data.get("data", {}).get("token", "")
+                # Wazuh tokens typically expire in 900s; refresh at 800s
+                self._token_expiry = time.time() + 800
+                logger.info("Wazuh authentication successful")
+            except httpx.HTTPStatusError as exc:
+                logger.error("Wazuh authentication failed: HTTP %d", exc.response.status_code)
+                raise
+            except httpx.RequestError as exc:
+                logger.error("Wazuh authentication request error: %s", exc)
+                raise
 
     def _ensure_token(self) -> str:
         """Return a valid JWT token, refreshing if expired."""
@@ -337,7 +344,7 @@ class WazuhClient:
             agent_id=agent_id,
             command="netsh",
             arguments=["advfirewall", "set", "allprofiles", "firewallpolicy",
-                        "blockinbound,blockoutbound"],
+                       "blockinbound,blockoutbound"],
         )
 
     # ------------------------------------------------------------------

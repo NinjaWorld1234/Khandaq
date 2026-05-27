@@ -14,10 +14,10 @@ Interval: 60 seconds
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -77,6 +77,7 @@ class SandboxAnalyzerAgent(BaseAgent):
         self._scan_window_min: int = self._agent_config.get("scan_window_min", 2)
         self._alerted_cache: dict[str, float] = {}
         self._alert_cooldown: int = 600
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -93,13 +94,13 @@ class SandboxAnalyzerAgent(BaseAgent):
             ], "minimum_should_match": 1}}
             fim_events = self.os_client.get_events_since(
                 index=self._wazuh_index, minutes=self._scan_window_min,
-                query=fim_query, size=500,
+                query=fim_query, size=10000,
             )
             # Zeek file extraction events
             zeek_query = {"bool": {"must": [{"exists": {"field": "filename"}}]}}
             zeek_events = self.os_client.get_events_since(
                 index=self._zeek_index, minutes=self._scan_window_min,
-                query=zeek_query, size=300,
+                query=zeek_query, size=10000,
             )
             logger.info("Collected %d Wazuh + %d Zeek file events",
                         len(fim_events), len(zeek_events))
@@ -119,20 +120,28 @@ class SandboxAnalyzerAgent(BaseAgent):
 
         # Analyze Wazuh events
         for event in data.get("wazuh_events", []):
-            syscheck = event.get("syscheck", {})
-            file_path = syscheck.get("path", event.get("data", {}).get("path", ""))
-            file_hash = syscheck.get("sha256_after", "")
-            if file_hash:
-                all_hashes.append(file_hash)
-            findings.extend(self._check_file(file_path, file_hash, event, "wazuh"))
+            try:
+                syscheck = event.get("syscheck", {})
+                file_path = syscheck.get("path", (event.get("data") or {}).get("path", ""))
+                file_hash = syscheck.get("sha256_after", "")
+                host = (event.get("agent") or {}).get("name", "unknown")
+                if file_hash:
+                    all_hashes.append(file_hash)
+                findings.extend(self._check_file(file_path, file_hash, event, "wazuh", host))
+            except Exception as e:
+                logger.warning("Error analyzing Wazuh file event: %s", e)
 
         # Analyze Zeek events
         for event in data.get("zeek_events", []):
-            file_path = event.get("filename", "")
-            file_hash = event.get("sha256", event.get("md5", ""))
-            if file_hash:
-                all_hashes.append(file_hash)
-            findings.extend(self._check_file(file_path, file_hash, event, "zeek"))
+            try:
+                file_path = event.get("filename", "")
+                file_hash = event.get("sha256", event.get("md5", ""))
+                host = event.get("id.orig_h", "unknown")
+                if file_hash:
+                    all_hashes.append(file_hash)
+                findings.extend(self._check_file(file_path, file_hash, event, "zeek", host))
+            except Exception as e:
+                logger.warning("Error analyzing Zeek file event: %s", e)
 
         # Batch check hashes against known malware list
         if all_hashes:
@@ -152,7 +161,7 @@ class SandboxAnalyzerAgent(BaseAgent):
         return findings
 
     def _check_file(self, path: str, file_hash: str,
-                    event: dict[str, Any], source: str) -> list[dict[str, Any]]:
+                    event: dict[str, Any], source: str, host: str) -> list[dict[str, Any]]:
         """Run heuristic checks on a single file event."""
         results: list[dict[str, Any]] = []
         if not path:
@@ -163,7 +172,7 @@ class SandboxAnalyzerAgent(BaseAgent):
         if _DOUBLE_EXT_RE.search(path_lower):
             results.append({
                 "check": "double_extension", "severity": Severity.HIGH,
-                "file_path": path, "source": source, "file_hash": file_hash,
+                "file_path": path, "source": source, "file_hash": file_hash, "host": host,
                 "description": f"Double extension detected: {path}",
             })
 
@@ -175,7 +184,7 @@ class SandboxAnalyzerAgent(BaseAgent):
                     results.append({
                         "check": "malicious_ext_suspicious_dir", "severity": Severity.HIGH,
                         "file_path": path, "extension": ext, "source": source,
-                        "file_hash": file_hash,
+                        "file_hash": file_hash, "host": host,
                         "description": f"Executable ({ext}) in suspicious directory: {path}",
                     })
                     break
@@ -185,17 +194,17 @@ class SandboxAnalyzerAgent(BaseAgent):
             results.append({
                 "check": "macro_document", "severity": Severity.MEDIUM,
                 "file_path": path, "extension": ext, "source": source,
-                "file_hash": file_hash,
+                "file_hash": file_hash, "host": host,
                 "description": f"Macro-enabled Office document detected: {path}",
             })
 
         # 4. Extension mismatch: MIME-type or rule description hints at executable
-        rule_desc = event.get("rule", {}).get("description", "").lower()
+        rule_desc = (event.get("rule") or {}).get("description", "").lower()
         if ext in _DOCUMENT_EXTS and ("executable" in rule_desc or "pe32" in rule_desc):
             results.append({
                 "check": "extension_mismatch", "severity": Severity.CRITICAL,
                 "file_path": path, "extension": ext, "source": source,
-                "file_hash": file_hash,
+                "file_hash": file_hash, "host": host,
                 "description": f"Extension mismatch – {ext} file is actually executable: {path}",
             })
 
@@ -211,7 +220,7 @@ class SandboxAnalyzerAgent(BaseAgent):
             results = self.os_client.search(index=self._hash_index, body={
                 "query": query, "size": len(hashes), "_source": ["hash", "malware_name"],
             })
-            for hit in results.get("hits", {}).get("hits", []):
+            for hit in (results.get("hits") or {}).get("hits", []):
                 src = hit.get("_source", {})
                 hits[src.get("hash", "")] = src.get("malware_name", "unknown")
         except Exception as exc:
@@ -221,8 +230,11 @@ class SandboxAnalyzerAgent(BaseAgent):
     @staticmethod
     def _get_extension(path: str) -> str:
         """Extract the final file extension from a path."""
+        path_sep_pos = max(path.rfind("\\"), path.rfind("/"))
         dot_pos = path.rfind(".")
-        return path[dot_pos:] if dot_pos != -1 else ""
+        if dot_pos > path_sep_pos:
+            return path[dot_pos:]
+        return ""
 
     # ------------------------------------------------------------------
     # Decide
@@ -262,7 +274,17 @@ class SandboxAnalyzerAgent(BaseAgent):
                 if sent:
                     alerts_sent += 1
                     self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["cache_key"]] = time.time()
+                    with self._cache_lock:
+
+                        self._alerted_cache[action["cache_key"]] = time.time()
+
+                    # Forward to supervisor for potential correlation and escalation
+                    self.report_to_supervisor({
+                        "type": "sandbox_analysis_alert",
+                        "severity": action["severity"],
+                        "agent": action["details"].get("host", ""),
+                        "details": action["details"]
+                    })
             elif action["type"] == "log_incident":
                 try:
                     self.os_client.index_document("soc-file-analysis", document={

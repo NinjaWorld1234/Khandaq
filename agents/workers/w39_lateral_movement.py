@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -39,6 +40,8 @@ _RDP_PORT = 3389
 _WMI_PORTS = {135, 5985, 5986}
 
 # RFC-1918 check
+
+
 def _is_internal(ip: str) -> bool:
     """Return True if the IP belongs to a private RFC-1918 range."""
     if not ip or ip in ("-", "::1", "127.0.0.1"):
@@ -70,20 +73,26 @@ class LateralMovementAgent(BaseAgent):
             config=config,
             supervisor_channel="soc:infra-supervisor",
         )
-        self._alert_index = self._agent_config.get("alert_index", "wazuh-alerts-*")
-        self._zeek_index = self._agent_config.get("zeek_index", "filebeat-zeek-*")
+        self._alert_index = self._agent_config.get(
+            "alert_index", "wazuh-alerts-*")
+        self._zeek_index = self._agent_config.get(
+            "zeek_index", "filebeat-zeek-*")
 
         # Auth graph: user -> {(host, timestamp), ...}  — sliding window
-        self._auth_graph: Dict[str, List[Tuple[str, float]]] = defaultdict(list)
+        self._auth_graph: Dict[str,
+                               List[Tuple[str, float]]] = defaultdict(list)
         # Known RDP destinations per user (baseline)
         self._known_rdp: Dict[str, Set[str]] = defaultdict(set)
 
         # Cooldown
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown = 300
+        self._cache_lock = threading.Lock()
 
     @staticmethod
     def _extract(doc: Dict[str, Any], dotted_key: str) -> Optional[str]:
+        if dotted_key in doc:
+            return str(doc[dotted_key])
         current: Any = doc
         for key in dotted_key.split("."):
             if isinstance(current, dict):
@@ -103,25 +112,25 @@ class LateralMovementAgent(BaseAgent):
             logon_events = self.os_client.get_events_since(
                 index=self._alert_index, minutes=2,
                 query={"match": {"data.win.system.eventID": "4624"}},
-                size=5000,
+                size=10000,
             )
             # Event 4697: Service installed (PsExec marker)
             service_events = self.os_client.get_events_since(
                 index=self._alert_index, minutes=2,
                 query={"match": {"data.win.system.eventID": "4697"}},
-                size=1000,
+                size=10000,
             )
             # Event 4688: New process (WMI remote)
             process_events = self.os_client.get_events_since(
                 index=self._alert_index, minutes=2,
                 query={"match": {"data.win.system.eventID": "4688"}},
-                size=2000,
+                size=10000,
             )
             # Event 5140: Network share access
             share_events = self.os_client.get_events_since(
                 index=self._alert_index, minutes=2,
                 query={"match": {"data.win.system.eventID": "5140"}},
-                size=2000,
+                size=10000,
             )
             # Zeek conn.log: internal-to-internal SSH/RDP
             zeek_conn = self.os_client.get_events_since(
@@ -129,7 +138,7 @@ class LateralMovementAgent(BaseAgent):
                 query={"bool": {"must": [
                     {"terms": {"id.resp_p": [_SSH_PORT, _RDP_PORT]}},
                 ]}},
-                size=3000,
+                size=10000,
             )
             return {
                 "logon_events": logon_events,
@@ -164,166 +173,226 @@ class LateralMovementAgent(BaseAgent):
 
         # --- Pass-the-Hash & RDP & Multi-host from 4624 ---
         for event in logon_events:
-            user = self._extract(event, "data.win.eventdata.targetUserName") or ""
-            src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
-            dst_host = self._extract(event, "data.win.eventdata.workstationName") or ""
-            logon_type = self._extract(event, "data.win.eventdata.logonType") or ""
-            auth_pkg = (self._extract(event, "data.win.eventdata.authenticationPackageName") or "").upper()
-            logon_proc = (self._extract(event, "data.win.eventdata.logonProcessName") or "").upper()
+            try:
+                user = self._extract(
+                    event, "data.win.eventdata.targetUserName") or ""
+                src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
+                dst_host = self._extract(
+                    event, "data.win.eventdata.workstationName") or ""
+                logon_type = self._extract(
+                    event, "data.win.eventdata.logonType") or ""
+                auth_pkg = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.authenticationPackageName") or "").upper()
+                logon_proc = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.logonProcessName") or "").upper()
 
-            if not user or user.endswith("$"):
-                continue
+                if not user or user.endswith("$"):
+                    continue
 
-            target = dst_host or src_ip
+                target = dst_host or src_ip
 
-            # Pass-the-Hash: logon type 9 (NewCredentials) or NTLM network logon
-            if logon_type == "9":
-                findings.append({
-                    "pattern": "pass_the_hash",
-                    "severity": Severity.HIGH,
-                    "user": user,
-                    "source_ip": src_ip,
-                    "target_host": target,
-                    "logon_type": logon_type,
-                    "description": (
-                        f"Pass-the-Hash: user '{user}' logon type 9 "
-                        f"from {src_ip} to {target}"
-                    ),
-                })
-
-            # NTLM network logon with seclogo (common PtH indicator)
-            if (logon_type == "3" and auth_pkg == "NTLM"
-                    and logon_proc == "SECLOGO" and _is_internal(src_ip)):
-                findings.append({
-                    "pattern": "ntlm_relay_suspect",
-                    "severity": Severity.MEDIUM,
-                    "user": user,
-                    "source_ip": src_ip,
-                    "target_host": target,
-                    "description": (
-                        f"NTLM relay suspect: '{user}' network logon via "
-                        f"SECLOGO from internal {src_ip}"
-                    ),
-                })
-
-            # RDP to new host
-            if logon_type == "10" and _is_internal(src_ip):
-                if target and target not in self._known_rdp[user]:
+                # Pass-the-Hash: logon type 9 (NewCredentials) or NTLM network
+                # logon
+                if logon_type == "9":
                     findings.append({
-                        "pattern": "rdp_new_host",
+                        "pattern": "pass_the_hash",
+                        "severity": Severity.HIGH,
+                        "user": user,
+                        "source_ip": src_ip,
+                        "target_host": target,
+                        "logon_type": logon_type,
+                        "description": (
+                            f"Pass-the-Hash: user '{user}' logon type 9 "
+                            f"from {src_ip} to {target}"
+                        ),
+                    })
+
+                # NTLM network logon with seclogo (common PtH indicator)
+                if (logon_type == "3" and auth_pkg == "NTLM"
+                        and logon_proc == "SECLOGO" and _is_internal(src_ip)):
+                    findings.append({
+                        "pattern": "ntlm_relay_suspect",
                         "severity": Severity.MEDIUM,
                         "user": user,
                         "source_ip": src_ip,
                         "target_host": target,
                         "description": (
-                            f"RDP to new host: '{user}' from {src_ip} to "
-                            f"previously unseen host '{target}'"
+                            f"NTLM relay suspect: '{user}' network logon via "
+                            f"SECLOGO from internal {src_ip}"
                         ),
                     })
-                self._known_rdp[user].add(target)
 
-            # Multi-host auth tracking
-            if logon_type in ("3", "10") and _is_internal(src_ip) and target:
-                self._auth_graph[user].append((target, now))
+                # RDP to new host
+                if logon_type == "10" and _is_internal(src_ip):
+                    if target and target not in self._known_rdp[user]:
+                        findings.append({
+                            "pattern": "rdp_new_host",
+                            "severity": Severity.MEDIUM,
+                            "user": user,
+                            "source_ip": src_ip,
+                            "target_host": target,
+                            "description": (
+                                f"RDP to new host: '{user}' from {src_ip} to "
+                                f"previously unseen host '{target}'"
+                            ),
+                        })
+                    self._known_rdp[user].add(target)
+
+                # Multi-host auth tracking
+                if logon_type in ("3", "10") and _is_internal(src_ip) and target:
+                    self._auth_graph[user].append((target, now))
+            except Exception as e:
+                logger.warning("Error processing logon event: %s", e)
 
         # Prune auth graph and check multi-host threshold
         for user in list(self._auth_graph.keys()):
-            self._auth_graph[user] = [
-                (h, t) for h, t in self._auth_graph[user]
-                if now - t < _MULTI_HOST_WINDOW_S
-            ]
-            unique_hosts = {h for h, _ in self._auth_graph[user]}
-            if len(unique_hosts) >= _MULTI_HOST_THRESHOLD:
-                findings.append({
-                    "pattern": "multi_host_auth",
-                    "severity": Severity.HIGH,
-                    "user": user,
-                    "host_count": len(unique_hosts),
-                    "hosts": sorted(unique_hosts)[:15],
-                    "description": (
-                        f"Rapid multi-host auth: '{user}' authenticated to "
-                        f"{len(unique_hosts)} hosts in {_MULTI_HOST_WINDOW_S // 60} min"
-                    ),
-                })
-                self._auth_graph[user] = []  # reset after alert
+            try:
+                self._auth_graph[user] = [
+                    (h, t) for h, t in self._auth_graph[user]
+                    if now - t < _MULTI_HOST_WINDOW_S
+                ]
+                unique_hosts = {h for h, _ in self._auth_graph[user]}
+                if len(unique_hosts) >= _MULTI_HOST_THRESHOLD:
+                    findings.append({
+                        "pattern": "multi_host_auth",
+                        "severity": Severity.HIGH,
+                        "user": user,
+                        "host_count": len(unique_hosts),
+                        "hosts": sorted(unique_hosts)[:15],
+                        "description": (
+                            f"Rapid multi-host auth: '{user}' authenticated to "
+                            f"{len(unique_hosts)} hosts in {_MULTI_HOST_WINDOW_S // 60} min"
+                        ),
+                    })
+                    self._auth_graph[user] = []  # reset after alert
+            except Exception as e:
+                logger.warning("Error pruning auth graph: %s", e)
 
         # --- PsExec-like: admin share + service creation ---
         share_users: Dict[str, Set[str]] = defaultdict(set)
         for event in share_events:
-            user = self._extract(event, "data.win.eventdata.subjectUserName") or ""
-            share_name = (self._extract(event, "data.win.eventdata.shareName") or "").upper()
-            src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
-            if user and not user.endswith("$"):
-                for admin_share in _ADMIN_SHARES:
-                    if admin_share.upper() in share_name:
-                        share_users[user].add(src_ip or "unknown")
+            try:
+                user = self._extract(
+                    event, "data.win.eventdata.subjectUserName") or ""
+                share_name = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.shareName") or "").upper()
+                src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
+                if user and not user.endswith("$"):
+                    for admin_share in _ADMIN_SHARES:
+                        if admin_share.upper() in share_name:
+                            share_users[user].add(src_ip or "unknown")
+            except Exception as e:
+                logger.warning("Error processing share event: %s", e)
 
         service_users: Set[str] = set()
         for event in service_events:
-            user = self._extract(event, "data.win.eventdata.subjectUserName") or ""
-            svc_name = (self._extract(event, "data.win.eventdata.serviceName") or "").lower()
-            if user and not user.endswith("$"):
-                if any(ps in svc_name for ps in _PSEXEC_SERVICE_NAMES) or svc_name:
-                    service_users.add(user)
+            try:
+                user = self._extract(
+                    event, "data.win.eventdata.subjectUserName") or ""
+                svc_name = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.serviceName") or "").lower()
+                if user and not user.endswith("$"):
+                    if any(
+                            ps in svc_name for ps in _PSEXEC_SERVICE_NAMES) or svc_name:
+                        service_users.add(user)
+            except Exception as e:
+                logger.warning("Error processing service event: %s", e)
 
         for user in share_users.keys() & service_users:
-            findings.append({
-                "pattern": "psexec_like",
-                "severity": Severity.HIGH,
-                "user": user,
-                "admin_share_sources": sorted(share_users[user])[:10],
-                "description": (
-                    f"PsExec-like: '{user}' accessed admin shares and "
-                    f"installed service within 2-min window"
-                ),
-            })
+            try:
+                findings.append({
+                    "pattern": "psexec_like",
+                    "severity": Severity.HIGH,
+                    "user": user,
+                    "admin_share_sources": sorted(share_users[user])[:10],
+                    "description": (
+                        f"PsExec-like: '{user}' accessed admin shares and "
+                        f"installed service within 2-min window"
+                    ),
+                })
+            except Exception as e:
+                logger.warning("Error combining psexec alerts: %s", e)
 
         # --- WMI remote execution ---
         for event in process_events:
-            user = self._extract(event, "data.win.eventdata.subjectUserName") or ""
-            proc_name = (self._extract(event, "data.win.eventdata.newProcessName") or "").lower()
-            cmd_line = (self._extract(event, "data.win.eventdata.commandLine") or "").lower()
+            try:
+                user = self._extract(
+                    event, "data.win.eventdata.subjectUserName") or ""
+                proc_name = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.newProcessName") or "").lower()
+                cmd_line = (
+                    self._extract(
+                        event,
+                        "data.win.eventdata.commandLine") or "").lower()
 
-            if not user or user.endswith("$"):
-                continue
-            if "wmiprvse.exe" in proc_name or ("wmic" in cmd_line and "/node:" in cmd_line):
-                findings.append({
-                    "pattern": "wmi_remote",
-                    "severity": Severity.MEDIUM,
-                    "user": user,
-                    "process": proc_name,
-                    "command_line": cmd_line[:300],
-                    "description": (
-                        f"WMI remote execution: '{user}' spawned WMI process"
-                    ),
-                })
+                if not user or user.endswith("$"):
+                    continue
+                if "wmiprvse.exe" in proc_name or (
+                        "wmic" in cmd_line and "/node:" in cmd_line):
+                    findings.append({
+                        "pattern": "wmi_remote",
+                        "severity": Severity.MEDIUM,
+                        "user": user,
+                        "process": proc_name,
+                        "command_line": cmd_line[:300],
+                        "description": (
+                            f"WMI remote execution: '{user}' spawned WMI process"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error processing WMI event: %s", e)
 
         # --- SSH pivoting from Zeek ---
         ssh_pivots: Dict[str, Set[str]] = defaultdict(set)
         for event in zeek_conn:
-            src_ip = self._extract(event, "id.orig_h") or self._extract(event, "source.ip") or ""
-            dst_ip = self._extract(event, "id.resp_h") or self._extract(event, "destination.ip") or ""
-            dst_port = self._extract(event, "id.resp_p") or self._extract(event, "destination.port") or ""
+            try:
+                src_ip = self._extract(
+                    event, "id.orig_h") or self._extract(
+                    event, "source.ip") or ""
+                dst_ip = self._extract(
+                    event, "id.resp_h") or self._extract(
+                    event, "destination.ip") or ""
+                dst_port = self._extract(
+                    event, "id.resp_p") or self._extract(
+                    event, "destination.port") or ""
 
-            if str(dst_port) == str(_SSH_PORT) and _is_internal(src_ip) and _is_internal(dst_ip):
-                ssh_pivots[src_ip].add(dst_ip)
+                if str(dst_port) == str(_SSH_PORT) and _is_internal(
+                        src_ip) and _is_internal(dst_ip):
+                    ssh_pivots[src_ip].add(dst_ip)
+            except Exception as e:
+                logger.warning("Error processing zeek conn: %s", e)
 
         for src, dests in ssh_pivots.items():
-            if len(dests) >= 3:
-                findings.append({
-                    "pattern": "ssh_pivoting",
-                    "severity": Severity.HIGH,
-                    "source_ip": src,
-                    "destinations": sorted(dests)[:15],
-                    "dest_count": len(dests),
-                    "description": (
-                        f"SSH pivoting: {src} connected to {len(dests)} "
-                        f"internal hosts via SSH"
-                    ),
-                })
+            try:
+                if len(dests) >= 3:
+                    findings.append({
+                        "pattern": "ssh_pivoting",
+                        "severity": Severity.HIGH,
+                        "source_ip": src,
+                        "destinations": sorted(dests)[:15],
+                        "dest_count": len(dests),
+                        "description": (
+                            f"SSH pivoting: {src} connected to {len(dests)} "
+                            f"internal hosts via SSH"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error computing ssh pivots: %s", e)
 
         if findings:
-            logger.warning("Detected %d lateral movement pattern(s)", len(findings))
+            logger.warning(
+                "Detected %d lateral movement pattern(s)",
+                len(findings))
         return findings
 
     # ------------------------------------------------------------------
@@ -336,23 +405,27 @@ class LateralMovementAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            actor = finding.get("user", finding.get("source_ip", "unknown"))
-            key = f"{finding['pattern']}:{actor}"
-            last = self._alerted_cache.get(key, 0.0)
-            if now - last < self._alert_cooldown:
-                continue
+            try:
+                actor = finding.get("user", finding.get("source_ip", "unknown"))
+                key = f"{finding['pattern']}:{actor}"
+                with self._cache_lock:
+                    last = self._alerted_cache.get(key, 0.0)
+                if now - last < self._alert_cooldown:
+                    continue
 
-            actions.append({
-                "type": "alert",
-                "severity": finding["severity"],
-                "title": f"Lateral Movement: {finding['pattern'].replace('_', ' ').title()}",
-                "details": {k: v for k, v in finding.items() if k != "severity"},
-                "cooldown_key": key,
-            })
-            actions.append({"type": "log_incident", "finding": finding})
+                actions.append({
+                    "type": "alert",
+                    "severity": finding["severity"],
+                    "title": f"Lateral Movement: {finding['pattern'].replace('_', ' ').title()}",
+                    "details": {k: v for k, v in finding.items() if k != "severity"},
+                    "cooldown_key": key,
+                })
+                actions.append({"type": "log_incident", "finding": finding})
 
-            if finding["severity"] >= Severity.CRITICAL:
-                actions.append({"type": "escalate", "finding": finding})
+                if finding["severity"] >= Severity.CRITICAL:
+                    actions.append({"type": "escalate", "finding": finding})
+            except Exception as e:
+                logger.warning("Error evaluating lateral finding: %s", e)
 
         return actions
 
@@ -366,49 +439,58 @@ class LateralMovementAgent(BaseAgent):
         incidents_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["cooldown_key"]] = time.time()
-
-            elif action["type"] == "log_incident":
-                try:
-                    finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-lateral-movement-incidents",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "pattern": finding["pattern"],
-                            "severity": finding["severity"].name,
-                            "user": finding.get("user", ""),
-                            "source_ip": finding.get("source_ip", ""),
-                            "description": finding["description"],
-                        },
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    incidents_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log lateral movement incident: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+                            self._alerted_cache[action["cooldown_key"]
+                                                ] = time.time()
 
-            elif action["type"] == "escalate":
-                finding = action["finding"]
-                self.report_to_supervisor({
-                    "type": "lateral_movement_critical",
-                    "pattern": finding["pattern"],
-                    "user": finding.get("user", ""),
-                    "description": finding["description"],
-                })
+                elif action["type"] == "log_incident":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-lateral-movement-incidents",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "pattern": finding["pattern"],
+                                "severity": finding["severity"].name,
+                                "user": finding.get("user", ""),
+                                "source_ip": finding.get("source_ip", ""),
+                                "description": finding["description"],
+                            },
+                        )
+                        incidents_logged += 1
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to log lateral movement incident: %s", exc)
+
+                elif action["type"] == "escalate":
+                    finding = action["finding"]
+                    self.report_to_supervisor({
+                        "type": "lateral_movement_critical",
+                        "pattern": finding["pattern"],
+                        "user": finding.get("user", ""),
+                        "description": finding["description"],
+                    })
+            except Exception as e:
+                logger.warning("Error executing lateral movement action: %s", e)
 
         # Prune cooldown
         cutoff = time.time() - self._alert_cooldown * 3
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {
+                k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         if alerts_sent:
             self.report_to_supervisor({
@@ -417,7 +499,8 @@ class LateralMovementAgent(BaseAgent):
                 "incidents_logged": incidents_logged,
             })
 
-        return {"alerts_sent": alerts_sent, "incidents_logged": incidents_logged}
+        return {"alerts_sent": alerts_sent,
+                "incidents_logged": incidents_logged}
 
 
 # ---------------------------------------------------------------------------

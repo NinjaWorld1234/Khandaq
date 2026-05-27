@@ -34,21 +34,18 @@ Interval: 10 seconds (must be responsive)
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from shared.alerter import Severity
 from shared.base_agent import BaseAgent
 from shared.config import SOCConfig
 from shared.redis_bus import (
     CHANNEL_SUPERVISOR_TO_COMMANDER,
-    RedisBus,
 )
 from shared.wazuh_client import WazuhClient
 
@@ -122,6 +119,7 @@ class InfraSupervisor(BaseAgent):
         # ذاكرة الارتباط – التنبيهات الأخيرة من العمال
         self._alert_buffer: list[CorrelatedAlert] = []
         self._buffer_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
 
         # Track which correlations have already been processed (avoid re-alerting)
         self._processed_correlations: set[str] = set()
@@ -162,11 +160,11 @@ class InfraSupervisor(BaseAgent):
             # Extract alert details from payload
             hostname = (
                 payload.get("hostname")
-                or payload.get("details", {}).get("hostname")
+                or (payload.get("details") or {}).get("hostname")
             )
             source_ip = (
                 payload.get("source_ip")
-                or payload.get("details", {}).get("source_ip")
+                or (payload.get("details") or {}).get("source_ip")
             )
             severity = payload.get("severity", "INFO")
 
@@ -180,7 +178,9 @@ class InfraSupervisor(BaseAgent):
             )
 
             with self._buffer_lock:
-                self._alert_buffer.append(correlated)
+                with self._cache_lock:
+
+                    self._alert_buffer.append(correlated)
                 if len(self._alert_buffer) > MAX_BUFFER_SIZE:
                     self._alert_buffer = self._alert_buffer[-MAX_BUFFER_SIZE:]
 
@@ -228,7 +228,9 @@ class InfraSupervisor(BaseAgent):
         """Remove alerts older than 2x the correlation window."""
         cutoff = time.time() - CORRELATION_WINDOW_SECONDS * 2
         with self._buffer_lock:
-            self._alert_buffer = [a for a in self._alert_buffer if a.received_at >= cutoff]
+            with self._cache_lock:
+
+                self._alert_buffer = [a for a in self._alert_buffer if a.received_at >= cutoff]
 
     # ------------------------------------------------------------------
     # Collect / جمع
@@ -273,22 +275,27 @@ class InfraSupervisor(BaseAgent):
         w46_alerts = self._get_recent_alerts(worker_id="W46")
 
         for health_alert in w46_alerts:
-            host = health_alert.hostname
-            if not host:
-                continue
-            w12_alerts = self._get_recent_alerts(worker_id="W12", hostname=host)
-            if w12_alerts:
-                key = f"defense_evasion:{host}"
-                if key in self._processed_correlations:
+            try:
+                host = health_alert.hostname
+                if not host:
                     continue
-                self._processed_correlations.add(key)
-                findings.append({
-                    "type": "defense_evasion",
-                    "hostname": host,
-                    "w46_alert": health_alert.alert_data.get("title", ""),
-                    "w12_count": len(w12_alerts),
-                    "w12_first": w12_alerts[0].alert_data.get("title", ""),
-                })
+                w12_alerts = self._get_recent_alerts(worker_id="W12", hostname=host)
+                if w12_alerts:
+                    key = f"defense_evasion:{host}"
+                    if key in self._processed_correlations:
+                        continue
+                    with self._cache_lock:
+    
+                        self._processed_correlations.add(key)
+                    findings.append({
+                        "type": "defense_evasion",
+                        "hostname": host,
+                        "w46_alert": health_alert.alert_data.get("title", ""),
+                        "w12_count": len(w12_alerts),
+                        "w12_first": w12_alerts[0].alert_data.get("title", ""),
+                    })
+            except Exception as e:
+                logger.warning("Error in defense evasion correlation: %s", e)
 
         return findings
 
@@ -298,28 +305,35 @@ class InfraSupervisor(BaseAgent):
         w36_alerts = self._get_recent_alerts(worker_id="W36")
 
         for canary_alert in w36_alerts:
-            ip = canary_alert.source_ip
-            if not ip:
-                # Try to find IP in alert metadata
-                details = canary_alert.alert_data.get("details", {})
-                ip = details.get("source_ip")
-            if not ip:
-                continue
-
-            w37_alerts = self._get_recent_alerts(worker_id="W37", source_ip=ip)
-            if w37_alerts:
-                key = f"confirmed_intrusion:{ip}"
-                if key in self._processed_correlations:
+            try:
+                ip = canary_alert.source_ip
+                if not ip:
+                    # Try to find IP in alert metadata
+                    details = canary_alert.alert_data.get("details") or {}
+                    ip = details.get("source_ip")
+                if not ip:
                     continue
-                self._processed_correlations.add(key)
-                findings.append({
-                    "type": "confirmed_intrusion",
-                    "source_ip": ip,
-                    "hostname": canary_alert.hostname,
-                    "canary_alert": canary_alert.alert_data.get("title", ""),
-                    "brute_force_count": len(w37_alerts),
-                    "wazuh_agent_id": canary_alert.alert_data.get("details", {}).get("wazuh_agent_id"),
-                })
+    
+                w37_alerts = self._get_recent_alerts(worker_id="W37", source_ip=ip)
+                if w37_alerts:
+                    key = f"confirmed_intrusion:{ip}"
+                    if key in self._processed_correlations:
+                        continue
+                    with self._cache_lock:
+    
+                        self._processed_correlations.add(key)
+                    
+                    details = canary_alert.alert_data.get("details") or {}
+                    findings.append({
+                        "type": "confirmed_intrusion",
+                        "source_ip": ip,
+                        "hostname": canary_alert.hostname,
+                        "canary_alert": canary_alert.alert_data.get("title", ""),
+                        "brute_force_count": len(w37_alerts),
+                        "wazuh_agent_id": details.get("wazuh_agent_id"),
+                    })
+            except Exception as e:
+                logger.warning("Error in confirmed intrusion correlation: %s", e)
 
         return findings
 
@@ -329,26 +343,31 @@ class InfraSupervisor(BaseAgent):
         w12_alerts = self._get_recent_alerts(worker_id="W12")
 
         for tamper_alert in w12_alerts:
-            host = tamper_alert.hostname
-            if not host:
-                continue
-
-            correlated_workers: list[str] = []
-            for wid in ["W37", "W36", "W29", "W43", "W46"]:
-                if self._get_recent_alerts(worker_id=wid, hostname=host):
-                    correlated_workers.append(wid)
-
-            if correlated_workers:
-                key = f"covering_tracks:{host}:{','.join(sorted(correlated_workers))}"
-                if key in self._processed_correlations:
+            try:
+                host = tamper_alert.hostname
+                if not host:
                     continue
-                self._processed_correlations.add(key)
-                findings.append({
-                    "type": "covering_tracks",
-                    "hostname": host,
-                    "tamper_alert": tamper_alert.alert_data.get("title", ""),
-                    "correlated_workers": correlated_workers,
-                })
+    
+                correlated_workers: list[str] = []
+                for wid in ["W37", "W36", "W29", "W43", "W46"]:
+                    if self._get_recent_alerts(worker_id=wid, hostname=host):
+                        correlated_workers.append(wid)
+    
+                if correlated_workers:
+                    key = f"covering_tracks:{host}:{','.join(sorted(correlated_workers))}"
+                    if key in self._processed_correlations:
+                        continue
+                    with self._cache_lock:
+    
+                        self._processed_correlations.add(key)
+                    findings.append({
+                        "type": "covering_tracks",
+                        "hostname": host,
+                        "tamper_alert": tamper_alert.alert_data.get("title", ""),
+                        "correlated_workers": correlated_workers,
+                    })
+            except Exception as e:
+                logger.warning("Error in covering tracks correlation: %s", e)
 
         return findings
 
@@ -360,59 +379,64 @@ class InfraSupervisor(BaseAgent):
         actions: list[dict[str, Any]] = []
 
         for finding in findings:
-            ftype = finding["type"]
-
-            if ftype == "defense_evasion":
-                actions.append({
-                    "alert": True,
-                    "severity": Severity.CRITICAL,
-                    "title": "🔴 CORRELATED: DEFENSE EVASION DETECTED",
-                    "details": {
-                        "hostname": finding["hostname"],
-                        "correlation_rule": "defense_evasion",
-                        "w46_alert": finding["w46_alert"],
-                        "w12_alerts_count": finding["w12_count"],
-                        "mitre_technique": "T1562.001 - Disable or Modify Tools",
-                        "mitre_tactic": "Defense Evasion",
-                    },
-                    "escalate": True,
-                })
-
-            elif ftype == "confirmed_intrusion":
-                actions.append({
-                    "alert": True,
-                    "severity": Severity.CRITICAL,
-                    "title": "🔴 CORRELATED: CONFIRMED INTRUSION",
-                    "details": {
-                        "source_ip": finding["source_ip"],
-                        "hostname": finding.get("hostname"),
-                        "correlation_rule": "confirmed_intrusion",
-                        "canary_alert": finding["canary_alert"],
-                        "brute_force_count": finding["brute_force_count"],
-                        "mitre_technique": "T1110 - Brute Force",
-                        "mitre_tactic": "Credential Access",
-                    },
-                    "escalate": True,
-                    "auto_block_ip": finding["source_ip"],
-                    "auto_isolate_host": finding.get("hostname"),
-                    "wazuh_agent_id": finding.get("wazuh_agent_id"),
-                })
-
-            elif ftype == "covering_tracks":
-                actions.append({
-                    "alert": True,
-                    "severity": Severity.CRITICAL,
-                    "title": "🔴 CORRELATED: ATTACKER COVERING TRACKS",
-                    "details": {
-                        "hostname": finding["hostname"],
-                        "correlation_rule": "covering_tracks",
-                        "tamper_alert": finding["tamper_alert"],
-                        "correlated_workers": finding["correlated_workers"],
-                        "mitre_technique": "T1070 - Indicator Removal",
-                        "mitre_tactic": "Defense Evasion",
-                    },
-                    "escalate": True,
-                })
+            try:
+                ftype = finding.get("type")
+                if not ftype:
+                    continue
+    
+                if ftype == "defense_evasion":
+                    actions.append({
+                        "alert": True,
+                        "severity": Severity.CRITICAL,
+                        "title": "🔴 CORRELATED: DEFENSE EVASION DETECTED",
+                        "details": {
+                            "hostname": finding.get("hostname"),
+                            "correlation_rule": "defense_evasion",
+                            "w46_alert": finding.get("w46_alert"),
+                            "w12_alerts_count": finding.get("w12_count"),
+                            "mitre_technique": "T1562.001 - Disable or Modify Tools",
+                            "mitre_tactic": "Defense Evasion",
+                        },
+                        "escalate": True,
+                    })
+    
+                elif ftype == "confirmed_intrusion":
+                    actions.append({
+                        "alert": True,
+                        "severity": Severity.CRITICAL,
+                        "title": "🔴 CORRELATED: CONFIRMED INTRUSION",
+                        "details": {
+                            "source_ip": finding.get("source_ip"),
+                            "hostname": finding.get("hostname"),
+                            "correlation_rule": "confirmed_intrusion",
+                            "canary_alert": finding.get("canary_alert"),
+                            "brute_force_count": finding.get("brute_force_count"),
+                            "mitre_technique": "T1110 - Brute Force",
+                            "mitre_tactic": "Credential Access",
+                        },
+                        "escalate": True,
+                        "auto_block_ip": finding.get("source_ip"),
+                        "auto_isolate_host": finding.get("hostname"),
+                        "wazuh_agent_id": finding.get("wazuh_agent_id"),
+                    })
+    
+                elif ftype == "covering_tracks":
+                    actions.append({
+                        "alert": True,
+                        "severity": Severity.CRITICAL,
+                        "title": "🔴 CORRELATED: ATTACKER COVERING TRACKS",
+                        "details": {
+                            "hostname": finding.get("hostname"),
+                            "correlation_rule": "covering_tracks",
+                            "tamper_alert": finding.get("tamper_alert"),
+                            "correlated_workers": finding.get("correlated_workers"),
+                            "mitre_technique": "T1070 - Indicator Removal",
+                            "mitre_tactic": "Defense Evasion",
+                        },
+                        "escalate": True,
+                    })
+            except Exception as e:
+                logger.warning("Error processing finding in decide: %s", e)
 
         return actions
 
@@ -430,65 +454,75 @@ class InfraSupervisor(BaseAgent):
         hosts_isolated = 0
 
         for action in actions:
-            # Send alert
-            if action.get("alert"):
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-
-            # Escalate to commander
-            if action.get("escalate"):
-                try:
-                    self.redis_bus.escalate_to_commander(
-                        sender=self.name,
-                        payload={
-                            "type": action["details"].get("correlation_rule", "infrastructure_alert"),
-                            "severity": action["severity"].name,
-                            "host": action["details"].get("hostname") or action["details"].get("source_ip", ""),
-                            "details": action["details"],
-                        },
+            try:
+                # Send alert
+                if action.get("alert"):
+                    severity = action.get("severity")
+                    sev_str = severity.name if hasattr(severity, "name") else str(severity)
+                    sent = self.alerter.send_alert(
+                        severity=severity,
+                        title=action.get("title", "Alert"),
+                        details=action.get("details", {}),
+                        agent_name=self.name,
                     )
-                    escalations += 1
-                    logger.info("⬆️ Escalated to commander: %s", action["title"][:60])
-                except Exception as exc:
-                    logger.error("Commander escalation failed: %s", exc)
-
-            # AUTO-BLOCK IP – no commander approval needed
-            ip_to_block = action.get("auto_block_ip")
-            if ip_to_block and ip_to_block not in self._blocked_ips:
-                try:
-                    logger.critical("🚫 AUTO-BLOCKING IP: %s", ip_to_block)
-                    self.wazuh.block_ip(agent_id="all", ip_address=ip_to_block)
-                    self._blocked_ips.add(ip_to_block)
-                    ips_blocked += 1
-                    self._log_decision("AUTO_BLOCK_IP", ip_to_block, "Brute force + canary confirmed")
-                except Exception as exc:
-                    logger.error("Failed to block IP %s: %s", ip_to_block, exc)
-
-            # AUTO-ISOLATE HOST – no commander approval needed
-            host_to_isolate = action.get("auto_isolate_host")
-            wazuh_agent_id = action.get("wazuh_agent_id")
-            if host_to_isolate and host_to_isolate not in self._isolated_hosts and wazuh_agent_id:
-                try:
-                    logger.critical("🔒 AUTO-ISOLATING HOST: %s", host_to_isolate)
-                    self.wazuh.isolate_agent(wazuh_agent_id)
-                    self._isolated_hosts.add(host_to_isolate)
-                    hosts_isolated += 1
-                    self._log_decision("AUTO_ISOLATE", host_to_isolate, f"Agent {wazuh_agent_id}")
-                except Exception as exc:
-                    logger.error("Failed to isolate host %s: %s", host_to_isolate, exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(sev_str)
+    
+                # Escalate to commander
+                if action.get("escalate"):
+                    try:
+                        details = action.get("details", {})
+                        severity = action.get("severity")
+                        sev_str = severity.name if hasattr(severity, "name") else str(severity)
+                        self.redis_bus.escalate_to_commander(
+                            sender=self.name,
+                            payload={
+                                "type": details.get("correlation_rule", "infrastructure_alert"),
+                                "severity": sev_str,
+                                "host": details.get("hostname") or details.get("source_ip", ""),
+                                "details": details,
+                            },
+                        )
+                        escalations += 1
+                        logger.info("⬆️ Escalated to commander: %s", action.get("title", "")[:60])
+                    except Exception as exc:
+                        logger.error("Commander escalation failed: %s", exc)
+    
+                # AUTO-BLOCK IP – no commander approval needed
+                ip_to_block = action.get("auto_block_ip")
+                if ip_to_block and ip_to_block not in self._blocked_ips:
+                    try:
+                        logger.critical("🚫 AUTO-BLOCKING IP: %s", ip_to_block)
+                        self.wazuh.block_ip(agent_id="all", ip_address=ip_to_block)
+                        self._blocked_ips.add(ip_to_block)
+                        ips_blocked += 1
+                        self._log_decision("AUTO_BLOCK_IP", ip_to_block, "Brute force + canary confirmed")
+                    except Exception as exc:
+                        logger.error("Failed to block IP %s: %s", ip_to_block, exc)
+    
+                # AUTO-ISOLATE HOST – no commander approval needed
+                host_to_isolate = action.get("auto_isolate_host")
+                wazuh_agent_id = action.get("wazuh_agent_id")
+                if host_to_isolate and host_to_isolate not in self._isolated_hosts and wazuh_agent_id:
+                    try:
+                        logger.critical("🔒 AUTO-ISOLATING HOST: %s", host_to_isolate)
+                        self.wazuh.isolate_agent(wazuh_agent_id)
+                        self._isolated_hosts.add(host_to_isolate)
+                        hosts_isolated += 1
+                        self._log_decision("AUTO_ISOLATE", host_to_isolate, f"Agent {wazuh_agent_id}")
+                    except Exception as exc:
+                        logger.error("Failed to isolate host %s: %s", host_to_isolate, exc)
+            except Exception as e:
+                logger.warning("Error processing action: %s", e)
 
         # Cleanup old alerts and stale correlations
         self._cleanup_old_alerts()
         if len(self._processed_correlations) > 500:
             sorted_keys = sorted(self._processed_correlations)
-            self._processed_correlations = set(sorted_keys[-250:])
+            with self._cache_lock:
+
+                self._processed_correlations = set(sorted_keys[-250:])
 
         self._events_processed += 1
         self._metrics.inc_events(1)

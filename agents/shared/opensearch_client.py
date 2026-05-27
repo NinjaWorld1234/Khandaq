@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -40,6 +41,7 @@ class OpenSearchClient:
         """
         self._cfg = (config or SOCConfig.get_instance()).opensearch
         self._client: Optional[OpenSearch] = None
+        self._conn_lock = threading.Lock()
         self._connect()
 
     # ------------------------------------------------------------------
@@ -82,7 +84,9 @@ class OpenSearchClient:
     def client(self) -> OpenSearch:
         """Return the underlying OpenSearch client."""
         if self._client is None:
-            self._connect()
+            with self._conn_lock:
+                if self._client is None:
+                    self._connect()
         assert self._client is not None, "OpenSearch client is not connected"
         return self._client
 
@@ -255,7 +259,7 @@ class OpenSearchClient:
             "sort": [{timestamp_field: {"order": "desc"}}],
         }
         resp = self.search(index, body, size=size)
-        return [hit["_source"] for hit in resp.get("hits", {}).get("hits", [])]
+        return [hit.get("_source", {}) for hit in resp.get("hits", {}).get("hits", [])]
 
     def get_field_stats(
         self,

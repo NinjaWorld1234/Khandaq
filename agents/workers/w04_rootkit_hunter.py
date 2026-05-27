@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -72,6 +72,7 @@ class RootkitHunterAgent(BaseAgent):
         # Track alerted items to avoid duplicates
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown = 1800  # 30 min cooldown
+        self._cache_lock = threading.Lock()
         # Known-good process set populated from SCA baselines
         self._known_good_procs: Set[str] = set(
             self._agent_config.get("known_good_processes", [
@@ -100,12 +101,12 @@ class RootkitHunterAgent(BaseAgent):
                 }
             }
             rootcheck_events = self.os_client.get_events_since(
-                index="wazuh-alerts-*", minutes=6, query=rootcheck_query, size=2000,
+                index="wazuh-alerts-*", minutes=6, query=rootcheck_query, size=10000,
             )
 
             sca_query: Dict[str, Any] = {"match": {"rule.groups": "sca"}}
             sca_events = self.os_client.get_events_since(
-                index="wazuh-alerts-*", minutes=6, query=sca_query, size=500,
+                index="wazuh-alerts-*", minutes=6, query=sca_query, size=10000,
             )
 
             logger.debug("Collected %d rootcheck and %d SCA events",
@@ -125,86 +126,100 @@ class RootkitHunterAgent(BaseAgent):
         sca_events = data.get("sca", [])
 
         for event in rootcheck_events:
-            rule_id = str(event.get("rule", {}).get("id", ""))
-            rule_desc = event.get("rule", {}).get("description", "")
-            host = event.get("agent", {}).get("name", "unknown")
-            full_log = event.get("full_log", "")
-            data_title = event.get("data", {}).get("title", "")
+            try:
+                # Fix V04-FUNC-CRIT-01: Use 'or {}' to prevent NoneType AttributeError if JSON contains null values
+                rule_obj = event.get("rule") or {}
+                rule_id = str(rule_obj.get("id", ""))
+                rule_desc = rule_obj.get("description", "")
+                agent_obj = event.get("agent") or {}
+                host = agent_obj.get("name", "unknown")
+                # Fix V04-FUNC-CRIT-02: Ensure full_log is a string to prevent .lower() crash
+                full_log = event.get("full_log") or ""
+                data_obj = event.get("data") or {}
+                data_title = data_obj.get("title", "")
 
-            # Rule 1: Hidden processes
-            if rule_id in _HIDDEN_PROCESS_RULES:
-                findings.append({
-                    "rule": "hidden_process", "severity": Severity.CRITICAL,
-                    "host": host, "rule_id": rule_id,
-                    "detail": data_title or rule_desc,
-                    "description": f"Hidden process detected on {host}: {data_title or rule_desc}",
-                })
-
-            # Rule 2: Hidden ports
-            elif rule_id in _HIDDEN_PORT_RULES:
-                findings.append({
-                    "rule": "hidden_port", "severity": Severity.CRITICAL,
-                    "host": host, "rule_id": rule_id,
-                    "detail": data_title or rule_desc,
-                    "description": f"Hidden port detected on {host}: {data_title or rule_desc}",
-                })
-
-            # Rule 3: Modified system binaries
-            elif rule_id in _BINARY_MODIFIED_RULES:
-                findings.append({
-                    "rule": "binary_hash_mismatch", "severity": Severity.CRITICAL,
-                    "host": host, "rule_id": rule_id,
-                    "detail": data_title or rule_desc,
-                    "description": f"System binary modified (hash mismatch) on {host}: {data_title or rule_desc}",
-                })
-
-            # Rule 4: Suspicious kernel modules
-            elif rule_id in _KERNEL_MODULE_RULES:
-                module_name = self._extract_module_name(full_log)
-                if module_name and module_name not in _KNOWN_GOOD_MODULES:
+                # Rule 1: Hidden processes
+                if rule_id in _HIDDEN_PROCESS_RULES:
                     findings.append({
-                        "rule": "suspicious_kernel_module", "severity": Severity.HIGH,
-                        "host": host, "module": module_name, "rule_id": rule_id,
-                        "description": f"Suspicious kernel module '{module_name}' on {host}",
+                        "rule": "hidden_process", "severity": Severity.CRITICAL,
+                        "host": host, "rule_id": rule_id,
+                        "detail": data_title or rule_desc,
+                        "description": f"Hidden process detected on {host}: {data_title or rule_desc}",
                     })
 
-            # Rule 5 & 6: LD_PRELOAD / ld.so.preload
-            if "ld_preload" in full_log.lower() or "ld.so.preload" in full_log.lower():
-                findings.append({
-                    "rule": "ld_preload_hijack", "severity": Severity.CRITICAL,
-                    "host": host, "detail": full_log[:200],
-                    "description": f"LD_PRELOAD hijacking detected on {host}: {full_log[:120]}",
-                })
+                # Rule 2: Hidden ports
+                elif rule_id in _HIDDEN_PORT_RULES:
+                    findings.append({
+                        "rule": "hidden_port", "severity": Severity.CRITICAL,
+                        "host": host, "rule_id": rule_id,
+                        "detail": data_title or rule_desc,
+                        "description": f"Hidden port detected on {host}: {data_title or rule_desc}",
+                    })
 
-            # Rule 7: Hidden files in /tmp or /dev/shm
-            if self._is_hidden_in_sensitive_dir(full_log, data_title):
-                findings.append({
-                    "rule": "hidden_file_sensitive_dir", "severity": Severity.HIGH,
-                    "host": host, "detail": data_title or full_log[:200],
-                    "description": f"Hidden file in sensitive directory on {host}: {data_title or full_log[:120]}",
-                })
+                # Rule 3: Modified system binaries
+                elif rule_id in _BINARY_MODIFIED_RULES:
+                    findings.append({
+                        "rule": "binary_hash_mismatch", "severity": Severity.CRITICAL,
+                        "host": host, "rule_id": rule_id,
+                        "detail": data_title or rule_desc,
+                        "description": f"System binary modified (hash mismatch) on {host}: {data_title or rule_desc}",
+                    })
 
-            # Rule 8: SUID on unusual binary (from rootcheck trojans/anomalies)
-            suid_path = self._extract_suid_path(full_log, data_title)
-            if suid_path and suid_path not in self._suid_whitelist:
-                findings.append({
-                    "rule": "unusual_suid_binary", "severity": Severity.HIGH,
-                    "host": host, "path": suid_path,
-                    "description": f"SUID bit set on unusual binary on {host}: {suid_path}",
-                })
+                # Rule 4: Suspicious kernel modules
+                elif rule_id in _KERNEL_MODULE_RULES:
+                    module_name = self._extract_module_name(full_log)
+                    if module_name and module_name not in _KNOWN_GOOD_MODULES:
+                        findings.append({
+                            "rule": "suspicious_kernel_module", "severity": Severity.HIGH,
+                            "host": host, "module": module_name, "rule_id": rule_id,
+                            "description": f"Suspicious kernel module '{module_name}' on {host}",
+                        })
+
+                # Rule 5 & 6: LD_PRELOAD / ld.so.preload
+                if "ld_preload" in full_log.lower() or "ld.so.preload" in full_log.lower():
+                    findings.append({
+                        "rule": "ld_preload_hijack", "severity": Severity.CRITICAL,
+                        "host": host, "detail": full_log[:200],
+                        "description": f"LD_PRELOAD hijacking detected on {host}: {full_log[:120]}",
+                    })
+
+                # Rule 7: Hidden files in /tmp or /dev/shm
+                if self._is_hidden_in_sensitive_dir(full_log, data_title):
+                    findings.append({
+                        "rule": "hidden_file_sensitive_dir", "severity": Severity.HIGH,
+                        "host": host, "detail": data_title or full_log[:200],
+                        "description": f"Hidden file in sensitive directory on {host}: {data_title or full_log[:120]}",
+                    })
+
+                # Rule 8: SUID on unusual binary (from rootcheck trojans/anomalies)
+                suid_path = self._extract_suid_path(full_log, data_title)
+                if suid_path and suid_path not in self._suid_whitelist:
+                    findings.append({
+                        "rule": "unusual_suid_binary", "severity": Severity.HIGH,
+                        "host": host, "path": suid_path,
+                        "description": f"SUID bit set on unusual binary on {host}: {suid_path}",
+                    })
+            except Exception as e:
+                logger.warning("Error processing rootcheck event: %s", e)
 
         # SCA failures that indicate rootkit-related checks failing
         for event in sca_events:
-            sca_result = event.get("data", {}).get("result", "")
-            sca_title = event.get("data", {}).get("title", "")
-            host = event.get("agent", {}).get("name", "unknown")
-            if sca_result == "failed" and any(kw in sca_title.lower()
-                    for kw in ("rootkit", "kernel", "hidden", "suid", "preload")):
-                findings.append({
-                    "rule": "sca_rootkit_check_failed", "severity": Severity.MEDIUM,
-                    "host": host, "detail": sca_title,
-                    "description": f"SCA rootkit-related check failed on {host}: {sca_title}",
-                })
+            try:
+                # Fix V04-FUNC-CRIT-01: Use 'or {}' for sca data object
+                data_obj = event.get("data") or {}
+                sca_result = str(data_obj.get("result", ""))
+                sca_title = str(data_obj.get("title", ""))
+                agent_obj = event.get("agent") or {}
+                host = agent_obj.get("name", "unknown")
+                if sca_result == "failed" and any(kw in sca_title.lower()
+                                                  for kw in ("rootkit", "kernel", "hidden", "suid", "preload")):
+                    findings.append({
+                        "rule": "sca_rootkit_check_failed", "severity": Severity.MEDIUM,
+                        "host": host, "detail": sca_title,
+                        "description": f"SCA rootkit-related check failed on {host}: {sca_title}",
+                    })
+            except Exception as e:
+                logger.warning("Error processing sca event: %s", e)
 
         self._events_processed += len(rootcheck_events) + len(sca_events)
         self._metrics.inc_events(len(rootcheck_events) + len(sca_events))
@@ -215,15 +230,22 @@ class RootkitHunterAgent(BaseAgent):
     @staticmethod
     def _extract_module_name(log_line: str) -> Optional[str]:
         """Extract kernel module name from rootcheck log entry."""
+        if not log_line:
+            return None
         for token in ("module:", "Module:", "loaded:"):
             if token in log_line:
                 parts = log_line.split(token, 1)
                 if len(parts) == 2:
-                    return parts[1].strip().split()[0].strip("'\"")
+                    # Fix V04-FUNC-HIGH-01: Prevent IndexError if split() is empty
+                    tokens = parts[1].strip().split()
+                    if tokens:
+                        return tokens[0].strip("'\"")
         return None
 
     @staticmethod
     def _is_hidden_in_sensitive_dir(full_log: str, title: str) -> bool:
+        full_log = full_log or ""
+        title = title or ""
         combined = (full_log + " " + title).lower()
         has_hidden = "hidden" in combined or combined.count("/.") > 0
         has_sensitive = any(d in combined for d in ("/tmp/", "/dev/shm/", "/var/tmp/"))
@@ -231,6 +253,8 @@ class RootkitHunterAgent(BaseAgent):
 
     @staticmethod
     def _extract_suid_path(full_log: str, title: str) -> Optional[str]:
+        full_log = full_log or ""
+        title = title or ""
         combined = full_log + " " + title
         if "suid" not in combined.lower() and "SUID" not in combined:
             return None
@@ -278,7 +302,9 @@ class RootkitHunterAgent(BaseAgent):
                 if sent:
                     alerts_sent += 1
                     self._metrics.inc_alerts(f["severity"].name)
-                    self._alerted_cache[action["cache_key"]] = time.time()
+                    with self._cache_lock:
+
+                        self._alerted_cache[action["cache_key"]] = time.time()
 
             elif action["type"] == "escalate":
                 self.report_to_supervisor({
@@ -302,7 +328,9 @@ class RootkitHunterAgent(BaseAgent):
 
         # Prune stale cache entries
         cutoff = time.time() - self._alert_cooldown * 2
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         return {"alerts_sent": alerts_sent, "escalations": escalations,
                 "incidents_logged": incidents_logged}

@@ -14,12 +14,10 @@ Attack types detected:
 
 import time
 import logging
-import hashlib
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List
 from collections import defaultdict
 from datetime import datetime, timezone
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W11-DDoSDetection")
@@ -61,8 +59,8 @@ class DDoSDetectionAgent(BaseAgent):
             ]}
         }
         try:
-            conns = self.os_client.get_events_since("zeek-conn-*", minutes=1, query=conn_query, size=5000)
-            suricata = self.os_client.get_events_since("suricata-*", minutes=1, query=suricata_query, size=1000)
+            conns = self.os_client.get_events_since("zeek-conn-*", minutes=1, query=conn_query, size=10000)
+            suricata = self.os_client.get_events_since("suricata-*", minutes=1, query=suricata_query, size=10000)
             return conns + suricata
         except Exception as e:
             logger.error("Failed to collect DDoS data: %s", e)
@@ -74,7 +72,8 @@ class DDoSDetectionAgent(BaseAgent):
         if not data:
             return findings
 
-        interval = max(self.interval_seconds, 1)
+        # Data is collected using `minutes=1` in collect(), so interval is 60 seconds
+        interval = 60
 
         # Aggregate metrics per destination
         dest_stats: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
@@ -84,109 +83,127 @@ class DDoSDetectionAgent(BaseAgent):
         })
 
         for event in data:
-            dest_ip = event.get("id.resp_h") or event.get("dest_ip", "")
-            src_ip = event.get("id.orig_h") or event.get("src_ip", "unknown")
-            proto = (event.get("proto") or event.get("app_proto") or "").lower()
-            conn_state = event.get("conn_state", "")
-            resp_bytes = int(event.get("resp_bytes", 0) or 0)
-            orig_bytes = int(event.get("orig_bytes", 0) or 0)
-            total = resp_bytes + orig_bytes
-            service = (event.get("service") or "").lower()
-            resp_p = int(event.get("id.resp_p", 0) or 0)
+            try:
+                dest_ip = event.get("id.resp_h") or event.get("dest_ip", "")
+                src_ip = event.get("id.orig_h") or event.get("src_ip", "unknown")
+                proto = (event.get("proto") or event.get("app_proto") or "").lower()
+                conn_state = event.get("conn_state", "")
+                resp_bytes = int(event.get("resp_bytes", 0) or 0)
+                orig_bytes = int(event.get("orig_bytes", 0) or 0)
+                total = resp_bytes + orig_bytes
+                service = (event.get("service") or "").lower()
+                resp_p = int(event.get("id.resp_p", 0) or 0)
 
-            if not dest_ip:
-                continue
+                if not dest_ip:
+                    continue
 
-            s = dest_stats[dest_ip]
-            s["total_bytes"] += total
-            s["sources"].add(src_ip)
+                s = dest_stats[dest_ip]
+                s["total_bytes"] += total
+                s["sources"].add(src_ip)
 
-            # SYN detection: Zeek conn_state S0 = SYN sent, no reply
-            if conn_state in ("S0", "S1", "SH", "SHR") and proto == "tcp":
-                s["syn_count"] += 1
+                # SYN detection: Zeek conn_state S0 = SYN sent, no reply
+                if conn_state in ("S0", "S1", "SH", "SHR") and proto == "tcp":
+                    s["syn_count"] += 1
 
-            # UDP volume
-            if proto == "udp":
-                s["udp_bytes"] += total
+                # UDP volume
+                if proto == "udp":
+                    s["udp_bytes"] += total
 
-            # HTTP requests (ports 80/443 or service http/ssl)
-            if resp_p in (80, 443, 8080, 8443) or service in ("http", "ssl"):
-                s["http_reqs"] += 1
+                # HTTP requests (ports 80/443 or service http/ssl)
+                if resp_p in (80, 443, 8080, 8443) or service in ("http", "ssl"):
+                    s["http_reqs"] += 1
 
-            # DNS amplification: large DNS responses from many sources
-            if (service == "dns" or resp_p == 53) and resp_bytes > DNS_AMP_RESP_BYTES:
-                s["dns_resp_sources"].add(src_ip)
-                s["dns_large_bytes"] += resp_bytes
+                # DNS amplification: large DNS responses from many sources
+                orig_p = int(event.get("id.orig_p", 0) or 0)
+                
+                if service == "dns" or resp_p == 53 or orig_p == 53:
+                    # The Reflector is the side sending the massive payload
+                    if resp_bytes > DNS_AMP_RESP_BYTES:
+                        # Reflector is dest_ip, Victim is src_ip
+                        if src_ip not in dest_stats: pass
+                        dest_stats[src_ip]["dns_resp_sources"].add(dest_ip)
+                        dest_stats[src_ip]["dns_large_bytes"] += resp_bytes
+                    elif orig_bytes > DNS_AMP_RESP_BYTES:
+                        # Reflector is src_ip, Victim is dest_ip
+                        dest_stats[dest_ip]["dns_resp_sources"].add(src_ip)
+                        dest_stats[dest_ip]["dns_large_bytes"] += orig_bytes
 
-            # Slowloris: half-open TCP connections
-            if conn_state in ("S0", "S1") and proto == "tcp":
-                s["half_open"] += 1
+                # Slowloris: true half-open TCP connections (S1 is established, must remove it)
+                if conn_state in ("S0", "SH", "RSTOS0", "SHR") and proto == "tcp":
+                    s["half_open"] += 1
+            except Exception as e:
+                logger.warning("Error processing DDoS event: %s", e)
 
         # Evaluate rules per destination
         for dest_ip, s in dest_stats.items():
-            src_count = len(s["sources"])
-            syn_pps = s["syn_count"] / interval
-            udp_mbps = (s["udp_bytes"] * 8) / (interval * 1_000_000)
-            http_rps = s["http_reqs"] / interval
-            total_gbps = (s["total_bytes"] * 8) / (interval * 1_000_000_000)
+            try:
+                src_count = len(s["sources"])
+                syn_pps = s["syn_count"] / interval
+                udp_mbps = (s["udp_bytes"] * 8) / (interval * 1_000_000)
+                http_rps = s["http_reqs"] / interval
+                total_gbps = (s["total_bytes"] * 8) / (interval * 1_000_000_000)
 
-            # Update baseline with EWMA
-            baseline = self._baselines.get(dest_ip, {"bytes_avg": float(s["total_bytes"]), "pps_avg": 0.0})
-            baseline["bytes_avg"] = (BASELINE_EWMA_ALPHA * s["total_bytes"]
-                                     + (1 - BASELINE_EWMA_ALPHA) * baseline["bytes_avg"])
-            self._baselines[dest_ip] = baseline
+                # Update baseline with EWMA
+                baseline = self._baselines.get(dest_ip, {"bytes_avg": float(s["total_bytes"]), "pps_avg": 0.0})
+                baseline["bytes_avg"] = (BASELINE_EWMA_ALPHA * s["total_bytes"]
+                                         + (1 - BASELINE_EWMA_ALPHA) * baseline["bytes_avg"])
+                self._baselines[dest_ip] = baseline
 
-            # Rule 1 — SYN flood
-            if syn_pps > SYN_FLOOD_PPS:
-                findings.append({
-                    "type": "syn_flood", "severity": Severity.CRITICAL,
-                    "dest_ip": dest_ip, "syn_pps": round(syn_pps, 1),
-                    "source_count": src_count,
-                    "details": f"SYN flood: {syn_pps:.0f} SYN/s → {dest_ip} from {src_count} sources",
-                })
+                # Rule 1 — SYN flood
+                if syn_pps > SYN_FLOOD_PPS:
+                    findings.append({
+                        "type": "syn_flood", "severity": Severity.CRITICAL,
+                        "dest_ip": dest_ip, "syn_pps": round(syn_pps, 1),
+                        "source_count": src_count,
+                        "details": f"SYN flood: {syn_pps:.0f} SYN/s → {dest_ip} from {src_count} sources",
+                    })
 
-            # Rule 2 — UDP flood
-            if udp_mbps > UDP_FLOOD_MBPS:
-                findings.append({
-                    "type": "udp_flood", "severity": Severity.HIGH,
-                    "dest_ip": dest_ip, "udp_mbps": round(udp_mbps, 1),
-                    "details": f"UDP flood: {udp_mbps:.0f} Mbps → {dest_ip}",
-                })
+                # Rule 2 — UDP flood
+                if udp_mbps > UDP_FLOOD_MBPS:
+                    findings.append({
+                        "type": "udp_flood", "severity": Severity.HIGH,
+                        "dest_ip": dest_ip, "udp_mbps": round(udp_mbps, 1),
+                        "details": f"UDP flood: {udp_mbps:.0f} Mbps → {dest_ip}",
+                    })
 
-            # Rule 3 — HTTP flood
-            if http_rps > HTTP_FLOOD_RPS:
-                findings.append({
-                    "type": "http_flood", "severity": Severity.HIGH,
-                    "dest_ip": dest_ip, "http_rps": round(http_rps, 1),
-                    "details": f"HTTP flood: {http_rps:.0f} req/s → {dest_ip}",
-                })
+                # Rule 3 — HTTP flood
+                if http_rps > HTTP_FLOOD_RPS:
+                    findings.append({
+                        "type": "http_flood", "severity": Severity.HIGH,
+                        "dest_ip": dest_ip, "http_rps": round(http_rps, 1),
+                        "details": f"HTTP flood: {http_rps:.0f} req/s → {dest_ip}",
+                    })
 
-            # Rule 4 — DNS amplification
-            if len(s["dns_resp_sources"]) > DNS_AMP_SOURCES:
-                findings.append({
-                    "type": "dns_amplification", "severity": Severity.HIGH,
-                    "dest_ip": dest_ip, "reflector_count": len(s["dns_resp_sources"]),
-                    "amp_bytes": s["dns_large_bytes"],
-                    "details": (f"DNS amplification: {len(s['dns_resp_sources'])} reflectors, "
-                                f"{s['dns_large_bytes']} bytes → {dest_ip}"),
-                })
+                # Rule 4 — DNS amplification
+                if len(s["dns_resp_sources"]) > DNS_AMP_SOURCES:
+                    findings.append({
+                        "type": "dns_amplification", "severity": Severity.HIGH,
+                        "dest_ip": dest_ip, "reflector_count": len(s["dns_resp_sources"]),
+                        "amp_bytes": s["dns_large_bytes"],
+                        "details": (f"DNS amplification: {len(s['dns_resp_sources'])} reflectors, "
+                                    f"{s['dns_large_bytes']} bytes → {dest_ip}"),
+                    })
 
-            # Rule 5 — Slowloris
-            if s["half_open"] > SLOWLORIS_HALF_OPEN:
-                findings.append({
-                    "type": "slowloris", "severity": Severity.MEDIUM,
-                    "dest_ip": dest_ip, "half_open": s["half_open"],
-                    "details": f"Slowloris: {s['half_open']} half-open connections → {dest_ip}",
-                })
+                # Rule 5 — Slowloris
+                if s["half_open"] > SLOWLORIS_HALF_OPEN:
+                    findings.append({
+                        "type": "slowloris", "severity": Severity.MEDIUM,
+                        "dest_ip": dest_ip, "half_open": s["half_open"],
+                        "details": f"Slowloris: {s['half_open']} half-open connections → {dest_ip}",
+                    })
 
-            # Rule 6 — Volumetric
-            if total_gbps > VOLUMETRIC_GBPS:
-                findings.append({
-                    "type": "volumetric", "severity": Severity.CRITICAL,
-                    "dest_ip": dest_ip, "gbps": round(total_gbps, 2),
-                    "details": f"Volumetric attack: {total_gbps:.2f} Gbps → {dest_ip}",
-                })
+                # Rule 6 — Volumetric
+                if total_gbps > VOLUMETRIC_GBPS:
+                    findings.append({
+                        "type": "volumetric", "severity": Severity.CRITICAL,
+                        "dest_ip": dest_ip, "gbps": round(total_gbps, 2),
+                        "details": f"Volumetric attack: {total_gbps:.2f} Gbps → {dest_ip}",
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating DDoS rules: %s", e)
 
+        self._events_processed += len(data)
+        self._metrics.inc_events(len(data))
         return findings
 
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -221,13 +238,15 @@ class DDoSDetectionAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"DDoS: {d['type'].replace('_', ' ').title()}",
                         details={"dest_ip": d["dest_ip"], "info": d["details"]},
                         agent_name=self.name,
                     )
-                    results["alerts_sent"] += 1
+                    if sent:
+                        results["alerts_sent"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
 
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])

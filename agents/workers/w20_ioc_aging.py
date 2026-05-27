@@ -17,7 +17,6 @@ Supervisor channel: soc:detection-supervisor
 from __future__ import annotations
 
 import logging
-import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -34,17 +33,17 @@ logger = logging.getLogger("soc.agent.w20_ioc_aging")
 
 IOC_MAX_AGE_DAYS = 90           # Days with zero hits before expiry
 IOC_EXTENSION_DAYS = 30         # TTL extension when an IOC gets recent hits
-IOC_RECENT_HIT_WINDOW_DAYS = 14 # "Recent" means a hit within this window
-BATCH_SIZE = 500                # OpenSearch scroll batch size
+IOC_RECENT_HIT_WINDOW_DAYS = 14  # "Recent" means a hit within this window
+BATCH_SIZE = 10000                # OpenSearch scroll batch size
 BLOCKLIST_INDEX = "soc-blocklist"
 IOC_INDEX = "soc-iocs"
 
 # Decay tiers – used to re-score IOCs based on last-hit recency
 DECAY_TIERS: list[dict[str, Any]] = [
-    {"max_days": 7,  "score": 1.0,  "label": "hot"},
-    {"max_days": 30, "score": 0.7,  "label": "warm"},
-    {"max_days": 60, "score": 0.4,  "label": "cool"},
-    {"max_days": 90, "score": 0.1,  "label": "cold"},
+    {"max_days": 7, "score": 1.0, "label": "hot"},
+    {"max_days": 30, "score": 0.7, "label": "warm"},
+    {"max_days": 60, "score": 0.4, "label": "cool"},
+    {"max_days": 90, "score": 0.1, "label": "cold"},
 ]
 
 
@@ -64,8 +63,10 @@ class IOCAgingAgent(BaseAgent):
             supervisor_channel="soc:detection-supervisor",
         )
         self._ioc_index: str = self._agent_config.get("ioc_index", IOC_INDEX)
-        self._blocklist_index: str = self._agent_config.get("blocklist_index", BLOCKLIST_INDEX)
-        self._max_age_days: int = self._agent_config.get("max_age_days", IOC_MAX_AGE_DAYS)
+        self._blocklist_index: str = self._agent_config.get(
+            "blocklist_index", BLOCKLIST_INDEX)
+        self._max_age_days: int = self._agent_config.get(
+            "max_age_days", IOC_MAX_AGE_DAYS)
         # Cumulative stats across cycles
         self._total_expired: int = 0
         self._total_extended: int = 0
@@ -85,12 +86,14 @@ class IOCAgingAgent(BaseAgent):
                     ],
                 }
             }
-            iocs = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._ioc_index,
-                minutes=0,  # no time filter – we want all active IOCs
-                query=query,
+                body={"query": query},
                 size=BATCH_SIZE,
             )
+            iocs = [
+                hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])
+            ]
             logger.info("Collected %d active IOCs for aging review", len(iocs))
             return iocs if iocs else None
         except Exception as exc:
@@ -107,57 +110,60 @@ class IOCAgingAgent(BaseAgent):
         findings: list[dict[str, Any]] = []
 
         for ioc in data:
-            ioc_id = ioc.get("_id", ioc.get("id", "unknown"))
-            ioc_value = ioc.get("value", "N/A")
-            ioc_type = ioc.get("type", "unknown")
-            created_str = ioc.get("created_at", ioc.get("@timestamp", ""))
-            last_hit_str = ioc.get("last_hit", "")
-            hit_count = ioc.get("hit_count", 0)
-            current_ttl_str = ioc.get("expires_at", "")
+            try:
+                ioc_id = ioc.get("_id", ioc.get("id", "unknown"))
+                ioc_value = ioc.get("value", "N/A")
+                ioc_type = ioc.get("type", "unknown")
+                created_str = ioc.get("created_at", ioc.get("@timestamp", ""))
+                last_hit_str = ioc.get("last_hit", "")
+                hit_count = ioc.get("hit_count", 0)
+                current_ttl_str = ioc.get("expires_at", "")
 
-            # Parse dates
-            created_at = self._parse_iso(created_str)
-            last_hit = self._parse_iso(last_hit_str) if last_hit_str else None
-            expires_at = self._parse_iso(current_ttl_str) if current_ttl_str else None
+                # Parse dates
+                created_at = self._parse_iso(created_str)
+                last_hit = self._parse_iso(last_hit_str) if last_hit_str else None
+                expires_at = self._parse_iso(current_ttl_str) if current_ttl_str else None
 
-            if created_at is None:
-                logger.warning("IOC %s has no valid created_at, skipping", ioc_id)
-                continue
+                if created_at is None:
+                    logger.warning("IOC %s has no valid created_at, skipping", ioc_id)
+                    continue
 
-            age_days = (now - created_at).days
-            days_since_hit = (now - last_hit).days if last_hit else age_days
+                age_days = (now - created_at).days
+                days_since_hit = (now - last_hit).days if last_hit else age_days
 
-            # Compute decay score
-            decay_score = 0.0
-            decay_label = "expired"
-            for tier in DECAY_TIERS:
-                if days_since_hit <= tier["max_days"]:
-                    decay_score = tier["score"]
-                    decay_label = tier["label"]
-                    break
+                # Compute decay score
+                decay_score = 0.0
+                decay_label = "expired"
+                for tier in DECAY_TIERS:
+                    if days_since_hit <= tier["max_days"]:
+                        decay_score = tier["score"]
+                        decay_label = tier["label"]
+                        break
 
-            # Determine action
-            action = "none"
-            if days_since_hit <= IOC_RECENT_HIT_WINDOW_DAYS and hit_count > 0:
-                action = "extend"
-            elif days_since_hit >= self._max_age_days:
-                action = "expire"
-            elif expires_at and now >= expires_at:
-                action = "expire"
+                # Determine action
+                action = "none"
+                if days_since_hit <= IOC_RECENT_HIT_WINDOW_DAYS and hit_count > 0:
+                    action = "extend"
+                elif days_since_hit >= self._max_age_days:
+                    action = "expire"
+                elif expires_at and now >= expires_at:
+                    action = "expire"
 
-            findings.append({
-                "ioc_id": ioc_id,
-                "ioc_value": ioc_value,
-                "ioc_type": ioc_type,
-                "age_days": age_days,
-                "days_since_hit": days_since_hit,
-                "hit_count": hit_count,
-                "decay_score": decay_score,
-                "decay_label": decay_label,
-                "action": action,
-                "created_at": created_str,
-                "last_hit": last_hit_str,
-            })
+                findings.append({
+                    "ioc_id": ioc_id,
+                    "ioc_value": ioc_value,
+                    "ioc_type": ioc_type,
+                    "age_days": age_days,
+                    "days_since_hit": days_since_hit,
+                    "hit_count": hit_count,
+                    "decay_score": decay_score,
+                    "decay_label": decay_label,
+                    "action": action,
+                    "created_at": created_str,
+                    "last_hit": last_hit_str,
+                })
+            except Exception as e:
+                logger.warning("Error analyzing IOC: %s", e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -165,7 +171,10 @@ class IOCAgingAgent(BaseAgent):
         # Log summary
         action_counts: Dict[str, int] = defaultdict(int)
         for f in findings:
-            action_counts[f["action"]] += 1
+            try:
+                action_counts[f["action"]] += 1
+            except Exception:
+                pass
         logger.info(
             "IOC aging analysis: %d total — extend=%d, expire=%d, none=%d",
             len(findings),
@@ -270,7 +279,8 @@ class IOCAgingAgent(BaseAgent):
                             "ioc_value": action["ioc_value"],
                             "ioc_type": action["ioc_type"],
                             "removed": True,
-                            "removed_at": datetime.now(timezone.utc).isoformat(),
+                            "removed_at": datetime.now(
+                                timezone.utc).isoformat(),
                             "reason": "IOC expired via aging policy",
                         },
                         doc_id=f"bl-{action['ioc_id']}",
@@ -339,7 +349,7 @@ class IOCAgingAgent(BaseAgent):
 
         # Alert if large expiry batch (could indicate stale threat-intel feed)
         if expired_count >= 50:
-            self.alerter.send_alert(
+            sent = self.alerter.send_alert(
                 severity=Severity.MEDIUM,
                 title="Large IOC Expiry Batch Detected",
                 details={
@@ -351,7 +361,8 @@ class IOCAgingAgent(BaseAgent):
                 },
                 agent_name=self.name,
             )
-            self._metrics.inc_alerts(Severity.MEDIUM.name)
+            if sent:
+                self._metrics.inc_alerts(Severity.MEDIUM.name)
 
         # Report to supervisor
         if expired_count or extended_count or cleaned_count:

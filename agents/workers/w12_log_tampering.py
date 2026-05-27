@@ -113,9 +113,9 @@ class LogTamperingAgent(BaseAgent):
             "hosts": {
                 "terms": {
                     "field": f"{self._host_field}.keyword"
-                              if not self._host_field.endswith(".keyword")
-                              else self._host_field,
-                    "size": 500,
+                    if not self._host_field.endswith(".keyword")
+                    else self._host_field,
+                    "size": 10000,
                 },
                 "aggs": {
                     "hourly_buckets": {
@@ -144,7 +144,7 @@ class LogTamperingAgent(BaseAgent):
                 query=query,
             )
 
-            host_buckets = result.get("hosts", {}).get("buckets", [])
+            host_buckets = (result.get("hosts") or {}).get("buckets", [])
             new_baselines: dict[str, float] = {}
 
             for host_bucket in host_buckets:
@@ -152,17 +152,18 @@ class LogTamperingAgent(BaseAgent):
                 if hostname in self._host_whitelist:
                     continue
 
-                hourly_buckets = host_bucket.get("hourly_buckets", {}).get("buckets", [])
+                hourly_buckets = (host_bucket.get("hourly_buckets") or {}).get("buckets", [])
                 if not hourly_buckets:
                     continue
 
-                # Calculate average events per hour
+                # Calculate true average events per hour across the entire baseline window
                 total_events = sum(b.get("doc_count", 0) for b in hourly_buckets)
-                num_hours = len(hourly_buckets)
+                num_hours = self._baseline_days * 24
                 avg_per_hour = total_events / num_hours if num_hours > 0 else 0
 
-                # Only track hosts with meaningful event volume
-                if avg_per_hour >= self._min_baseline_events_hr:
+                # Only track hosts with meaningful event volume, OR hosts we were ALREADY tracking
+                # This prevents "slow taper" evasion where attackers reduce volume gradually to drop off the baseline
+                if avg_per_hour >= self._min_baseline_events_hr or hostname in self._baselines:
                     new_baselines[hostname] = avg_per_hour
 
             self._baselines = new_baselines
@@ -187,9 +188,9 @@ class LogTamperingAgent(BaseAgent):
             "hosts": {
                 "terms": {
                     "field": f"{self._host_field}.keyword"
-                              if not self._host_field.endswith(".keyword")
-                              else self._host_field,
-                    "size": 500,
+                    if not self._host_field.endswith(".keyword")
+                    else self._host_field,
+                    "size": 10000,
                 },
             },
         }
@@ -209,7 +210,7 @@ class LogTamperingAgent(BaseAgent):
                 aggs=aggs,
                 query=query,
             )
-            host_buckets = result.get("hosts", {}).get("buckets", [])
+            host_buckets = (result.get("hosts") or {}).get("buckets", [])
             return {b["key"]: b["doc_count"] for b in host_buckets}
         except Exception as exc:
             logger.error("Failed to get current event counts: %s", exc)
@@ -237,48 +238,51 @@ class LogTamperingAgent(BaseAgent):
         interval_hours = self.interval_seconds / 3600.0
 
         for hostname, baseline_avg in baselines.items():
-            if hostname in self._host_whitelist:
-                continue
+            try:
+                if hostname in self._host_whitelist:
+                    continue
 
-            current_count = current.get(hostname, 0)
-            current_rate = current_count / interval_hours if interval_hours > 0 else 0
+                current_count = current.get(hostname, 0)
+                current_rate = current_count / interval_hours if interval_hours > 0 else 0
 
-            # Calculate percentage drop from baseline
-            if baseline_avg > 0:
-                drop_pct = ((baseline_avg - current_rate) / baseline_avg) * 100
-            else:
-                continue  # No meaningful baseline
+                # Calculate percentage drop from baseline
+                if baseline_avg > 0:
+                    drop_pct = ((baseline_avg - current_rate) / baseline_avg) * 100
+                else:
+                    continue  # No meaningful baseline
 
-            if drop_pct >= self._critical_drop_pct:
-                # 100% drop: host went completely silent
-                findings.append({
-                    "hostname": hostname,
-                    "severity": "CRITICAL",
-                    "drop_pct": drop_pct,
-                    "baseline_avg_per_hr": round(baseline_avg, 1),
-                    "current_rate_per_hr": round(current_rate, 1),
-                    "current_count": current_count,
-                    "description": (
-                        f"Host '{hostname}' has gone SILENT. "
-                        f"Expected ~{baseline_avg:.0f} events/hr, got {current_rate:.0f}. "
-                        "Possible log tampering or agent failure."
-                    ),
-                })
-            elif drop_pct >= self._high_drop_pct:
-                # >70% drop: significant reduction
-                findings.append({
-                    "hostname": hostname,
-                    "severity": "HIGH",
-                    "drop_pct": drop_pct,
-                    "baseline_avg_per_hr": round(baseline_avg, 1),
-                    "current_rate_per_hr": round(current_rate, 1),
-                    "current_count": current_count,
-                    "description": (
-                        f"Host '{hostname}' event volume dropped {drop_pct:.0f}%. "
-                        f"Expected ~{baseline_avg:.0f} events/hr, got {current_rate:.0f}. "
-                        "Investigate possible log suppression."
-                    ),
-                })
+                if drop_pct >= self._critical_drop_pct:
+                    # 100% drop: host went completely silent
+                    findings.append({
+                        "hostname": hostname,
+                        "severity": "CRITICAL",
+                        "drop_pct": drop_pct,
+                        "baseline_avg_per_hr": round(baseline_avg, 1),
+                        "current_rate_per_hr": round(current_rate, 1),
+                        "current_count": current_count,
+                        "description": (
+                            f"Host '{hostname}' has gone SILENT. "
+                            f"Expected ~{baseline_avg:.0f} events/hr, got {current_rate:.0f}. "
+                            "Possible log tampering or agent failure."
+                        ),
+                    })
+                elif drop_pct >= self._high_drop_pct:
+                    # >70% drop: significant reduction
+                    findings.append({
+                        "hostname": hostname,
+                        "severity": "HIGH",
+                        "drop_pct": drop_pct,
+                        "baseline_avg_per_hr": round(baseline_avg, 1),
+                        "current_rate_per_hr": round(current_rate, 1),
+                        "current_count": current_count,
+                        "description": (
+                            f"Host '{hostname}' event volume dropped {drop_pct:.0f}%. "
+                            f"Expected ~{baseline_avg:.0f} events/hr, got {current_rate:.0f}. "
+                            "Investigate possible log suppression."
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating log tampering rules for %s: %s", hostname, e)
 
         self._events_processed += len(baselines)
         self._metrics.inc_events(len(baselines))

@@ -7,6 +7,7 @@ Includes severity levels and rate-limiting to prevent alert storms.
 """
 
 from __future__ import annotations
+import threading
 
 import hashlib
 import json
@@ -19,7 +20,11 @@ from email.mime.text import MIMEText
 from enum import IntEnum
 from typing import Any, Optional
 
-import httpx
+try:
+    import httpx
+except ImportError:
+    logging.getLogger("soc.alerter").warning("httpx package not found. Slack/Telegram alerts will be disabled.")
+    httpx = None
 
 from .config import SOCConfig
 
@@ -94,6 +99,7 @@ class Alerter:
 
         # Rate limiter: hash(alert) → last-sent timestamp
         self._rate_cache: dict[str, float] = {}
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Rate limiting / تحديد المعدل
@@ -106,20 +112,22 @@ class Alerter:
 
     def _is_rate_limited(self, alert_key: str) -> bool:
         """Check whether this alert was sent recently."""
-        last_sent = self._rate_cache.get(alert_key, 0.0)
+        with self._cache_lock:
+            last_sent = self._rate_cache.get(alert_key, 0.0)
         if time.time() - last_sent < self._alerting.rate_limit_seconds:
             return True
         return False
 
     def _mark_sent(self, alert_key: str) -> None:
         """Record the send time for rate-limiting."""
-        self._rate_cache[alert_key] = time.time()
-        # Periodically prune old entries to prevent unbounded growth
-        if len(self._rate_cache) > 10_000:
-            cutoff = time.time() - self._alerting.rate_limit_seconds * 2
-            self._rate_cache = {
-                k: v for k, v in self._rate_cache.items() if v > cutoff
-            }
+        with self._cache_lock:
+            self._rate_cache[alert_key] = time.time()
+            # Periodically prune old entries to prevent unbounded growth
+            if len(self._rate_cache) > 10_000:
+                cutoff = time.time() - self._alerting.rate_limit_seconds * 2
+                self._rate_cache = {
+                    k: v for k, v in self._rate_cache.items() if v > cutoff
+                }
 
     # ------------------------------------------------------------------
     # Main send method / طريقة الإرسال الرئيسية
@@ -216,6 +224,9 @@ class Alerter:
         timestamp: str,
     ) -> None:
         """Send alert to Slack via webhook."""
+        if httpx is None:
+            return
+
         slack_cfg = self._alerting.slack
         if not slack_cfg.enabled or not slack_cfg.webhook_url:
             return
@@ -262,6 +273,9 @@ class Alerter:
         timestamp: str,
     ) -> None:
         """Send alert to Telegram via Bot API."""
+        if httpx is None:
+            return
+
         tg_cfg = self._alerting.telegram
         if not tg_cfg.enabled or not tg_cfg.bot_token or not tg_cfg.chat_id:
             return
@@ -332,10 +346,10 @@ class Alerter:
 
         try:
             if smtp_cfg.use_tls:
-                server = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port)
+                server = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port, timeout=10)
                 server.starttls()
             else:
-                server = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port)
+                server = smtplib.SMTP(smtp_cfg.host, smtp_cfg.port, timeout=10)
 
             if smtp_cfg.username:
                 server.login(smtp_cfg.username, smtp_cfg.password)

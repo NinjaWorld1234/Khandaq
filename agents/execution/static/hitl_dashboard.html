@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>خندق — بوابة الموافقة البشرية | Khandaq HITL Gateway</title>
+    <meta name="description" content="Human-in-the-Loop approval gateway for Khandaq SOC AI decisions" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <style>
+        /* ============================================================
+           Design System — SOC Dark Theme
+           ============================================================ */
+        :root {
+            --bg-primary: #0a0e17;
+            --bg-secondary: #111827;
+            --bg-card: #1a2234;
+            --bg-card-hover: #1f2a42;
+            --border-color: #2d3748;
+            --border-accent: #3b82f6;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-blue: #3b82f6;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-amber: #f59e0b;
+            --accent-purple: #8b5cf6;
+            --accent-cyan: #06b6d4;
+            --severity-critical: #dc2626;
+            --severity-high: #ef4444;
+            --severity-medium: #f59e0b;
+            --severity-low: #10b981;
+            --severity-info: #3b82f6;
+            --glow-blue: 0 0 20px rgba(59,130,246,0.3);
+            --glow-red: 0 0 20px rgba(239,68,68,0.3);
+            --glow-green: 0 0 20px rgba(16,185,129,0.3);
+            --radius: 12px;
+            --radius-sm: 8px;
+            --font-sans: 'Inter', -apple-system, sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+            --transition: 0.2s ease;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: var(--font-sans);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* ============================================================
+           Header
+           ============================================================ */
+        .header {
+            background: linear-gradient(135deg, var(--bg-secondary), var(--bg-card));
+            border-bottom: 1px solid var(--border-color);
+            padding: 16px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            backdrop-filter: blur(12px);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .logo {
+            font-size: 28px;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        .logo-sub {
+            font-size: 13px;
+            color: var(--text-muted);
+            font-weight: 400;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        .status-badge.live {
+            background: rgba(16,185,129,0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(16,185,129,0.3);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-green);
+            animation: pulse-dot 2s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(16,185,129,0.5); }
+            50% { opacity: 0.8; box-shadow: 0 0 0 6px rgba(16,185,129,0); }
+        }
+
+        /* ============================================================
+           Stats Bar
+           ============================================================ */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            padding: 24px 32px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 20px;
+            transition: all var(--transition);
+        }
+
+        .stat-card:hover {
+            border-color: var(--border-accent);
+            box-shadow: var(--glow-blue);
+            transform: translateY(-2px);
+        }
+
+        .stat-label {
+            font-size: 13px;
+            color: var(--text-muted);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .stat-value {
+            font-size: 36px;
+            font-weight: 700;
+            font-family: var(--font-mono);
+            margin-top: 4px;
+        }
+
+        .stat-value.pending { color: var(--accent-amber); }
+        .stat-value.approved { color: var(--accent-green); }
+        .stat-value.rejected { color: var(--accent-red); }
+        .stat-value.total { color: var(--accent-blue); }
+
+        /* ============================================================
+           Tabs
+           ============================================================ */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            padding: 0 32px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .tab {
+            padding: 12px 24px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-muted);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all var(--transition);
+            background: none;
+            border-top: none;
+            border-left: none;
+            border-right: none;
+        }
+
+        .tab:hover { color: var(--text-primary); }
+
+        .tab.active {
+            color: var(--accent-blue);
+            border-bottom-color: var(--accent-blue);
+        }
+
+        .tab .badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 22px;
+            height: 22px;
+            border-radius: 11px;
+            font-size: 12px;
+            font-weight: 600;
+            margin-right: 6px;
+            padding: 0 6px;
+        }
+
+        .tab .badge.pending-badge {
+            background: rgba(245,158,11,0.2);
+            color: var(--accent-amber);
+        }
+
+        /* ============================================================
+           Actions List
+           ============================================================ */
+        .content { padding: 24px 32px; }
+
+        .actions-list { display: flex; flex-direction: column; gap: 16px; }
+
+        .action-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            overflow: hidden;
+            transition: all var(--transition);
+        }
+
+        .action-card:hover {
+            border-color: var(--border-accent);
+            box-shadow: var(--glow-blue);
+        }
+
+        .action-card.severity-CRITICAL { border-right: 4px solid var(--severity-critical); }
+        .action-card.severity-HIGH { border-right: 4px solid var(--severity-high); }
+        .action-card.severity-MEDIUM { border-right: 4px solid var(--severity-medium); }
+        .action-card.severity-LOW { border-right: 4px solid var(--severity-low); }
+
+        .action-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 20px;
+            background: rgba(255,255,255,0.02);
+        }
+
+        .action-info { display: flex; align-items: center; gap: 12px; }
+
+        .action-type-badge {
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 12px;
+            font-weight: 600;
+            font-family: var(--font-mono);
+            text-transform: uppercase;
+        }
+
+        .action-type-badge.block_ip { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+        .action-type-badge.isolate_host { background: rgba(245,158,11,0.2); color: var(--accent-amber); }
+        .action-type-badge.monitor_step_up { background: rgba(59,130,246,0.2); color: var(--accent-blue); }
+        .action-type-badge.disable_user { background: rgba(139,92,246,0.2); color: var(--accent-purple); }
+        .action-type-badge.default { background: rgba(100,116,139,0.2); color: var(--text-secondary); }
+
+        .action-target {
+            font-family: var(--font-mono);
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .action-source {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+
+        .action-time {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+        }
+
+        .action-body {
+            padding: 16px 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .action-reason {
+            font-size: 14px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+            margin-bottom: 16px;
+        }
+
+        .action-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .feedback-input {
+            flex: 1;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+            padding: 10px 14px;
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            font-size: 14px;
+            outline: none;
+            transition: border-color var(--transition);
+        }
+
+        .feedback-input:focus { border-color: var(--accent-blue); }
+        .feedback-input::placeholder { color: var(--text-muted); }
+
+        .btn {
+            padding: 10px 24px;
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            border: none;
+            transition: all var(--transition);
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-approve {
+            background: rgba(16,185,129,0.15);
+            color: var(--accent-green);
+            border: 1px solid rgba(16,185,129,0.3);
+        }
+        .btn-approve:hover:not(:disabled) {
+            background: var(--accent-green);
+            color: #fff;
+            box-shadow: var(--glow-green);
+        }
+
+        .btn-reject {
+            background: rgba(239,68,68,0.15);
+            color: var(--accent-red);
+            border: 1px solid rgba(239,68,68,0.3);
+        }
+        .btn-reject:hover:not(:disabled) {
+            background: var(--accent-red);
+            color: #fff;
+            box-shadow: var(--glow-red);
+        }
+
+        /* ============================================================
+           History Table
+           ============================================================ */
+        .history-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 8px;
+        }
+
+        .history-table th {
+            text-align: right;
+            padding: 12px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .history-table td {
+            padding: 12px 16px;
+            font-size: 14px;
+            border-bottom: 1px solid rgba(45,55,72,0.5);
+        }
+
+        .history-table tr:hover td { background: var(--bg-card-hover); }
+
+        .status-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .status-pill.approved { background: rgba(16,185,129,0.2); color: var(--accent-green); }
+        .status-pill.rejected { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+        .status-pill.policy { background: rgba(139,92,246,0.2); color: var(--accent-purple); }
+
+        /* ============================================================
+           Empty State
+           ============================================================ */
+        .empty-state {
+            text-align: center;
+            padding: 80px 32px;
+            color: var(--text-muted);
+        }
+
+        .empty-icon { font-size: 48px; margin-bottom: 16px; }
+        .empty-title { font-size: 18px; font-weight: 600; color: var(--text-secondary); }
+        .empty-desc { font-size: 14px; margin-top: 8px; }
+
+        /* ============================================================
+           Toast Notifications
+           ============================================================ */
+        .toast-container {
+            position: fixed;
+            top: 80px;
+            left: 32px;
+            z-index: 999;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast {
+            padding: 12px 20px;
+            border-radius: var(--radius-sm);
+            font-size: 14px;
+            font-weight: 500;
+            animation: slideIn 0.3s ease, fadeOut 0.3s ease 3s forwards;
+            max-width: 400px;
+        }
+
+        .toast.success { background: rgba(16,185,129,0.9); color: #fff; }
+        .toast.error { background: rgba(239,68,68,0.9); color: #fff; }
+
+        @keyframes slideIn { from { transform: translateX(-100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        @keyframes fadeOut { to { opacity: 0; transform: translateX(-50px); } }
+
+        /* ============================================================
+           Responsive
+           ============================================================ */
+        @media (max-width: 768px) {
+            .stats-bar { grid-template-columns: repeat(2, 1fr); }
+            .header { padding: 12px 16px; }
+            .content { padding: 16px; }
+            .action-controls { flex-direction: column; }
+            .feedback-input { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div>
+                <div class="logo">🛡️ خندق</div>
+                <div class="logo-sub">بوابة الموافقة البشرية — HITL Gateway</div>
+            </div>
+        </div>
+        <div class="status-badge live">
+            <span class="status-dot"></span>
+            <span id="statusText">متصل — تحديث تلقائي</span>
+        </div>
+    </header>
+
+    <!-- Stats -->
+    <div class="stats-bar">
+        <div class="stat-card">
+            <div class="stat-label">⏳ معلّقة</div>
+            <div class="stat-value pending" id="statPending">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">✅ مقبولة</div>
+            <div class="stat-value approved" id="statApproved">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">❌ مرفوضة</div>
+            <div class="stat-value rejected" id="statRejected">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">📊 إجمالي القرارات</div>
+            <div class="stat-value total" id="statTotal">0</div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+        <button class="tab active" data-tab="pending" onclick="switchTab('pending')">
+            <span class="badge pending-badge" id="pendingBadge">0</span> إجراءات معلّقة
+        </button>
+        <button class="tab" data-tab="history" onclick="switchTab('history')">
+            📜 سجل القرارات
+        </button>
+    </div>
+
+    <!-- Content -->
+    <div class="content">
+        <!-- Pending Tab -->
+        <div id="tab-pending" class="tab-content">
+            <div class="actions-list" id="pendingList"></div>
+        </div>
+
+        <!-- History Tab -->
+        <div id="tab-history" class="tab-content" style="display:none;">
+            <table class="history-table">
+                <thead>
+                    <tr>
+                        <th>المعرّف</th>
+                        <th>النوع</th>
+                        <th>الهدف</th>
+                        <th>الحالة</th>
+                        <th>التعليق</th>
+                        <th>الوقت</th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        /* ============================================================
+           State & Config
+           ============================================================ */
+        const API_BASE = window.location.origin;
+        let refreshInterval = null;
+
+        /* ============================================================
+           API Calls
+           ============================================================ */
+        async function fetchPending() {
+            try {
+                const resp = await fetch(`${API_BASE}/api/approvals/pending`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                return await resp.json();
+            } catch (e) {
+                console.error("Failed to fetch pending:", e);
+                return { count: 0, actions: [] };
+            }
+        }
+
+        async function fetchStats() {
+            try {
+                const resp = await fetch(`${API_BASE}/api/stats`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                return await resp.json();
+            } catch (e) {
+                console.error("Failed to fetch stats:", e);
+                return { pending: 0, approved: 0, rejected: 0, total: 0 };
+            }
+        }
+
+        async function fetchHistory() {
+            try {
+                const resp = await fetch(`${API_BASE}/api/approvals/history`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                return await resp.json();
+            } catch (e) {
+                console.error("Failed to fetch history:", e);
+                return { actions: [] };
+            }
+        }
+
+        async function approveAction(actionId) {
+            const input = document.getElementById(`feedback-${actionId}`);
+            const reason = input ? input.value : "";
+            try {
+                const resp = await fetch(`${API_BASE}/api/approvals/${actionId}/approve`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ feedback_reason: reason }),
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                showToast("✅ تمت الموافقة على الإجراء", "success");
+                await refreshAll();
+            } catch (e) {
+                showToast("❌ فشلت الموافقة: " + e.message, "error");
+            }
+        }
+
+        async function rejectAction(actionId) {
+            const input = document.getElementById(`feedback-${actionId}`);
+            const reason = input ? input.value : "";
+            if (!reason.trim()) {
+                showToast("⚠️ يجب كتابة سبب الرفض", "error");
+                input && input.focus();
+                return;
+            }
+            try {
+                const resp = await fetch(`${API_BASE}/api/approvals/${actionId}/reject`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ feedback_reason: reason }),
+                });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                showToast("❌ تم رفض الإجراء وإرسال التغذية الراجعة", "success");
+                await refreshAll();
+            } catch (e) {
+                showToast("❌ فشل الرفض: " + e.message, "error");
+            }
+        }
+
+        /* ============================================================
+           Render Functions
+           ============================================================ */
+        function getActionTypeClass(type) {
+            const known = ["block_ip", "isolate_host", "monitor_step_up", "disable_user"];
+            return known.includes(type) ? type : "default";
+        }
+
+        function formatTime(ts) {
+            if (!ts) return "—";
+            const d = new Date(typeof ts === "number" ? ts * 1000 : ts);
+            return d.toLocaleString("ar-SA", { hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "2-digit" });
+        }
+
+        function renderPending(data) {
+            const container = document.getElementById("pendingList");
+            const actions = data.actions || [];
+
+            if (actions.length === 0) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-icon">✅</div>
+                        <div class="empty-title">لا توجد إجراءات معلّقة</div>
+                        <div class="empty-desc">جميع قرارات الذكاء الاصطناعي تمت مراجعتها</div>
+                    </div>`;
+                return;
+            }
+
+            container.innerHTML = actions.map(action => {
+                const actionId = action.action_id || "unknown";
+                const actionType = action.action_type || "unknown";
+                const target = action.target || "—";
+                const reason = action.reason || "لا يوجد سبب محدد";
+                const source = action.source || "unknown";
+                const timestamp = formatTime(action.timestamp);
+                const reputation = action.reputation_score !== undefined ? parseFloat(action.reputation_score).toFixed(2) : "1.00";
+                const warningHTML = action.confidence_warning ? `<div style="margin-top: 8px; color: var(--accent-amber); font-size: 13px; font-weight: 600; padding: 6px; background: rgba(245,158,11,0.1); border-radius: 4px;">⚠️ ${action.confidence_warning}</div>` : "";
+
+                return `
+                <div class="action-card severity-${(action.severity || 'HIGH').toUpperCase()}">
+                    <div class="action-header">
+                        <div class="action-info">
+                            <span class="action-type-badge ${getActionTypeClass(actionType)}">${actionType}</span>
+                            <span class="action-target">${target}</span>
+                            <span class="action-source">المصدر: ${source} <span style="color: ${parseFloat(reputation) < 0.7 ? 'var(--accent-red)' : 'var(--text-muted)'}">(★ ${reputation})</span></span>
+                        </div>
+                        <span class="action-time">${timestamp}</span>
+                    </div>
+                    <div class="action-body">
+                        <div class="action-reason">📝 <strong>السبب:</strong> ${reason}</div>
+                        ${warningHTML}
+                        <div class="action-controls" style="margin-top: 16px;">
+                            <input type="text" class="feedback-input" id="feedback-${actionId}"
+                                   placeholder="تعليق المحلل (اختياري للموافقة، إجباري للرفض)..." />
+                            <button class="btn btn-approve" onclick="approveAction('${actionId}')">✅ موافقة</button>
+                            <button class="btn btn-reject" onclick="rejectAction('${actionId}')">❌ رفض</button>
+                        </div>
+                    </div>
+                </div>`;
+            }).join("");
+        }
+
+        function renderHistory(data) {
+            const tbody = document.getElementById("historyBody");
+            const actions = data.actions || [];
+
+            if (actions.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--text-muted);">لا يوجد سجل بعد</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = actions.map(a => {
+                const statusClass = a.status === "APPROVED" ? "approved" :
+                                   a.status === "REJECTED_BY_HUMAN" ? "rejected" : "policy";
+                const statusText = a.status === "APPROVED" ? "مقبول" :
+                                  a.status === "REJECTED_BY_HUMAN" ? "مرفوض" : "سياسة";
+                return `
+                <tr>
+                    <td style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">${(a.action_id || "").substring(0,12)}…</td>
+                    <td><span class="action-type-badge ${getActionTypeClass(a.action_type)}">${a.action_type || "—"}</span></td>
+                    <td style="font-family:var(--font-mono)">${a.target || "—"}</td>
+                    <td><span class="status-pill ${statusClass}">${statusText}</span></td>
+                    <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.human_feedback || a.policy_reason || "—"}</td>
+                    <td style="font-family:var(--font-mono);font-size:12px">${formatTime(a.timestamp)}</td>
+                </tr>`;
+            }).join("");
+        }
+
+        function updateStats(stats) {
+            document.getElementById("statPending").textContent = stats.pending || 0;
+            document.getElementById("statApproved").textContent = stats.approved || 0;
+            document.getElementById("statRejected").textContent = stats.rejected || 0;
+            document.getElementById("statTotal").textContent = stats.total || 0;
+            document.getElementById("pendingBadge").textContent = stats.pending || 0;
+        }
+
+        /* ============================================================
+           Tab Switching
+           ============================================================ */
+        function switchTab(tabName) {
+            document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+            document.querySelectorAll(".tab-content").forEach(c => c.style.display = "none");
+            document.querySelector(`[data-tab="${tabName}"]`).classList.add("active");
+            document.getElementById(`tab-${tabName}`).style.display = "block";
+
+            if (tabName === "history") loadHistory();
+        }
+
+        async function loadHistory() {
+            const data = await fetchHistory();
+            renderHistory(data);
+        }
+
+        /* ============================================================
+           Toast
+           ============================================================ */
+        function showToast(message, type) {
+            const container = document.getElementById("toastContainer");
+            const toast = document.createElement("div");
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 3500);
+        }
+
+        /* ============================================================
+           Auto-Refresh Loop
+           ============================================================ */
+        async function refreshAll() {
+            try {
+                const [pending, stats] = await Promise.all([fetchPending(), fetchStats()]);
+                renderPending(pending);
+                updateStats(stats);
+            } catch (e) {
+                console.error("Refresh failed:", e);
+            }
+        }
+
+        // Initial load
+        refreshAll();
+        // Auto-refresh every 5 seconds
+        refreshInterval = setInterval(refreshAll, 5000);
+    </script>
+</body>
+</html>

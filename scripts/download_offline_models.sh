@@ -2,56 +2,55 @@
 ###############################################################################
 # SOC Platform — Offline AI Models Downloader (Naser Server)
 # أداة تحميل النماذج لسيرفر ناصر (التخزين غير المتصل)
-#
-# هذا السكريبت يقوم بسحب أوزان نماذج الذكاء الاصطناعي المتفق عليها
-# وتخزينها محلياً في مجلد (soc_models) لتعمل الحاويات بدون إنترنت.
+# Architecture: Distributed Cognitive Cyber Defense Platform
 ###############################################################################
 
 set -euo pipefail
 
-# الألوان
 readonly GREEN='\033[0;32m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m'
 
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-readonly MODELS_DIR="${PROJECT_DIR}/soc_models"
+export PATH="$PATH:/root/.local/bin:$HOME/.local/bin"
+
+readonly MODELS_DIR="/root/Khandaq/soc_models"
 
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 
 mkdir -p "${MODELS_DIR}"
-cd "${MODELS_DIR}"
 
 log_step "Checking prerequisites (hf & hf_transfer)..."
-if ! command -v hf &> /dev/null; then
+if ! command -v huggingface-cli &> /dev/null; then
     log_info "Installing huggingface_hub via pipx..."
     pipx install "huggingface_hub[cli]"
 fi
 
-log_info "Ensuring hf_transfer is installed for ultra-fast parallel downloads..."
 pipx runpip huggingface-hub install hf_transfer || true
-
 export HF_HUB_ENABLE_HF_TRANSFER=1
 
 # =============================================================================
-# 1. القائد والمشرفين (Kimi 2.6-Mini)
+# 1. Strategic Commander (Qwen-2.5-7B) - Long Context & Reasoning
 # =============================================================================
-log_step "Downloading Commander Model: Kimi K2.6-Mini (13B) into Naser Server..."
-hf download moonshotai/Kimi-K2.6 --local-dir "${MODELS_DIR}/Kimi-K2.6-Mini"
+log_step "Downloading Strategic Commander: Qwen-2.5-7B-Instruct (GGUF Q4_K_M)..."
+huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF --include "*q4_k_m*.gguf" --local-dir "${MODELS_DIR}/Commander-Qwen"
 
 # =============================================================================
-# 2. الوكلاء الميدانيين (WhiteRabbitNeo)
+# 2. Cyber Analyst (WhiteRabbitNeo-13B) — Cybersecurity-Specialized Tactical Analysis
 # =============================================================================
-log_step "Downloading Field Workers Model: WhiteRabbitNeo-13B-v1 into Naser Server..."
-hf download WhiteRabbitNeo/WhiteRabbitNeo-13B-v1 --local-dir "${MODELS_DIR}/WhiteRabbitNeo-13B-v1"
+log_step "Downloading Cyber Analyst: WhiteRabbitNeo-13B (GGUF Q4_K_M)..."
+huggingface-cli download TheBloke/WhiteRabbitNeo-13B-GGUF --include "*Q4_K_M*.gguf" --local-dir "${MODELS_DIR}/WhiteRabbitNeo-13B"
 
 # =============================================================================
-# 3. محرك التصفية السريع (SecureBERT)
+# 3. [REMOVED] Mistral Router — no longer used in Khandaq architecture
 # =============================================================================
-log_step "Downloading Fast Filter Model: SecureBERT into Naser Server..."
-hf download ehsanaghaei/SecureBERT --local-dir "${MODELS_DIR}/SecureBERT"
+# log_step "Skipped: Mistral router removed from architecture"
 
-log_info "✅ All models have been successfully downloaded into Naser Server storage (${MODELS_DIR})."
-log_info "✅ The SOC is now ready to operate in 100% Air-Gapped (Offline) mode."
+# =============================================================================
+# 4. Fast Classifier (SecureBERT) - Initial Filter
+# =============================================================================
+log_step "Downloading Fast Classifier: SecureBERT..."
+huggingface-cli download ehsanaghaei/SecureBERT --local-dir "${MODELS_DIR}/Filter-SecureBERT"
+
+log_info "✅ All architectural models have been successfully downloaded for storage in ${MODELS_DIR}."
+

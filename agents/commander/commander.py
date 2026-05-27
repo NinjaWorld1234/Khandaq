@@ -1,561 +1,199 @@
 """
-SOC Platform – Commander Agent (القائد الأعلى)
-The supreme coordinator that receives escalations from all 5 supervisors
-and makes strategic response decisions.
-
-Subscribes to: soc:supervisor-to-commander
-
-Cross-supervisor correlations:
-  1. Network C2 + Endpoint suspicious process on same host → CONFIRMED INTRUSION
-  2. Intel new threat campaign + Endpoint IOC match        → TARGETED ATTACK
-  3. Infra log gap + Network beaconing from same host      → EVASION
-  4. Response isolation + continued network activity        → INCOMPLETE CONTAINMENT
-  5. Multiple supervisors reporting on same host            → MULTI-VECTOR ATTACK
-
-Global Threat Levels: GREEN → YELLOW → ORANGE → RED
-
-Interval: 10 seconds (highly responsive)
+SOC Platform – AI Strategic Commander (Qwen-2.5)
+The supreme AI coordinator that receives escalations from Mistral Routers
+and CyberLlama tactical analysts to make strategic response decisions.
 """
-
-from __future__ import annotations
 
 import json
 import logging
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+import os
+import requests
+import threading
+from typing import Any, Dict, List, Optional
 
+from memory.memory_service import CyberMemory
+from shared.decision_fusion import DecisionFusionEngine
+from shared.trust_engine import TrustEngine
 from shared.base_agent import BaseAgent
 from shared.config import SOCConfig
-from shared.alerter import Severity
+from shared.ai_client import AIClient
+from config.system_prompts import QWEN_COMMANDER_PROMPT
 
 logger = logging.getLogger("soc.commander")
 
-# Threat level thresholds
-_THREAT_DECAY_SECONDS = 1800  # 30 min with no escalation → decay
-_CORRELATION_WINDOW = 600     # 10 min window for cross-supervisor correlation
-
-
 class CommanderAgent(BaseAgent):
-    """
-    Commander Agent — the top-level SOC coordinator.
-    Receives escalated events from all supervisors, performs cross-domain
-    correlation, manages global threat level, and coordinates strategic
-    incident response.
-    """
-
     def __init__(self, config: Optional[SOCConfig] = None) -> None:
         super().__init__(
-            name="commander",
-            description="Supreme SOC coordinator with global visibility",
+            name="CommanderAgent_Qwen",
+            description="Supreme SOC coordinator powered by Qwen-2.5",
             interval_seconds=10,
             config=config,
+            supervisor_channel="soc:supervisor-to-commander"
         )
-        # Global threat state
-        self._threat_level = "GREEN"
-        self._threat_level_since = time.time()
-        self._last_critical = 0.0
-
-        # Incoming supervisor reports (sliding window)
-        self._supervisor_reports: List[Dict[str, Any]] = []
-
-        # Per-host timeline: host → list of {supervisor, type, severity, time}
-        self._host_timeline: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-
-        # Active incidents
-        self._active_incidents: Dict[str, Dict[str, Any]] = {}
-
-        # HITL (Human-in-the-Loop) Authorizations
-        self._pending_auths: Dict[str, Dict[str, Any]] = {}
-        self._auth_timeout_seconds = 3600  # 60 minutes
-        
-        # Red Line Definition (Servers)
-        self._red_line_keywords = ["khandaq", "srv-", "server", "db-", "opensearch", "10.99."]
-
-        # Statistics
-        self._total_escalations = 0
+        self.ai_client = AIClient(role="commander", config=config)
+        self.pending_reports = []
+        self._lock = threading.Lock()
         self._total_decisions = 0
+        self._cache_lock = threading.Lock()
+        
+        # Initialize Cyber Memory Engine
+        self.memory = CyberMemory()
+        
+        # Initialize Decision Fusion Engine
+        self.fusion_engine = DecisionFusionEngine()
+        
+        # Initialize Zero Trust Engine
+        self.trust_engine = TrustEngine()
 
-    # ------------------------------------------------------------------
-    # Redis handler
-    # ------------------------------------------------------------------
-
-    def _on_supervisor_message(self, message: dict) -> None:
+    def handle_worker_message(self, message: dict) -> None:
         try:
-            data = message if isinstance(message, dict) else json.loads(message)
-            data["_received_at"] = time.time()
-            self._supervisor_reports.append(data)
-            self._total_escalations += 1
-            logger.info("Escalation from %s: %s [%s]",
-                        data.get("supervisor", "?"),
-                        data.get("type", "?"),
-                        data.get("severity", "?"))
-        except Exception as exc:
-            logger.error("Failed to parse supervisor message: %s", exc)
+            payload = message.get("payload", {})
+            with self._lock:
+                with self._cache_lock:
 
-    # ------------------------------------------------------------------
-    # Collect
-    # ------------------------------------------------------------------
+                    self.pending_reports.append(payload)
+            logger.info(f"Received strategic report: {payload.get('type', 'unknown')}")
+        except Exception as exc:
+            logger.error("Failed to parse incoming report: %s", exc)
 
     def collect(self) -> List[Dict[str, Any]]:
-        now = time.time()
-        
-        # Clean up expired HITL authorizations
-        expired_auths = [auth_id for auth_id, data in self._pending_auths.items() 
-                         if now - data["timestamp"] > self._auth_timeout_seconds]
-        for auth_id in expired_auths:
-            logger.warning(f"HITL Authorization {auth_id} expired. Dropping action.")
-            del self._pending_auths[auth_id]
+        with self._lock:
+            batch = list(self.pending_reports)
+            with self._cache_lock:
 
-        # Keep last 15 minutes of reports
-        self._supervisor_reports = [
-            r for r in self._supervisor_reports
-            if now - r.get("_received_at", 0) < 900
-        ]
-        batch = list(self._supervisor_reports)
-        self._supervisor_reports.clear()
+                self.pending_reports.clear()
         return batch
 
-    # ------------------------------------------------------------------
-    # Analyze — cross-supervisor correlation
-    # ------------------------------------------------------------------
-
     def analyze(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        findings: List[Dict[str, Any]] = []
-        now = time.time()
+        if not data:
+            return []
 
-        # Index by supervisor and host
-        by_supervisor: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        by_host: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-
+        # 1. Collective Reasoning: Calculate consensus and trigger debate if necessary
+        consensus_score, needs_debate = self.fusion_engine.calculate_consensus(data)
+        
+        if needs_debate:
+            consensus_score = self.fusion_engine.trigger_debate(data, self.ai_client)
+            
+        # 2. Dynamic Trust Penalty
+        trust_actions = []
         for report in data:
-            supervisor = report.get("supervisor", "")
-            host = report.get("host", "")
-            report_type = report.get("type", "")
-            severity_str = report.get("severity", "MEDIUM")
-            severity = self._parse_severity(severity_str)
-
-            by_supervisor[supervisor].append(report)
-            if host:
-                by_host[host].append(report)
-                self._host_timeline[host].append({
-                    "supervisor": supervisor,
-                    "type": report_type,
-                    "severity": severity,
-                    "time": now,
-                    "details": report.get("details", ""),
-                })
-
-        # ── Rule 1: Network C2 + Endpoint suspicious process ──
-        network_reports = by_supervisor.get("network_supervisor", [])
-        endpoint_reports = by_supervisor.get("endpoint_supervisor", [])
-
-        c2_hosts = {r.get("host") for r in network_reports
-                    if "c2" in str(r.get("type", "")).lower() or "beaconing" in str(r.get("type", "")).lower()}
-        suspicious_hosts = {r.get("host") for r in endpoint_reports
-                           if "process" in str(r.get("type", "")).lower() or "rootkit" in str(r.get("type", "")).lower()}
-
-        overlap_c2_endpoint = c2_hosts & suspicious_hosts - {"", None}
-        for host in overlap_c2_endpoint:
-            key = f"confirmed_intrusion:{host}"
-            if self._should_escalate(key, now):
-                findings.append({
-                    "type": "CONFIRMED_INTRUSION",
-                    "severity": Severity.CRITICAL,
-                    "host": host,
-                    "details": f"Network C2/beaconing + Endpoint suspicious process on {host}",
-                    "response": "IMMEDIATE_ISOLATION",
-                })
-
-        # ── Rule 2: Intel threat + Endpoint IOC match ──
-        detection_reports = by_supervisor.get("detection_supervisor", [])
-        intel_threats = [r for r in detection_reports
-                        if "campaign" in str(r.get("type", "")).lower()
-                        or "known_threat" in str(r.get("type", "")).lower()]
-        for threat in intel_threats:
-            affected_hosts = threat.get("affected_hosts", [])
-            for host in affected_hosts:
-                if host in by_host:
-                    key = f"targeted:{host}"
-                    if self._should_escalate(key, now):
-                        findings.append({
-                            "type": "TARGETED_ATTACK",
-                            "severity": Severity.CRITICAL,
-                            "host": host,
-                            "details": f"Intelligence reports targeted attack matching activity on {host}",
-                            "response": "ELEVATED_MONITORING",
-                        })
-
-        # ── Rule 3: Infra log gap + Network beaconing ──
-        infra_reports = by_supervisor.get("infra_supervisor", [])
-        log_gap_hosts = {r.get("host") for r in infra_reports
-                        if "log" in str(r.get("type", "")).lower()
-                        and ("gap" in str(r.get("type", "")).lower()
-                             or "tamper" in str(r.get("type", "")).lower())}
-        beaconing_hosts = {r.get("host") for r in network_reports
-                          if "beacon" in str(r.get("type", "")).lower()}
-        evasion_hosts = log_gap_hosts & beaconing_hosts - {"", None}
-        for host in evasion_hosts:
-            key = f"evasion:{host}"
-            if self._should_escalate(key, now):
-                findings.append({
-                    "type": "ATTACKER_EVASION",
-                    "severity": Severity.CRITICAL,
-                    "host": host,
-                    "details": f"Log tampering + C2 beaconing on {host} — attacker evading detection",
-                    "response": "IMMEDIATE_ISOLATION",
-                })
-
-        # ── Rule 5: Multi-vector (3+ supervisors reporting same host) ──
-        for host, events in self._host_timeline.items():
-            recent = [e for e in events if now - e["time"] < _CORRELATION_WINDOW]
-            supervisors = {e["supervisor"] for e in recent}
-            if len(supervisors) >= 3:
-                key = f"multi_vector:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "MULTI_VECTOR_ATTACK",
-                        "severity": Severity.CRITICAL,
-                        "host": host,
-                        "details": (f"Multi-vector attack on {host}: "
-                                    f"reported by {', '.join(supervisors)}"),
-                        "supervisors": list(supervisors),
-                        "response": "FULL_INCIDENT_RESPONSE",
-                    })
-
-        # Always forward all escalations
-        for report in data:
-            severity = self._parse_severity(report.get("severity", "MEDIUM"))
-            if severity >= Severity.HIGH:
-                findings.append({
-                    "type": "supervisor_escalation",
-                    "severity": severity,
-                    "host": report.get("host", ""),
-                    "source": report.get("supervisor", ""),
-                    "details": report.get("details", ""),
-                })
-
-        self._prune_timelines(now)
-        return findings
-
-    # ------------------------------------------------------------------
-    # Decide
-    # ------------------------------------------------------------------
+            src_ip = report.get("src_ip")
+            user = report.get("user")
+            summary = report.get("summary", report.get("incident_summary", "Malicious Activity"))
+            
+            if src_ip:
+                res = self.trust_engine.penalize(src_ip, consensus_score, summary)
+                if res.get("action"):
+                    trust_actions.append(res["action"])
+            if user:
+                res = self.trust_engine.penalize(user, consensus_score, summary)
+                if res.get("action"):
+                    trust_actions.append(res["action"])
+            
+        # Build context for Qwen
+        context = {
+            "timestamp": time.time(),
+            "active_reports": data,
+            "fused_threat_score": consensus_score,
+            "debate_triggered": needs_debate,
+            "zero_trust_automated_actions": trust_actions
+        }
+        
+        # Inject Cyber Memory Context
+        try:
+            query_text = json.dumps(data)
+            # Truncate query to avoid overly large embeddings
+            if len(query_text) > 1000:
+                query_text = query_text[:1000]
+                
+            historical = self.memory.search_similar_incidents(query_text, limit=3)
+            if historical:
+                context["historical_similar_incidents"] = historical
+                logger.info(f"Injected {len(historical)} historical incidents into Commander's context.")
+        except Exception as mem_err:
+            logger.error(f"Failed to query Cyber Memory: {mem_err}")
+        try:
+            context_json = json.dumps(context, default=str)
+        except Exception as e:
+            logger.error(f"Failed to serialize context for Qwen: {e}")
+            return []
+            
+        prompt = f"Analyze the current War-room context and provide strategic decisions:\n```json\n{context_json}\n```"
+        logger.info(f"Commander Qwen analyzing {len(data)} aggregated reports...")
+        
+        try:
+            response = self.ai_client.generate(prompt, system_prompt=QWEN_COMMANDER_PROMPT, json_mode=True)
+        except Exception as e:
+            logger.error(f"Qwen generation failed: {e}")
+            return []
+            
+        decision = self.ai_client.extract_json(response)
+        
+        return [decision]
 
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        actions: List[Dict[str, Any]] = []
-        now = time.time()
-
-        # Update global threat level
-        new_level = self._compute_threat_level(findings, now)
-        if new_level != self._threat_level:
-            old = self._threat_level
-            self._threat_level = new_level
-            self._threat_level_since = now
-            actions.append({
-                "action": "update_threat_level",
-                "old_level": old,
-                "new_level": new_level,
-            })
-
-        for f in findings:
-            severity = f.get("severity", Severity.MEDIUM)
-            response = f.get("response", "")
-
-            # Strategic decisions
-            if response == "IMMEDIATE_ISOLATION" and f.get("host"):
-                actions.append({"action": "isolate_host", "host": f["host"], "finding": f})
-
-            if severity >= Severity.CRITICAL:
-                actions.append({"action": "page_humans", "finding": f})
-                self._last_critical = now
-
-            if response == "FULL_INCIDENT_RESPONSE":
-                actions.append({"action": "trigger_ir_playbook", "finding": f})
-
-            # Always log commander decisions
-            actions.append({"action": "log_decision", "finding": f})
-
-        self._total_decisions += len(actions)
+        actions = []
+        for decision in findings:
+            try:
+                if decision.get("error"):
+                    logger.error(f"Qwen Generation Error: {decision}")
+                    continue
+                    
+                logger.critical(f"STRATEGIC ASSESSMENT: {decision.get('incident_summary')}")
+                logger.critical(f"OVERALL SEVERITY: {decision.get('overall_severity')}")
+                
+                # Store the decision in Cyber Memory for future reference
+                try:
+                    self.memory.store_incident(decision)
+                except Exception as mem_err:
+                    logger.error(f"Failed to store decision in Cyber Memory: {mem_err}")
+                
+                for action in decision.get("actions", []):
+                    try:
+                        actions.append(action)
+                    except Exception as e:
+                        logger.warning("Error processing action in decide: %s", e)
+            except Exception as e:
+                logger.warning("Error processing decision in decide: %s", e)
+                
         return actions
 
-    # ------------------------------------------------------------------
-    # Act
-    # ------------------------------------------------------------------
-
     def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = {"paged": 0, "isolations": 0, "playbooks": 0,
-                   "level_changes": 0, "logged": 0}
-
+        results = {"executed": 0}
         for action in actions:
             try:
-                act_type = action["action"]
-
-                if act_type == "page_humans":
-                    f = action["finding"]
-                    severity = f.get("severity", Severity.CRITICAL)
-                    self.alerter.send_alert(
-                        severity=severity,
-                        title=f"🚨 COMMANDER: {f.get('type', 'Critical Alert')}",
-                        details={
-                            "host": f.get("host", ""),
-                            "description": f.get("details", ""),
-                            "recommended_response": f.get("response", "INVESTIGATE"),
-                            "threat_level": self._threat_level,
-                        },
-                        agent_name="commander",
-                    )
-                    results["paged"] += 1
-
-                elif act_type in ["isolate_host", "trigger_ir_playbook"]:
-                    f = action.get("finding", {})
-                    host = action.get("host") or f.get("host", "Unknown")
-                    
-                    # Check if the host is a Core Server (RED LINE)
-                    is_red_line = False
-                    if act_type == "trigger_ir_playbook":
-                        is_red_line = True # Playbooks always touch servers
-                    else:
-                        is_red_line = any(kw in host.lower() for kw in self._red_line_keywords)
-                    
-                    if not is_red_line:
-                        # Employee Endpoint -> Autonomous Action + Notification
-                        self.alerter.send_alert(
-                            severity=Severity.HIGH,
-                            title=f"🛡️ AUTO-ISOLATION: Employee Host '{host}'",
-                            details={
-                                "host": host,
-                                "reason": f.get("details", ""),
-                                "note": "Commander acted autonomously because the target is a standard employee endpoint, not a core server."
-                            },
-                            agent_name="commander",
-                        )
-                        self._execute_isolation(action)
-                        results["isolations"] += 1
-                        continue
-
-                    # RED LINE -> HUMAN-IN-THE-LOOP (HITL) Logic
-                    import uuid
-                    auth_id = str(uuid.uuid4())[:8] # Short 8-char ID
-                    
-                    self._pending_auths[auth_id] = {
-                        "timestamp": time.time(),
-                        "action": action
-                    }
-                    
-                    self.alerter.send_alert(
-                        severity=Severity.CRITICAL,
-                        title=f"⚠️ RED LINE AUTHORIZATION REQUIRED: {act_type.upper()}",
-                        details={
-                            "auth_id": auth_id,
-                            "action_type": act_type,
-                            "host": host,
-                            "reason": f.get("details", ""),
-                            "instructions": f"Run 'python scripts/authorize.py {auth_id} approve' to execute."
-                        },
-                        agent_name="commander",
-                    )
-                    logger.warning(f"RED LINE Action {act_type} for {host} frozen. Awaiting HITL Auth ID: {auth_id}")
-                    if act_type == "isolate_host":
-                        results["isolations"] += 1
-                    else:
-                        results["playbooks"] += 1
-
-                elif act_type == "update_threat_level":
-                    self.redis_bus.publish("soc:commander-broadcast", {
-                        "type": "threat_level_update",
-                        "old_level": action["old_level"],
-                        "new_level": action["new_level"],
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }, sender=self.name, message_type="broadcast")
-                    # Store in OpenSearch
-                    self.os_client.index_document("soc-commander-decisions", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "decision": "threat_level_change",
-                        "old_level": action["old_level"],
-                        "new_level": action["new_level"],
-                    })
-                    results["level_changes"] += 1
-                    logger.warning("⚡ THREAT LEVEL: %s → %s",
-                                   action["old_level"], action["new_level"])
-
-                elif act_type == "log_decision":
-                    f = action["finding"]
-                    self.os_client.index_document("soc-commander-decisions", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "type": f.get("type"),
-                        "severity": str(f.get("severity")),
-                        "host": f.get("host", ""),
-                        "details": str(f.get("details", ""))[:500],
-                        "threat_level": self._threat_level,
-                        "total_escalations": self._total_escalations,
-                    })
-                    results["logged"] += 1
-
-            except Exception as exc:
-                logger.error("Commander action failed (%s): %s", action.get("action"), exc)
-
-        if results["paged"] or results["isolations"]:
-            logger.info("Commander cycle: paged=%d, isolations(frozen)=%d, playbooks(frozen)=%d, level_changes=%d",
-                        results["paged"], results["isolations"],
-                        results["playbooks"], results["level_changes"])
+                action_type = action.get("type")
+                target = action.get("target")
+                reason = action.get("reason")
+                
+                logger.info(f"Submitting PROPOSED_ACTION: {action_type} on {target} to Execution Layer.")
+                
+                payload = {
+                    "action_id": f"act_{int(time.time()*1000)}",
+                    "timestamp": time.time(),
+                    "source": self.name,
+                    "action_type": action_type,
+                    "target": target,
+                    "reason": reason,
+                    "status": "PENDING_APPROVAL"
+                }
+                
+                self.redis_bus.publish("soc:proposed-actions", payload, sender=self.name, message_type="PROPOSED_ACTION")
+                
+                results["executed"] += 1
+                self._total_decisions += 1
+            except Exception as e:
+                logger.warning("Error executing action in act: %s", e)
+            
         return results
 
-    # ------------------------------------------------------------------
-    # HITL Execution Helpers
-    # ------------------------------------------------------------------
-
-    def _execute_isolation(self, action: Dict[str, Any]) -> None:
-        host = action.get("host", "")
-        try:
-            self.wazuh_client.active_response(
-                command="firewall-drop",
-                agent_name=host,
-                alert={
-                    "reason": "Commander isolation order (HITL Approved)",
-                    "type": action.get("finding", {}).get("type", ""),
-                },
-            )
-        except Exception:
-            pass
-        self.os_client.index_document("soc-commander-actions", {
-            "@timestamp": datetime.now(timezone.utc).isoformat(),
-            "action": "isolate_host",
-            "host": host,
-            "reason": action.get("finding", {}).get("details", ""),
-            "threat_level": self._threat_level,
-        })
-        logger.warning("🔒 ISOLATION ORDER EXECUTED for %s", host)
-
-    def _execute_ir_playbook(self, action: Dict[str, Any]) -> None:
-        f = action.get("finding", {})
-        self.redis_bus.publish("soc:response-supervisor", {
-            "source_agent": "commander",
-            "type": "ir_playbook_trigger",
-            "host": f.get("host", ""),
-            "incident_type": f.get("type", ""),
-            "severity": "CRITICAL",
-        }, sender=self.name, message_type="ir_command")
-        logger.warning("🚨 IR PLAYBOOK EXECUTED for %s", f.get("host", ""))
-
-    def _on_human_auth_message(self, message: dict) -> None:
-        try:
-            data = message if isinstance(message, dict) else json.loads(message)
-            auth_id = data.get("auth_id")
-            decision = data.get("decision", "").lower()
-            
-            if auth_id in self._pending_auths:
-                pending = self._pending_auths[auth_id]
-                action = pending["action"]
-                
-                if decision == "approve":
-                    logger.info(f"✅ HITL APPROVAL received for {auth_id}. Executing action {action['action']}.")
-                    if action["action"] == "isolate_host":
-                        self._execute_isolation(action)
-                    elif action["action"] == "trigger_ir_playbook":
-                        self._execute_ir_playbook(action)
-                        
-                elif decision == "reject":
-                    logger.info(f"❌ HITL REJECTION received for {auth_id}. Action dropped.")
-                
-                del self._pending_auths[auth_id]
-            else:
-                logger.warning(f"Received HITL response for unknown or expired Auth ID: {auth_id}")
-        except Exception as exc:
-            logger.error("Failed to parse human auth message: %s", exc)
-
-    # ------------------------------------------------------------------
-    # Threat level management
-    # ------------------------------------------------------------------
-
-    def _compute_threat_level(self, findings: List[Dict[str, Any]], now: float) -> str:
-        """Compute global threat level based on current findings and time decay."""
-        has_critical = any(
-            f.get("severity") == Severity.CRITICAL for f in findings
-        )
-        has_high = any(
-            f.get("severity") == Severity.HIGH for f in findings
-        )
-        confirmed_attacks = any(
-            f.get("type") in ("CONFIRMED_INTRUSION", "MULTI_VECTOR_ATTACK", "ATTACKER_EVASION")
-            for f in findings
-        )
-
-        if confirmed_attacks:
-            return "RED"
-        if has_critical:
-            return "RED"
-        if has_high:
-            if self._threat_level == "RED":
-                # Stay RED for a while after critical
-                if now - self._last_critical < _THREAT_DECAY_SECONDS:
-                    return "RED"
-            return "ORANGE"
-
-        # Decay logic
-        time_since_change = now - self._threat_level_since
-        if self._threat_level == "RED" and time_since_change > _THREAT_DECAY_SECONDS:
-            return "ORANGE"
-        if self._threat_level == "ORANGE" and time_since_change > _THREAT_DECAY_SECONDS:
-            return "YELLOW"
-        if self._threat_level == "YELLOW" and time_since_change > _THREAT_DECAY_SECONDS * 2:
-            return "GREEN"
-
-        return self._threat_level
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _should_escalate(self, key: str, now: float) -> bool:
-        if now - self._escalated_keys.get(key, 0) < self._cooldown:
-            return False
-        self._escalated_keys[key] = now
-        return True
-
-    def _prune_timelines(self, now: float) -> None:
-        cutoff = now - _CORRELATION_WINDOW * 3
-        for host in list(self._host_timeline):
-            self._host_timeline[host] = [
-                e for e in self._host_timeline[host] if e["time"] > cutoff
-            ]
-            if not self._host_timeline[host]:
-                del self._host_timeline[host]
-        self._escalated_keys = {
-            k: v for k, v in self._escalated_keys.items() if v > cutoff
-        }
-
-    @staticmethod
-    def _parse_severity(raw: Any) -> Severity:
-        if isinstance(raw, Severity):
-            return raw
-        if isinstance(raw, str):
-            try:
-                return Severity[raw.upper()]
-            except KeyError:
-                return Severity.MEDIUM
-        return Severity.MEDIUM
-
-    def run_loop(self) -> None:
-        """Subscribe to the supervisor-to-commander channel."""
-        self.redis_bus.subscribe(
-            "soc:supervisor-to-commander", self._on_supervisor_message
-        )
-        self.redis_bus.subscribe(
-            "soc:human-auth", self._on_human_auth_message
-        )
-        logger.info("🏰 Commander Agent online | Threat Level: %s | HITL Enforced", self._threat_level)
+    def run_loop(self):
+        self.redis_bus.subscribe(self.supervisor_channel, self.handle_worker_message)
+        # Also subscribe to the tactical channel just in case tactical agent sends direct escalations
+        self.redis_bus.subscribe("soc:tactical-analysis", self.handle_worker_message)
         super().run_loop()
 
-
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-        stream=sys.stdout,
-    )
     agent = CommanderAgent()
     agent.run_loop()

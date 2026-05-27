@@ -75,6 +75,50 @@ RUN_DURATION = Histogram(
     registry=REGISTRY,
 )
 
+# ---------------------------------------------------------------------------
+# LLM Metrics / مقاييس نماذج الذكاء الاصطناعي
+# ---------------------------------------------------------------------------
+
+LLM_REQUEST_DURATION = Histogram(
+    "llm_request_duration_seconds",
+    "Duration of LLM inference requests",
+    ["model", "role"],
+    buckets=(0.5, 1, 2, 5, 10, 30, 60, 120),
+    registry=REGISTRY,
+)
+
+LLM_REQUESTS_TOTAL = Counter(
+    "llm_requests_total",
+    "Total LLM requests made",
+    ["model", "role", "status"],
+    registry=REGISTRY,
+)
+
+LLM_TOKENS_USED = Counter(
+    "llm_tokens_used_total",
+    "Total tokens used in LLM requests (prompt + completion)",
+    ["model", "role", "token_type"],
+    registry=REGISTRY,
+)
+
+# ---------------------------------------------------------------------------
+# Redis Queue Metrics / مقاييس طابور ريدس
+# ---------------------------------------------------------------------------
+
+REDIS_QUEUE_DEPTH = Gauge(
+    "redis_queue_depth",
+    "Number of items in Redis hash queues",
+    ["queue_name"],
+    registry=REGISTRY,
+)
+
+REDIS_PUBLISH_TOTAL = Counter(
+    "redis_publish_total",
+    "Total messages published to Redis channels",
+    ["channel"],
+    registry=REGISTRY,
+)
+
 
 # ---------------------------------------------------------------------------
 # Metrics Server Management / إدارة خادم المقاييس

@@ -16,11 +16,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from shared.alerter import Severity
 from shared.base_agent import BaseAgent
 from shared.config import SOCConfig
 
@@ -73,6 +72,7 @@ class ThreatFeedAgent(BaseAgent):
         self._scan_window_min: int = self._agent_config.get("scan_window_min", 6)
         self._known_ioc_hashes: set[str] = set()  # dedup cache (hash of value)
         self._stats: dict[str, int] = {"ip": 0, "domain": 0, "hash": 0, "url": 0, "unknown": 0}
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -88,7 +88,7 @@ class ThreatFeedAgent(BaseAgent):
                 index=self._misp_index,
                 minutes=self._scan_window_min,
                 query=query,
-                size=1000,
+                size=10000,
             )
             logger.info("Collected %d new MISP IOC events", len(events))
             return events
@@ -106,49 +106,54 @@ class ThreatFeedAgent(BaseAgent):
         cycle_stats: dict[str, int] = {"ip": 0, "domain": 0, "hash": 0, "url": 0, "unknown": 0}
 
         for event in data:
-            # MISP attribute fields
-            ioc_value = event.get("value", event.get("Attribute", {}).get("value", ""))
-            if not ioc_value:
-                continue
-
-            # Deduplicate within memory
-            ioc_hash = hashlib.sha256(ioc_value.encode()).hexdigest()[:16]
-            if ioc_hash in self._known_ioc_hashes:
-                continue
-            self._known_ioc_hashes.add(ioc_hash)
-
-            ioc_type = classify_ioc(ioc_value)
-            confidence = event.get("confidence", event.get("Tag", {}).get("confidence", 50))
             try:
-                confidence = int(confidence)
-            except (ValueError, TypeError):
-                confidence = 50
+                # MISP attribute fields
+                ioc_value = event.get("value", (event.get("Attribute") or {}).get("value", ""))
+                if not ioc_value:
+                    continue
 
-            tlp = event.get("tlp", event.get("Tag", {}).get("tlp", "amber"))
-            source = event.get("source", event.get("Event", {}).get("Orgc", {}).get("name", "misp-feed"))
-            tags = event.get("tags", event.get("Tag", {}).get("name", ""))
-            if isinstance(tags, str):
-                tags = [t.strip() for t in tags.split(",") if t.strip()]
+                # Deduplicate within memory
+                ioc_hash = hashlib.sha256(ioc_value.encode()).hexdigest()[:16]
+                with self._cache_lock:
+                    if ioc_hash in self._known_ioc_hashes:
+                        continue
+                    self._known_ioc_hashes.add(ioc_hash)
 
-            stat_key = ioc_type if ioc_type in ("ip", "domain", "url") else (
-                "hash" if ioc_type in ("md5", "sha1", "sha256") else "unknown"
-            )
-            cycle_stats[stat_key] += 1
+                ioc_type = classify_ioc(ioc_value)
+                confidence = event.get("confidence", (event.get("Tag") or {}).get("confidence", 50))
+                try:
+                    confidence = int(confidence)
+                except (ValueError, TypeError):
+                    confidence = 50
 
-            findings.append({
-                "ioc_value": ioc_value,
-                "ioc_type": ioc_type,
-                "confidence": confidence,
-                "tlp": tlp,
-                "source": source,
-                "tags": tags,
-                "ioc_hash": ioc_hash,
-                "original_event_id": event.get("_id", ""),
-            })
+                tlp = event.get("tlp", (event.get("Tag") or {}).get("tlp", "amber"))
+                source = event.get("source", ((event.get("Event") or {}).get("Orgc") or {}).get("name", "misp-feed"))
+                tags = event.get("tags", (event.get("Tag") or {}).get("name", ""))
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+                stat_key = ioc_type if ioc_type in ("ip", "domain", "url") else (
+                    "hash" if ioc_type in ("md5", "sha1", "sha256") else "unknown"
+                )
+                cycle_stats[stat_key] += 1
+
+                findings.append({
+                    "ioc_value": ioc_value,
+                    "ioc_type": ioc_type,
+                    "confidence": confidence,
+                    "tlp": tlp,
+                    "source": source,
+                    "tags": tags,
+                    "ioc_hash": ioc_hash,
+                    "original_event_id": event.get("_id", ""),
+                })
+            except Exception as e:
+                logger.warning("Error analyzing MISP event: %s", e)
 
         # Accumulate lifetime stats
-        for k, v in cycle_stats.items():
-            self._stats[k] += v
+        with self._cache_lock:
+            for k, v in cycle_stats.items():
+                self._stats[k] += v
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -220,19 +225,25 @@ class ThreatFeedAgent(BaseAgent):
                     logger.error("Failed to distribute IOC: %s", exc)
 
             elif action["type"] == "report_summary":
+                with self._cache_lock:
+                    lifetime_stats = dict(self._stats)
                 self.report_to_supervisor({
                     "type": "threat_feed_report",
                     "new_iocs": action["count"],
                     "stored": stored,
                     "distributed": distributed,
-                    "lifetime_stats": dict(self._stats),
+                    "lifetime_stats": lifetime_stats,
                 })
 
         # Prune dedup cache if too large (keep last ~5000)
-        if len(self._known_ioc_hashes) > 10000:
-            excess = len(self._known_ioc_hashes) - 5000
-            for _ in range(excess):
-                self._known_ioc_hashes.pop()
+        with self._cache_lock:
+            if len(self._known_ioc_hashes) > 10000:
+                excess = len(self._known_ioc_hashes) - 5000
+                for _ in range(excess):
+                    try:
+                        self._known_ioc_hashes.pop()
+                    except KeyError:
+                        break
 
         logger.info("Threat feed cycle: stored=%d, distributed=%d", stored, distributed)
         return {"iocs_stored": stored, "iocs_distributed": distributed}

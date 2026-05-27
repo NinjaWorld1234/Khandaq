@@ -60,7 +60,7 @@ class AutoCaseAgent(BaseAgent):
                 }
             }
             alerts = self.os_client.get_events_since(
-                index=_ALERTS_INDEX, minutes=5, query=query, size=500,
+                index=_ALERTS_INDEX, minutes=5, query=query, size=10000,
             )
             return {"alerts": alerts}
         except Exception as exc:
@@ -77,43 +77,50 @@ class AutoCaseAgent(BaseAgent):
         # Group by host within 30-minute windows
         host_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for alert in alerts:
-            host = (
-                alert.get("agent", {}).get("name")
-                or alert.get("details", {}).get("host")
-                or alert.get("host", "unknown")
-            )
-            host_groups[host].append(alert)
+            try:
+                host = (
+                    (alert.get("agent") or {}).get("name")
+                    or (alert.get("details") or {}).get("host")
+                    or alert.get("host", "unknown")
+                )
+                host_groups[host].append(alert)
+            except Exception as e:
+                logger.warning("Error grouping alert: %s", e)
 
         self._events_processed += len(alerts)
+        self._metrics.inc_events(len(alerts))
         findings: List[Dict[str, Any]] = []
 
         for host, host_alerts in host_groups.items():
-            # Determine the dominant alert type for deduplication
-            alert_types: Dict[str, int] = defaultdict(int)
-            for a in host_alerts:
-                a_type = a.get("title", a.get("rule", {}).get("description", "unknown"))
-                alert_types[a_type] += 1
-            dominant_type = max(alert_types, key=alert_types.get)  # type: ignore[arg-type]
+            try:
+                # Determine the dominant alert type for deduplication
+                alert_types: Dict[str, int] = defaultdict(int)
+                for a in host_alerts:
+                    a_type = a.get("title", (a.get("rule") or {}).get("description", "unknown"))
+                    alert_types[a_type] += 1
+                dominant_type = max(alert_types, key=alert_types.get)  # type: ignore[arg-type]
 
-            dedup_key = self._make_dedup_key(host, dominant_type)
-            if self._is_duplicate(dedup_key):
-                logger.debug("Duplicate case suppressed: host=%s type=%s", host, dominant_type)
-                continue
+                dedup_key = self._make_dedup_key(host, dominant_type)
+                if self._is_duplicate(dedup_key):
+                    logger.debug("Duplicate case suppressed: host=%s type=%s", host, dominant_type)
+                    continue
 
-            # Find max severity across grouped alerts
-            max_sev = max(
-                (self._parse_severity(a.get("severity", "MEDIUM")) for a in host_alerts),
-                default=Severity.HIGH,
-            )
+                # Find max severity across grouped alerts
+                max_sev = max(
+                    (self._parse_severity(a.get("severity", "MEDIUM")) for a in host_alerts),
+                    default=Severity.HIGH,
+                )
 
-            findings.append({
-                "host": host,
-                "alert_type": dominant_type,
-                "severity": max_sev,
-                "alert_count": len(host_alerts),
-                "alerts": host_alerts[:20],  # cap sample
-                "dedup_key": dedup_key,
-            })
+                findings.append({
+                    "host": host,
+                    "alert_type": dominant_type,
+                    "severity": max_sev,
+                    "alert_count": len(host_alerts),
+                    "alerts": host_alerts[:20],  # cap sample
+                    "dedup_key": dedup_key,
+                })
+            except Exception as e:
+                logger.warning("Error analyzing host group: %s", e)
 
         if findings:
             logger.info("Identified %d new case candidates", len(findings))
@@ -124,26 +131,29 @@ class AutoCaseAgent(BaseAgent):
         """Create a case action for each finding, check if existing open case exists."""
         actions: List[Dict[str, Any]] = []
         for finding in findings:
-            existing = self._find_existing_case(finding["host"])
-            if existing:
-                actions.append({
-                    "type": "update_case",
-                    "case_id": existing,
-                    "new_alerts": finding["alerts"],
-                    "host": finding["host"],
-                })
-            else:
-                case_id = self._generate_case_id(finding["host"])
-                actions.append({
-                    "type": "create_case",
-                    "case_id": case_id,
-                    "host": finding["host"],
-                    "severity": finding["severity"],
-                    "alert_type": finding["alert_type"],
-                    "alert_count": finding["alert_count"],
-                    "alerts": finding["alerts"],
-                    "dedup_key": finding["dedup_key"],
-                })
+            try:
+                existing = self._find_existing_case(finding["host"])
+                if existing:
+                    actions.append({
+                        "type": "update_case",
+                        "case_id": existing,
+                        "new_alerts": finding["alerts"],
+                        "host": finding["host"],
+                    })
+                else:
+                    case_id = self._generate_case_id(finding["host"])
+                    actions.append({
+                        "type": "create_case",
+                        "case_id": case_id,
+                        "host": finding["host"],
+                        "severity": finding["severity"],
+                        "alert_type": finding["alert_type"],
+                        "alert_count": finding["alert_count"],
+                        "alerts": finding["alerts"],
+                        "dedup_key": finding["dedup_key"],
+                    })
+            except Exception as e:
+                logger.warning("Error deciding action: %s", e)
         return actions
 
     # ── Act ──────────────────────────────────────────────────────────
@@ -233,7 +243,7 @@ class AutoCaseAgent(BaseAgent):
     @staticmethod
     def _generate_case_id(host: str) -> str:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        host_hash = hashlib.md5(host.encode()).hexdigest()[:6]
+        host_hash = hashlib.sha256(host.encode()).hexdigest()[:6]
         return f"CASE-{ts}-{host_hash}"
 
     @staticmethod
@@ -259,7 +269,7 @@ class AutoCaseAgent(BaseAgent):
                 "sort": [{"@timestamp": {"order": "desc"}}],
             }
             resp = self.os_client.search(index=_CASES_INDEX, body=body, size=1)
-            hits = resp.get("hits", {}).get("hits", [])
+            hits = (resp.get("hits") or {}).get("hits", [])
             if hits:
                 return hits[0]["_source"]["case_id"]
         except Exception:

@@ -17,6 +17,7 @@ Interval: 60 seconds
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -72,6 +73,7 @@ class APISecurityAgent(BaseAgent):
         # Cooldown cache to prevent duplicate alerts
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown: int = 600
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -92,7 +94,7 @@ class APISecurityAgent(BaseAgent):
         }
         try:
             events = self.os_client.get_events_since(
-                index="wazuh-alerts-*", minutes=2, query=query, size=5000,
+                index="wazuh-alerts-*", minutes=2, query=query, size=10000,
             )
             # Reset hourly counters every 60 minutes
             if time.time() - self._last_reset > 3600:
@@ -115,110 +117,127 @@ class APISecurityAgent(BaseAgent):
         large_response_ips: Dict[str, int] = defaultdict(int)
 
         for event in data:
-            src_ip = event.get("data", {}).get("srcip", event.get("agent", {}).get("ip", "unknown"))
-            url = event.get("data", {}).get("url", "")
-            status_code = str(event.get("data", {}).get("status", ""))
-            api_key = event.get("data", {}).get("api_key", event.get("data", {}).get("id", ""))
-            response_size = int(event.get("data", {}).get("bytes", 0) or 0)
-            request_body = event.get("data", {}).get("data", "").lower()
+            try:
+                data_dict = event.get("data") or {}
+                agent_dict = event.get("agent") or {}
+                src_ip = data_dict.get("srcip", agent_dict.get("ip", "unknown"))
+                url = data_dict.get("url", "")
+                status_code = str(data_dict.get("status", ""))
+                api_key = data_dict.get("api_key", data_dict.get("id", ""))
+                response_size = int(data_dict.get("bytes", 0) or 0)
+                request_body = data_dict.get("data", "").lower()
 
-            # Update per-IP request counter
-            self._ip_request_counts[src_ip] += 1
+                # Update per-IP request counter
+                self._ip_request_counts[src_ip] += 1
 
-            # Track API key to IP mapping
-            if api_key:
-                self._key_to_ips[api_key].add(src_ip)
+                # Track API key to IP mapping
+                if api_key:
+                    self._key_to_ips[api_key].add(src_ip)
 
-            # Rule 1: Unauthorized access tracking (401/403)
-            if status_code in ("401", "403"):
-                self._ip_unauth_counts[src_ip] += 1
+                # Rule 1: Unauthorized access tracking (401/403)
+                if status_code in ("401", "403"):
+                    self._ip_unauth_counts[src_ip] += 1
 
-            # Rule 2: Large response sizes (scraping detection)
-            if response_size > self._large_response_bytes:
-                large_response_ips[src_ip] += 1
+                # Rule 2: Large response sizes (scraping detection)
+                if response_size > self._large_response_bytes:
+                    large_response_ips[src_ip] += 1
 
-            # Rule 3: GraphQL introspection queries
-            if "/graphql" in url.lower() or "/api/graphql" in url.lower():
-                if any(kw in request_body for kw in _GRAPHQL_INTROSPECTION_KEYWORDS):
-                    findings.append({
-                        "rule": "graphql_introspection",
-                        "severity": Severity.MEDIUM,
-                        "source_ip": src_ip,
-                        "url": url,
-                        "description": f"GraphQL introspection query from {src_ip}",
-                    })
+                # Rule 3: GraphQL introspection queries
+                if "/graphql" in url.lower() or "/api/graphql" in url.lower():
+                    if any(kw in request_body for kw in _GRAPHQL_INTROSPECTION_KEYWORDS):
+                        findings.append({
+                            "rule": "graphql_introspection",
+                            "severity": Severity.MEDIUM,
+                            "source_ip": src_ip,
+                            "url": url,
+                            "description": f"GraphQL introspection query from {src_ip}",
+                        })
 
-            # Rule 4: Deprecated API version access
-            url_lower = url.lower()
-            for version in _DEPRECATED_VERSIONS:
-                if f"/api/{version}/" in url_lower or f"/{version}/api/" in url_lower:
-                    findings.append({
-                        "rule": "deprecated_api_version",
-                        "severity": Severity.MEDIUM,
-                        "source_ip": src_ip,
-                        "url": url,
-                        "version": version,
-                        "description": f"Access to deprecated API {version} from {src_ip}: {url}",
-                    })
-                    break
+                # Rule 4: Deprecated API version access
+                url_lower = url.lower()
+                for version in _DEPRECATED_VERSIONS:
+                    if f"/api/{version}/" in url_lower or f"/{version}/api/" in url_lower:
+                        findings.append({
+                            "rule": "deprecated_api_version",
+                            "severity": Severity.MEDIUM,
+                            "source_ip": src_ip,
+                            "url": url,
+                            "version": version,
+                            "description": f"Access to deprecated API {version} from {src_ip}: {url}",
+                        })
+                        break
 
-            # Rule 5: Sensitive/unusual endpoint access
-            for endpoint in _SENSITIVE_ENDPOINTS:
-                if url_lower.startswith(endpoint):
-                    findings.append({
-                        "rule": "sensitive_endpoint",
-                        "severity": Severity.LOW,
-                        "source_ip": src_ip,
-                        "url": url,
-                        "description": f"Sensitive API endpoint accessed by {src_ip}: {url}",
-                    })
-                    break
+                # Rule 5: Sensitive/unusual endpoint access
+                for endpoint in _SENSITIVE_ENDPOINTS:
+                    if url_lower.startswith(endpoint):
+                        findings.append({
+                            "rule": "sensitive_endpoint",
+                            "severity": Severity.LOW,
+                            "source_ip": src_ip,
+                            "url": url,
+                            "description": f"Sensitive API endpoint accessed by {src_ip}: {url}",
+                        })
+                        break
+            except Exception as e:
+                logger.warning("Error processing API event: %s", e)
 
         # Rule 6: Rate limit violations (aggregated check)
         for ip, count in self._ip_request_counts.items():
-            if count >= self._rate_limit_threshold:
-                findings.append({
-                    "rule": "rate_limit_violation",
-                    "severity": Severity.HIGH,
-                    "source_ip": ip,
-                    "request_count": count,
-                    "threshold": self._rate_limit_threshold,
-                    "description": f"Rate limit exceeded: {count} requests/hour from {ip}",
-                })
+            try:
+                if count >= self._rate_limit_threshold:
+                    findings.append({
+                        "rule": "rate_limit_violation",
+                        "severity": Severity.HIGH,
+                        "source_ip": ip,
+                        "request_count": count,
+                        "threshold": self._rate_limit_threshold,
+                        "description": f"Rate limit exceeded: {count} requests/hour from {ip}",
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating rate limit: %s", e)
 
         # Rule 7: API key used from multiple IPs
         for key, ips in self._key_to_ips.items():
-            if len(ips) >= self._key_ip_threshold:
-                findings.append({
-                    "rule": "api_key_abuse",
-                    "severity": Severity.HIGH,
-                    "api_key": key[:8] + "***",
-                    "source_ips": list(ips),
-                    "unique_ips": len(ips),
-                    "description": f"API key {key[:8]}*** used from {len(ips)} different IPs",
-                })
+            try:
+                if len(ips) >= self._key_ip_threshold:
+                    findings.append({
+                        "rule": "api_key_abuse",
+                        "severity": Severity.HIGH,
+                        "api_key": key[:8] + "***",
+                        "source_ips": list(ips),
+                        "unique_ips": len(ips),
+                        "description": f"API key {key[:8]}*** used from {len(ips)} different IPs",
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating API key abuse: %s", e)
 
         # Unauthorized access threshold
         for ip, count in self._ip_unauth_counts.items():
-            if count >= self._unauth_threshold:
-                findings.append({
-                    "rule": "unauthorized_access_flood",
-                    "severity": Severity.HIGH,
-                    "source_ip": ip,
-                    "unauth_count": count,
-                    "description": f"Excessive unauthorized attempts: {count} 401/403 responses for {ip}",
-                })
+            try:
+                if count >= self._unauth_threshold:
+                    findings.append({
+                        "rule": "unauthorized_access_flood",
+                        "severity": Severity.HIGH,
+                        "source_ip": ip,
+                        "unauth_count": count,
+                        "description": f"Excessive unauthorized attempts: {count} 401/403 responses for {ip}",
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating unauth access: %s", e)
 
         # Data scraping detection via large responses
         for ip, count in large_response_ips.items():
-            if count >= self._scraping_count:
-                findings.append({
-                    "rule": "data_scraping",
-                    "severity": Severity.CRITICAL,
-                    "source_ip": ip,
-                    "large_responses": count,
-                    "description": f"Possible data scraping: {count} large responses sent to {ip}",
-                })
+            try:
+                if count >= self._scraping_count:
+                    findings.append({
+                        "rule": "data_scraping",
+                        "severity": Severity.CRITICAL,
+                        "source_ip": ip,
+                        "large_responses": count,
+                        "description": f"Possible data scraping: {count} large responses sent to {ip}",
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating data scraping: %s", e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -234,23 +253,27 @@ class APISecurityAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            alert_key = f"{finding['rule']}:{finding.get('source_ip', finding.get('api_key', ''))}"
-            last = self._alerted_cache.get(alert_key, 0.0)
-            if now - last < self._alert_cooldown:
-                continue
+            try:
+                alert_key = f"{finding['rule']}:{finding.get('source_ip', finding.get('api_key', ''))}"
+                with self._cache_lock:
+                    last = self._alerted_cache.get(alert_key, 0.0)
+                if now - last < self._alert_cooldown:
+                    continue
 
-            actions.append({
-                "type": "alert",
-                "severity": finding["severity"],
-                "title": f"API Security: {finding['rule'].replace('_', ' ').title()}",
-                "details": {k: v for k, v in finding.items() if k != "severity"},
-                "alert_key": alert_key,
-            })
+                actions.append({
+                    "type": "alert",
+                    "severity": finding["severity"],
+                    "title": f"API Security: {finding['rule'].replace('_', ' ').title()}",
+                    "details": {k: v for k, v in finding.items() if k != "severity"},
+                    "alert_key": alert_key,
+                })
 
-            if finding["severity"] >= Severity.HIGH:
-                actions.append({"type": "escalate", "finding": finding})
+                if finding["severity"] >= Severity.HIGH:
+                    actions.append({"type": "escalate", "finding": finding})
 
-            actions.append({"type": "log_incident", "finding": finding})
+                actions.append({"type": "log_incident", "finding": finding})
+            except Exception as e:
+                logger.warning("Error evaluating API security finding action: %s", e)
 
         return actions
 
@@ -265,46 +288,52 @@ class APISecurityAgent(BaseAgent):
         incidents_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["alert_key"]] = time.time()
-
-            elif action["type"] == "escalate":
-                self.report_to_supervisor({
-                    "type": "api_security_escalation",
-                    **action["finding"],
-                })
-                escalations += 1
-
-            elif action["type"] == "log_incident":
-                try:
-                    finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-api-security-incidents",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "rule": finding["rule"],
-                            "severity": finding["severity"].name,
-                            "source_ip": finding.get("source_ip"),
-                            "description": finding["description"],
-                        },
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
                     )
-                    incidents_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log API security incident: %s", exc)
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+                            self._alerted_cache[action["alert_key"]] = time.time()
+
+                elif action["type"] == "escalate":
+                    self.report_to_supervisor({
+                        "type": "api_security_escalation",
+                        **action["finding"],
+                    })
+                    escalations += 1
+
+                elif action["type"] == "log_incident":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-api-security-incidents",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "rule": finding["rule"],
+                                "severity": finding["severity"].name,
+                                "source_ip": finding.get("source_ip"),
+                                "description": finding["description"],
+                            },
+                        )
+                        incidents_logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log API security incident: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing API security action: %s", e)
 
         # Prune expired cooldown entries
         cutoff = time.time() - self._alert_cooldown * 2
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         if alerts_sent:
             self.report_to_supervisor({

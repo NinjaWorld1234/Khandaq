@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -73,6 +74,7 @@ class WAFAnomalyAgent(BaseAgent):
 
         self._alerted_cache: dict[str, float] = {}
         self._alert_cooldown = 300
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -93,7 +95,7 @@ class WAFAnomalyAgent(BaseAgent):
                 }
             }
             events = self.os_client.get_events_since(
-                index=self._alert_index, minutes=2, query=query, size=2000,
+                index=self._alert_index, minutes=2, query=query, size=10000,
             )
             logger.debug("Collected %d web access events", len(events))
             return events
@@ -113,66 +115,74 @@ class WAFAnomalyAgent(BaseAgent):
         total_5xx = 0
 
         for event in data:
-            d = event.get("data", {})
-            src_ip = d.get("srcip", "")
-            method = d.get("method", "").upper()
-            status = str(d.get("status", d.get("response_code", "")))
-            uri = d.get("url", d.get("uri", ""))
-            ua = d.get("user_agent", d.get("agent", ""))
-            content_len = int(d.get("content_length", 0) or 0)
+            try:
+                d = event.get("data") or {}
+                src_ip = d.get("srcip", "")
+                method = d.get("method", "").upper()
+                status = str(d.get("status", d.get("response_code", "")))
+                uri = d.get("url", d.get("uri", ""))
+                ua = d.get("user_agent", d.get("agent", ""))
+                content_len = int(d.get("content_length", 0) or 0)
 
-            if src_ip in self._ip_whitelist:
-                continue
+                if src_ip in self._ip_whitelist:
+                    continue
 
-            ip_requests[src_ip] += 1
+                ip_requests[src_ip] += 1
 
-            # 1. Unusual HTTP method
-            if method in _UNUSUAL_METHODS:
-                findings.append({
-                    "type": "unusual_method", "severity": Severity.MEDIUM,
-                    "source_ip": src_ip, "method": method, "uri": uri,
-                })
+                # 1. Unusual HTTP method
+                if method in _UNUSUAL_METHODS:
+                    findings.append({
+                        "type": "unusual_method", "severity": Severity.MEDIUM,
+                        "source_ip": src_ip, "method": method, "uri": uri,
+                    })
 
-            # 2. Status code tracking
-            if status.startswith("4"):
-                ip_4xx[src_ip] += 1
-            if status.startswith("5"):
-                total_5xx += 1
+                # 2. Status code tracking
+                if status.startswith("4"):
+                    ip_4xx[src_ip] += 1
+                if status.startswith("5"):
+                    total_5xx += 1
 
-            # 3. Scanner User-Agent
-            if ua:
-                for pat in _SCANNER_UA_PATTERNS:
-                    if pat.search(ua):
-                        findings.append({
-                            "type": "scanner_detected", "severity": Severity.MEDIUM,
-                            "source_ip": src_ip, "user_agent": ua[:200],
-                            "scanner": pat.pattern,
-                        })
-                        break
+                # 3. Scanner User-Agent
+                if ua:
+                    for pat in _SCANNER_UA_PATTERNS:
+                        if pat.search(ua):
+                            findings.append({
+                                "type": "scanner_detected", "severity": Severity.MEDIUM,
+                                "source_ip": src_ip, "user_agent": ua[:200],
+                                "scanner": pat.pattern,
+                            })
+                            break
 
-            # 4. Path traversal
-            if _PATH_TRAVERSAL_RE.search(uri):
-                findings.append({
-                    "type": "path_traversal", "severity": Severity.HIGH,
-                    "source_ip": src_ip, "uri": uri[:300],
-                })
+                # 4. Path traversal
+                if _PATH_TRAVERSAL_RE.search(uri):
+                    findings.append({
+                        "type": "path_traversal", "severity": Severity.HIGH,
+                        "source_ip": src_ip, "uri": uri[:300],
+                    })
 
-            # 5. Large POST body
-            if method == "POST" and content_len > _LARGE_POST_BYTES:
-                findings.append({
-                    "type": "large_post", "severity": Severity.MEDIUM,
-                    "source_ip": src_ip, "uri": uri[:200],
-                    "content_length": content_len,
-                })
+                # 5. Large POST body
+                if method == "POST" and content_len > _LARGE_POST_BYTES:
+                    findings.append({
+                        "type": "large_post", "severity": Severity.MEDIUM,
+                        "source_ip": src_ip, "uri": uri[:200],
+                        "content_length": content_len,
+                    })
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing WAF event: %s", e)
 
         # 6. 4xx error flood per IP
         for ip, count in ip_4xx.items():
-            if count >= _4XX_THRESHOLD:
-                findings.append({
-                    "type": "4xx_flood", "severity": Severity.HIGH,
-                    "source_ip": ip, "error_count": count,
-                    "description": f"{count} client errors from {ip} in 2 min",
-                })
+            try:
+                if count >= _4XX_THRESHOLD:
+                    findings.append({
+                        "type": "4xx_flood", "severity": Severity.HIGH,
+                        "source_ip": ip, "error_count": count,
+                        "description": f"{count} client errors from {ip} in 2 min",
+                    })
+            except Exception as e:
+                logger.warning("Error processing 4xx flood: %s", e)
 
         # 7. 5xx spike detection (vs rolling baseline)
         self._update_baseline(total_5xx)
@@ -185,18 +195,19 @@ class WAFAnomalyAgent(BaseAgent):
 
         # 8. High request rate
         for ip, count in ip_requests.items():
-            if count >= _RATE_THRESHOLD:
-                findings.append({
-                    "type": "high_rate", "severity": Severity.HIGH,
-                    "source_ip": ip, "request_count": count,
-                    "description": f"{count} requests from {ip} in 2 min",
-                })
+            try:
+                if count >= _RATE_THRESHOLD:
+                    findings.append({
+                        "type": "high_rate", "severity": Severity.HIGH,
+                        "source_ip": ip, "request_count": count,
+                        "description": f"{count} requests from {ip} in 2 min",
+                    })
+            except Exception as e:
+                logger.warning("Error processing high request rate: %s", e)
 
         # Deduplicate scanner / method hits per IP
         findings = self._deduplicate(findings)
 
-        self._events_processed += len(data)
-        self._metrics.inc_events(len(data))
         return findings
 
     def _update_baseline(self, current_5xx: int) -> None:
@@ -228,16 +239,19 @@ class WAFAnomalyAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
         now = time.time()
         for f in findings:
-            key = f"waf:{f['type']}:{f.get('source_ip', 'global')}"
-            if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
-                continue
-            actions.append({
-                "type": "alert", "severity": f["severity"],
-                "title": f"Web Anomaly: {f['type'].replace('_', ' ').title()}",
-                "details": {k: v for k, v in f.items() if k not in ("severity",)},
-                "alert_key": key,
-            })
-            actions.append({"type": "log_incident", "finding": f})
+            try:
+                key = f"waf:{f['type']}:{f.get('source_ip', 'global')}"
+                if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
+                    continue
+                actions.append({
+                    "type": "alert", "severity": f["severity"],
+                    "title": f"Web Anomaly: {f['type'].replace('_', ' ').title()}",
+                    "details": {k: v for k, v in f.items() if k not in ("severity",)},
+                    "alert_key": key,
+                })
+                actions.append({"type": "log_incident", "finding": f})
+            except Exception as e:
+                logger.warning("Error deciding for WAF finding: %s", e)
         return actions
 
     # ------------------------------------------------------------------
@@ -247,27 +261,33 @@ class WAFAnomalyAgent(BaseAgent):
     def act(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
         alerts_sent, logged = 0, 0
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"], title=action["title"],
-                    details=action["details"], agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._alerted_cache[action["alert_key"]] = time.time()
-            elif action["type"] == "log_incident":
-                try:
-                    f = action["finding"]
-                    self.os_client.index_document("soc-waf-incidents", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "agent_name": self.name, "type": f["type"],
-                        "severity": f["severity"].name,
-                        "source_ip": f.get("source_ip", ""),
-                        "details": f.get("description", ""),
-                    })
-                    logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log WAF incident: %s", exc)
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"], title=action["title"],
+                        details=action["details"], agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+
+                            self._alerted_cache[action["alert_key"]] = time.time()
+                elif action["type"] == "log_incident":
+                    try:
+                        f = action["finding"]
+                        self.os_client.index_document("soc-waf-incidents", {
+                            "@timestamp": datetime.now(timezone.utc).isoformat(),
+                            "agent_name": self.name, "type": f["type"],
+                            "severity": f["severity"].name,
+                            "source_ip": f.get("source_ip", ""),
+                            "details": f.get("description", ""),
+                        })
+                        logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log WAF incident: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing WAF action: %s", e)
         if alerts_sent:
             self.report_to_supervisor({
                 "type": "waf_report", "alerts_sent": alerts_sent,

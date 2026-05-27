@@ -17,16 +17,15 @@ Severity escalation:
 import time
 import logging
 import hashlib
-from typing import Dict, Any, List, Set, Optional, Tuple
+from typing import Dict, Any, List, Set, Optional
 from collections import defaultdict
 from datetime import datetime, timezone
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W15-KillChain")
 
-CORRELATION_WINDOW_MIN = 240  # 4 hours
+CORRELATION_WINDOW_MIN = 10080  # 7 days (APTs use low and slow techniques)
 
 # Mapping of alert keywords / rule groups → kill-chain stage
 STAGE_MAP: Dict[str, List[str]] = {
@@ -70,10 +69,10 @@ STAGE_ORDER = [
 def _classify_stage(alert: Dict[str, Any]) -> Optional[str]:
     """Determine the kill-chain stage for an alert based on keywords."""
     searchable = " ".join([
-        str(alert.get("rule", {}).get("description", "")),
+        str((alert.get("rule") or {}).get("description", "")),
         str(alert.get("title", "")),
         str(alert.get("agent_name", "")),
-        " ".join(alert.get("rule", {}).get("groups", []) if isinstance(alert.get("rule"), dict) else []),
+        " ".join((alert.get("rule") or {}).get("groups", []) if isinstance(alert.get("rule"), dict) else []),
         str(alert.get("details", "")),
         str(alert.get("type", "")),
     ]).lower()
@@ -89,7 +88,7 @@ def _extract_iocs(alert: Dict[str, Any]) -> Set[str]:
     iocs: Set[str] = set()
     for field in ("src_ip", "dest_ip", "id.orig_h", "id.resp_h", "source_ip",
                   "destination_ip", "domain", "query", "url"):
-        val = alert.get(field) or alert.get("data", {}).get(field, "")
+        val = alert.get(field) or (alert.get("data") or {}).get(field, "")
         if val and isinstance(val, str) and len(val) > 3:
             iocs.add(val.lower())
     return iocs
@@ -117,7 +116,7 @@ class KillChainAgent(BaseAgent):
             wazuh = self.os_client.get_events_since(
                 "wazuh-alerts-*", minutes=CORRELATION_WINDOW_MIN,
                 query={"bool": {"must": [{"exists": {"field": "rule.description"}}]}},
-                size=3000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to fetch Wazuh alerts: %s", e)
@@ -126,7 +125,7 @@ class KillChainAgent(BaseAgent):
             soc = self.os_client.get_events_since(
                 "soc-alerts-*", minutes=CORRELATION_WINDOW_MIN,
                 query={"bool": {"must": [{"exists": {"field": "title"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to fetch SOC alerts: %s", e)
@@ -141,111 +140,120 @@ class KillChainAgent(BaseAgent):
 
         # Prune stale history entries
         for host in list(self._host_history.keys()):
-            self._host_history[host] = [
-                e for e in self._host_history[host] if e["timestamp"] > cutoff
-            ]
-            if not self._host_history[host]:
-                del self._host_history[host]
+            try:
+                self._host_history[host] = [
+                    e for e in self._host_history[host] if e["timestamp"] > cutoff
+                ]
+                if not self._host_history[host]:
+                    del self._host_history[host]
+            except Exception as e:
+                logger.warning("Error pruning history for %s: %s", host, e)
 
         # Classify new alerts and add to host history
         for alert in data:
-            stage = _classify_stage(alert)
-            if not stage:
-                continue
-
-            host = (alert.get("agent", {}).get("name", "")
-                    or alert.get("id.resp_h", "")
-                    or alert.get("dest_ip", "unknown"))
-            iocs = _extract_iocs(alert)
-            ts_str = alert.get("@timestamp") or alert.get("timestamp", "")
             try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-            except (ValueError, AttributeError):
-                ts = now
+                stage = _classify_stage(alert)
+                if not stage:
+                    continue
 
-            entry = {
-                "stage": stage,
-                "timestamp": ts,
-                "iocs": iocs,
-                "summary": str(alert.get("rule", {}).get("description", alert.get("title", "")))[:120],
-            }
+                host = ((alert.get("agent") or {}).get("name", "")
+                        or alert.get("id.resp_h", "")
+                        or alert.get("dest_ip", "unknown"))
+                iocs = _extract_iocs(alert)
+                ts_str = alert.get("@timestamp") or alert.get("timestamp", "")
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                except (ValueError, AttributeError):
+                    ts = now
 
-            # Avoid duplicate entries in the same bucket
-            existing_stages = {e["stage"] for e in self._host_history[host]
-                               if abs(e["timestamp"] - ts) < 60}
-            if stage not in existing_stages:
-                self._host_history[host].append(entry)
+                entry = {
+                    "stage": stage,
+                    "timestamp": ts,
+                    "iocs": iocs,
+                    "summary": str((alert.get("rule") or {}).get("description", alert.get("title", "")))[:120],
+                }
+
+                # Avoid duplicate entries in the same bucket
+                existing_stages = {e["stage"] for e in self._host_history[host]
+                                   if abs(e["timestamp"] - ts) < 60}
+                if stage not in existing_stages:
+                    self._host_history[host].append(entry)
+            except Exception as e:
+                logger.warning("Error classifying alert: %s", e)
 
         # Evaluate each host for kill-chain progression
         for host, entries in self._host_history.items():
-            stages_seen: Dict[str, Dict[str, Any]] = {}
-            all_iocs: Set[str] = set()
+            try:
+                stages_seen: Dict[str, Dict[str, Any]] = {}
+                all_iocs: Set[str] = set()
 
-            for entry in entries:
-                s = entry["stage"]
-                if s not in stages_seen or entry["timestamp"] > stages_seen[s]["timestamp"]:
-                    stages_seen[s] = entry
-                all_iocs.update(entry["iocs"])
+                for entry in entries:
+                    s = entry["stage"]
+                    if s not in stages_seen or entry["timestamp"] > stages_seen[s]["timestamp"]:
+                        stages_seen[s] = entry
+                    all_iocs.update(entry["iocs"])
 
-            stage_count = len(stages_seen)
-            if stage_count == 0:
-                continue
+                stage_count = len(stages_seen)
+                if stage_count == 0:
+                    continue
 
-            # Check IOC overlap across stages for stronger correlation
-            ioc_overlap = False
-            if stage_count >= 2:
-                per_stage_iocs = [e["iocs"] for e in stages_seen.values()]
-                for i, iocs_a in enumerate(per_stage_iocs):
-                    for iocs_b in per_stage_iocs[i + 1:]:
-                        if iocs_a & iocs_b:
-                            ioc_overlap = True
-                            break
+                # Check IOC overlap across stages for stronger correlation
+                ioc_overlap = False
+                if stage_count >= 2:
+                    per_stage_iocs = [e["iocs"] for e in stages_seen.values()]
+                    for i, iocs_a in enumerate(per_stage_iocs):
+                        for iocs_b in per_stage_iocs[i + 1:]:
+                            if iocs_a & iocs_b:
+                                ioc_overlap = True
+                                break
 
-            # Determine severity
-            if stage_count >= 3:
-                severity = Severity.CRITICAL
-            elif stage_count == 2:
-                severity = Severity.HIGH
-            else:
-                severity = Severity.MEDIUM
+                # Determine severity
+                if stage_count >= 3:
+                    severity = Severity.CRITICAL
+                elif stage_count == 2:
+                    severity = Severity.HIGH
+                else:
+                    severity = Severity.MEDIUM
 
-            # Boost severity if IOCs overlap across stages
-            if ioc_overlap and severity < Severity.CRITICAL:
-                severity = Severity(min(severity + 1, Severity.CRITICAL))
+                # Boost severity if IOCs overlap across stages
+                if ioc_overlap and severity < Severity.CRITICAL:
+                    severity = Severity(min(severity + 1, Severity.CRITICAL))
 
-            # Only report if not recently reported for this host+stage combo
-            report_key = hashlib.sha256(
-                f"{host}:{sorted(stages_seen.keys())}".encode()
-            ).hexdigest()[:16]
-            last_reported = self._reported.get(report_key, 0)
-            if (now - last_reported) < self._report_cooldown and stage_count < 3:
-                continue
+                # Only report if not recently reported for this host+stage combo
+                report_key = hashlib.sha256(
+                    f"{host}:{sorted(stages_seen.keys())}".encode()
+                ).hexdigest()[:16]
+                last_reported = self._reported.get(report_key, 0)
+                if (now - last_reported) < self._report_cooldown:
+                    continue
 
-            # Build ordered timeline
-            timeline = []
-            for stage_name in STAGE_ORDER:
-                if stage_name in stages_seen:
-                    e = stages_seen[stage_name]
-                    timeline.append({
-                        "stage": stage_name,
-                        "time": datetime.fromtimestamp(e["timestamp"], tz=timezone.utc).isoformat(),
-                        "summary": e["summary"],
-                    })
+                # Build ordered timeline
+                timeline = []
+                for stage_name in STAGE_ORDER:
+                    if stage_name in stages_seen:
+                        e = stages_seen[stage_name]
+                        timeline.append({
+                            "stage": stage_name,
+                            "time": datetime.fromtimestamp(e["timestamp"], tz=timezone.utc).isoformat(),
+                            "summary": e["summary"],
+                        })
 
-            findings.append({
-                "type": "kill_chain_progression",
-                "severity": severity,
-                "host": host,
-                "stage_count": stage_count,
-                "stages": sorted(stages_seen.keys(), key=lambda s: STAGE_ORDER.index(s)),
-                "ioc_overlap": ioc_overlap,
-                "shared_iocs": list(all_iocs)[:20],
-                "timeline": timeline,
-                "details": (f"Host '{host}': {stage_count} kill-chain stage(s) detected — "
-                            f"{', '.join(sorted(stages_seen.keys(), key=lambda s: STAGE_ORDER.index(s)))}"
-                            f"{' (IOC correlation)' if ioc_overlap else ''}"),
-            })
-            self._reported[report_key] = now
+                findings.append({
+                    "type": "kill_chain_progression",
+                    "severity": severity,
+                    "host": host,
+                    "stage_count": stage_count,
+                    "stages": sorted(stages_seen.keys(), key=lambda s: STAGE_ORDER.index(s)),
+                    "ioc_overlap": ioc_overlap,
+                    "shared_iocs": list(all_iocs)[:20],
+                    "timeline": timeline,
+                    "details": (f"Host '{host}': {stage_count} kill-chain stage(s) detected — "
+                                f"{', '.join(sorted(stages_seen.keys(), key=lambda s: STAGE_ORDER.index(s)))}"
+                                f"{' (IOC correlation)' if ioc_overlap else ''}"),
+                })
+                self._reported[report_key] = now
+            except Exception as e:
+                logger.warning("Error evaluating kill chain for %s: %s", host, e)
 
         return findings
 
@@ -266,14 +274,16 @@ class KillChainAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"Kill Chain: {d['stage_count']} stages on {d['host']}",
                         details={"host": d["host"], "stages": ", ".join(d["stages"]),
                                  "ioc_overlap": d["ioc_overlap"], "info": d["details"]},
                         agent_name=self.name,
                     )
-                    results["alerts"] += 1
+                    if sent:
+                        results["alerts"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])
                     results["escalations"] += 1
@@ -291,6 +301,11 @@ class KillChainAgent(BaseAgent):
                     results["timelines"] += 1
             except Exception as e:
                 logger.error("Kill-chain action failed: %s", e)
+                
+        # Update agent metrics (we don't have the exact event count here, so just mark a cycle)
+        self._events_processed += 1
+        self._metrics.inc_events(1)
+        
         return results
 
 

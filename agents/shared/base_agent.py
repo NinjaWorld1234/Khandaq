@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import signal
-import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -215,9 +214,27 @@ class BaseAgent(ABC):
         Args:
             message: Report payload dict.
         """
+        
+        # Check Agent Reputation (Zero Trust)
+        reputation_score = 1.0
+        try:
+            if hasattr(self, 'redis_bus') and self.redis_bus and self.redis_bus.redis_client:
+                rep_str = self.redis_bus.redis_client.hget("soc:agent_reputation", self.name)
+                if rep_str:
+                    reputation_score = float(rep_str)
+        except Exception as e:
+            logger.debug(f"Could not fetch reputation for {self.name}: {e}")
+            
+        # Tag findings with low confidence if reputation is poor
+        if reputation_score < 0.7:
+            logger.warning(f"⚠️ {self.name} has low reputation ({reputation_score}). Tagging findings as LOW_CONFIDENCE.")
+            message["confidence_warning"] = "LOW_CONFIDENCE: This agent has a history of false positives/rejections."
+            message["reputation_score"] = reputation_score
+            
         report = {
             "agent_name": self.name,
             "agent_description": self.description,
+            "reputation_score": reputation_score,
             **message,
         }
 
@@ -237,7 +254,8 @@ class BaseAgent(ABC):
                 if receiver_count > 0:
                     delivered = True
                     # Reset consecutive failure counter on success
-                    self._supervisor_failures = 0
+                    with self._lock:
+                        self._supervisor_failures = 0
                     break
                 else:
                     # Published but no subscribers listening
@@ -296,21 +314,24 @@ class BaseAgent(ABC):
         # --- Track failures and alert ---
         # --- تتبع الفشل وإرسال تنبيهات ---
         if not delivered:
-            self._supervisor_failures = getattr(
-                self, "_supervisor_failures", 0
-            ) + 1
+            with self._lock:
+                self._supervisor_failures = getattr(
+                    self, "_supervisor_failures", 0
+                ) + 1
+                current_failures = self._supervisor_failures
+
             self._metrics.inc_errors("supervisor_delivery_failed")
 
             logger.error(
                 "[%s] 🔴 SUPERVISOR UNREACHABLE — message lost! "
                 "(consecutive failures: %d, channel: '%s')",
-                self.name, self._supervisor_failures,
+                self.name, current_failures,
                 self.supervisor_channel,
             )
 
             # Alert via OpenSearch after 3 consecutive failures
             # تنبيه عبر أوبن سيرش بعد 3 فشل متتالي
-            if self._supervisor_failures == 3:
+            if current_failures == 3:
                 try:
                     self.os_client.index_document(
                         "soc-channel-failures",
@@ -482,8 +503,12 @@ class BaseAgent(ABC):
             )
             self._running = False
 
-        signal.signal(signal.SIGTERM, _shutdown_handler)
-        signal.signal(signal.SIGINT, _shutdown_handler)
+        try:
+            signal.signal(signal.SIGTERM, _shutdown_handler)
+            signal.signal(signal.SIGINT, _shutdown_handler)
+        except ValueError:
+            # signal.signal only works in the main thread. Ignore if running in a background thread.
+            pass
 
         logger.info(
             "Agent '%s' starting run loop (interval=%ds)",

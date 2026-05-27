@@ -18,11 +18,10 @@ import re
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Tuple
 from urllib.parse import unquote
 
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("soc.agent.w33_sqli_xss_detector")
@@ -132,6 +131,9 @@ class SQLiXSSDetectorAgent(BaseAgent):
         payloads: List[str] = []
         for field in fields:
             val = event.get(field)
+            if val is None and "." in field:
+                parts = field.split(".")
+                val = (event.get(parts[0]) or {}).get(parts[1])
             if val and isinstance(val, str):
                 payloads.append(val)
         return payloads
@@ -189,10 +191,10 @@ class SQLiXSSDetectorAgent(BaseAgent):
         }
         try:
             wazuh_events = self.os_client.get_events_since(
-                "wazuh-alerts-*", minutes=1, query=wazuh_query, size=5000
+                "wazuh-alerts-*", minutes=1, query=wazuh_query, size=10000
             )
             web_events = self.os_client.get_events_since(
-                "filebeat-*", minutes=1, query=web_query, size=3000
+                "filebeat-*", minutes=1, query=web_query, size=10000
             )
             all_events = wazuh_events + web_events
             logger.debug("Collected %d web/Wazuh events", len(all_events))
@@ -212,115 +214,127 @@ class SQLiXSSDetectorAgent(BaseAgent):
             return findings
 
         for event in data:
-            src_ip = (
-                event.get("data.srcip")
-                or event.get("src_ip")
-                or event.get("client.ip")
-                or "unknown"
-            )
-            dest_ip = event.get("data.dstip") or event.get("dest_ip") or ""
-            url = event.get("data.url") or event.get("url") or event.get("http.url") or ""
+            try:
+                data_block = event.get("data") or {}
+                src_ip = (
+                    event.get("data.srcip")
+                    or data_block.get("srcip")
+                    or event.get("src_ip")
+                    or event.get("client.ip")
+                    or "unknown"
+                )
+                dest_ip = event.get("data.dstip") or data_block.get("dstip") or event.get("dest_ip") or ""
+                url = event.get("data.url") or data_block.get("url") or event.get("url") or event.get("http.url") or ""
 
-            payloads = self._extract_payloads(event)
-            if not payloads:
-                continue
+                payloads = self._extract_payloads(event)
+                if not payloads:
+                    self._events_processed += 1
+                    self._metrics.inc_events(1)
+                    continue
 
-            for raw_payload in payloads:
-                decoded = self._decode_payload(raw_payload)
+                for raw_payload in payloads:
+                    decoded = self._decode_payload(raw_payload)
 
-                # --- SQLi check ---
-                sqli_matches = self._scan_patterns(decoded, SQLI_PATTERNS)
-                if sqli_matches:
-                    max_score = max(s for _, s in sqli_matches)
-                    if max_score >= SQLI_MIN_SCORE:
-                        pattern_names = [n for n, _ in sqli_matches]
-                        key = f"sqli:{src_ip}:{hash(decoded) % 10**8}"
-                        if self._should_alert(key):
-                            severity = Severity.CRITICAL if max_score >= 9 else Severity.HIGH
-                            findings.append({
-                                "type": "sql_injection",
-                                "severity": severity,
-                                "src_ip": src_ip,
-                                "dest_ip": dest_ip,
-                                "url": url[:300],
-                                "matched_patterns": pattern_names,
-                                "score": max_score,
-                                "payload_snippet": decoded[:200],
-                                "details": (
-                                    f"SQLi from {src_ip}: {', '.join(pattern_names[:3])} "
-                                    f"(score {max_score})"
-                                ),
-                            })
-                            self._offender_log[src_ip].append((time.time(), "sqli"))
+                    # --- SQLi check ---
+                    sqli_matches = self._scan_patterns(decoded, SQLI_PATTERNS)
+                    if sqli_matches:
+                        max_score = max(s for _, s in sqli_matches)
+                        if max_score >= SQLI_MIN_SCORE:
+                            pattern_names = [n for n, _ in sqli_matches]
+                            key = f"sqli:{src_ip}:{hash(decoded) % 10**8}"
+                            if self._should_alert(key):
+                                severity = Severity.CRITICAL if max_score >= 9 else Severity.HIGH
+                                findings.append({
+                                    "type": "sql_injection",
+                                    "severity": severity,
+                                    "src_ip": src_ip,
+                                    "dest_ip": dest_ip,
+                                    "url": url[:300],
+                                    "matched_patterns": pattern_names,
+                                    "score": max_score,
+                                    "payload_snippet": decoded[:200],
+                                    "details": (
+                                        f"SQLi from {src_ip}: {', '.join(pattern_names[:3])} "
+                                        f"(score {max_score})"
+                                    ),
+                                })
+                                self._offender_log[src_ip].append((time.time(), "sqli"))
 
-                # --- XSS check ---
-                xss_matches = self._scan_patterns(decoded, XSS_PATTERNS)
-                if xss_matches:
-                    max_score = max(s for _, s in xss_matches)
-                    if max_score >= XSS_MIN_SCORE:
-                        pattern_names = [n for n, _ in xss_matches]
-                        key = f"xss:{src_ip}:{hash(decoded) % 10**8}"
-                        if self._should_alert(key):
-                            severity = Severity.HIGH if max_score >= 7 else Severity.MEDIUM
-                            findings.append({
-                                "type": "xss",
-                                "severity": severity,
-                                "src_ip": src_ip,
-                                "dest_ip": dest_ip,
-                                "url": url[:300],
-                                "matched_patterns": pattern_names,
-                                "score": max_score,
-                                "payload_snippet": decoded[:200],
-                                "details": (
-                                    f"XSS from {src_ip}: {', '.join(pattern_names[:3])} "
-                                    f"(score {max_score})"
-                                ),
-                            })
-                            self._offender_log[src_ip].append((time.time(), "xss"))
+                    # --- XSS check ---
+                    xss_matches = self._scan_patterns(decoded, XSS_PATTERNS)
+                    if xss_matches:
+                        max_score = max(s for _, s in xss_matches)
+                        if max_score >= XSS_MIN_SCORE:
+                            pattern_names = [n for n, _ in xss_matches]
+                            key = f"xss:{src_ip}:{hash(decoded) % 10**8}"
+                            if self._should_alert(key):
+                                severity = Severity.HIGH if max_score >= 7 else Severity.MEDIUM
+                                findings.append({
+                                    "type": "xss",
+                                    "severity": severity,
+                                    "src_ip": src_ip,
+                                    "dest_ip": dest_ip,
+                                    "url": url[:300],
+                                    "matched_patterns": pattern_names,
+                                    "score": max_score,
+                                    "payload_snippet": decoded[:200],
+                                    "details": (
+                                        f"XSS from {src_ip}: {', '.join(pattern_names[:3])} "
+                                        f"(score {max_score})"
+                                    ),
+                                })
+                                self._offender_log[src_ip].append((time.time(), "xss"))
 
-                # --- Command Injection check ---
-                cmdi_matches = self._scan_patterns(decoded, CMDI_PATTERNS)
-                if cmdi_matches:
-                    max_score = max(s for _, s in cmdi_matches)
-                    if max_score >= CMDI_MIN_SCORE:
-                        pattern_names = [n for n, _ in cmdi_matches]
-                        key = f"cmdi:{src_ip}:{hash(decoded) % 10**8}"
-                        if self._should_alert(key):
-                            severity = Severity.CRITICAL if max_score >= 9 else Severity.HIGH
-                            findings.append({
-                                "type": "command_injection",
-                                "severity": severity,
-                                "src_ip": src_ip,
-                                "dest_ip": dest_ip,
-                                "url": url[:300],
-                                "matched_patterns": pattern_names,
-                                "score": max_score,
-                                "payload_snippet": decoded[:200],
-                                "details": (
-                                    f"Command injection from {src_ip}: "
-                                    f"{', '.join(pattern_names[:3])} (score {max_score})"
-                                ),
-                            })
-                            self._offender_log[src_ip].append((time.time(), "cmdi"))
+                    # --- Command Injection check ---
+                    cmdi_matches = self._scan_patterns(decoded, CMDI_PATTERNS)
+                    if cmdi_matches:
+                        max_score = max(s for _, s in cmdi_matches)
+                        if max_score >= CMDI_MIN_SCORE:
+                            pattern_names = [n for n, _ in cmdi_matches]
+                            key = f"cmdi:{src_ip}:{hash(decoded) % 10**8}"
+                            if self._should_alert(key):
+                                severity = Severity.CRITICAL if max_score >= 9 else Severity.HIGH
+                                findings.append({
+                                    "type": "command_injection",
+                                    "severity": severity,
+                                    "src_ip": src_ip,
+                                    "dest_ip": dest_ip,
+                                    "url": url[:300],
+                                    "matched_patterns": pattern_names,
+                                    "score": max_score,
+                                    "payload_snippet": decoded[:200],
+                                    "details": (
+                                        f"Command injection from {src_ip}: "
+                                        f"{', '.join(pattern_names[:3])} (score {max_score})"
+                                    ),
+                                })
+                                self._offender_log[src_ip].append((time.time(), "cmdi"))
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing SQLi/XSS event: %s", e)
 
         # --- Repeat-offender detection ---
         self._prune_offenders()
         for src_ip, entries in self._offender_log.items():
-            if len(entries) >= REPEAT_OFFENDER_THRESHOLD:
-                key = f"repeat:{src_ip}"
-                if self._should_alert(key):
-                    attack_types = list({t for _, t in entries})
-                    findings.append({
-                        "type": "repeat_offender",
-                        "severity": Severity.CRITICAL,
-                        "src_ip": src_ip,
-                        "attack_count": len(entries),
-                        "attack_types": attack_types,
-                        "details": (
-                            f"Repeat offender {src_ip}: {len(entries)} injection attempts "
-                            f"({', '.join(attack_types)}) in 5 min"
-                        ),
-                    })
+            try:
+                if len(entries) >= REPEAT_OFFENDER_THRESHOLD:
+                    key = f"repeat:{src_ip}"
+                    if self._should_alert(key):
+                        attack_types = list({t for _, t in entries})
+                        findings.append({
+                            "type": "repeat_offender",
+                            "severity": Severity.CRITICAL,
+                            "src_ip": src_ip,
+                            "attack_count": len(entries),
+                            "attack_types": attack_types,
+                            "details": (
+                                f"Repeat offender {src_ip}: {len(entries)} injection attempts "
+                                f"({', '.join(attack_types)}) in 5 min"
+                            ),
+                        })
+            except Exception as e:
+                logger.warning("Error processing repeat offender: %s", e)
 
         return findings
 
@@ -333,20 +347,23 @@ class SQLiXSSDetectorAgent(BaseAgent):
         actions: List[Dict[str, Any]] = []
 
         for f in findings:
-            actions.append({"action": "alert", "data": f})
+            try:
+                actions.append({"action": "alert", "data": f})
 
-            if f["severity"] >= Severity.HIGH:
-                actions.append({"action": "escalate", "data": f})
+                if f["severity"] >= Severity.HIGH:
+                    actions.append({"action": "escalate", "data": f})
 
-            # Block repeat offenders via active response
-            if f["type"] == "repeat_offender":
-                actions.append({
-                    "action": "block_source",
-                    "src_ip": f["src_ip"],
-                    "reason": f["details"],
-                })
+                # Block repeat offenders via active response
+                if f["type"] == "repeat_offender":
+                    actions.append({
+                        "action": "block_source",
+                        "src_ip": f["src_ip"],
+                        "reason": f["details"],
+                    })
 
-            actions.append({"action": "index_finding", "data": f})
+                actions.append({"action": "index_finding", "data": f})
+            except Exception as e:
+                logger.warning("Error deciding for SQLi/XSS finding: %s", e)
 
         return actions
 
@@ -362,7 +379,7 @@ class SQLiXSSDetectorAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"Web Attack: {d['type'].replace('_', ' ').title()}",
                         details={
@@ -374,7 +391,9 @@ class SQLiXSSDetectorAgent(BaseAgent):
                         },
                         agent_name=self.name,
                     )
-                    results["alerts_sent"] += 1
+                    if sent:
+                        results["alerts_sent"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
 
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])

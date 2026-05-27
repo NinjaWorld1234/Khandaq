@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections import defaultdict
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -78,10 +78,13 @@ class PhishingAnalyzerAgent(BaseAgent):
             config=config,
             supervisor_channel="soc:detection-supervisor",
         )
-        self._alert_index = self._agent_config.get("alert_index", "wazuh-alerts-*")
-        self._seen_domains: dict[str, float] = {}  # domain -> first_seen timestamp
+        self._alert_index = self._agent_config.get(
+            "alert_index", "wazuh-alerts-*")
+        # domain -> first_seen timestamp
+        self._seen_domains: dict[str, float] = {}
         self._alerted_cache: dict[str, float] = {}
         self._alert_cooldown = 300
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -102,7 +105,7 @@ class PhishingAnalyzerAgent(BaseAgent):
                 }
             }
             events = self.os_client.get_events_since(
-                index=self._alert_index, minutes=2, query=query, size=500,
+                index=self._alert_index, minutes=2, query=query, size=10000,
             )
             logger.debug("Collected %d email events", len(events))
             return events
@@ -118,30 +121,33 @@ class PhishingAnalyzerAgent(BaseAgent):
         """Scan each email event for phishing indicators."""
         findings: list[dict[str, Any]] = []
         for event in data:
-            indicators = self._score_event(event)
-            if indicators:
-                score = sum(i["weight"] for i in indicators)
-                severity = (
-                    Severity.HIGH if score >= 5
-                    else Severity.MEDIUM if score >= 3
-                    else Severity.LOW
-                )
-                findings.append({
-                    "event": event,
-                    "indicators": indicators,
-                    "score": score,
-                    "severity": severity,
-                    "source": event.get("data", {}).get("srcip", "unknown"),
-                    "from": event.get("data", {}).get("from", "unknown"),
-                })
-        self._events_processed += len(data)
-        self._metrics.inc_events(len(data))
+            try:
+                indicators = self._score_event(event)
+                if indicators:
+                    score = sum(i["weight"] for i in indicators)
+                    severity = (
+                        Severity.HIGH if score >= 5
+                        else Severity.MEDIUM if score >= 3
+                        else Severity.LOW
+                    )
+                    findings.append({
+                        "event": event,
+                        "indicators": indicators,
+                        "score": score,
+                        "severity": severity,
+                        "source": (event.get("data") or {}).get("srcip", "unknown"),
+                        "from": (event.get("data") or {}).get("from", "unknown"),
+                    })
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing phishing event: %s", e)
         return findings
 
     def _score_event(self, event: dict[str, Any]) -> list[dict[str, Any]]:
         """Return weighted indicator list for a single event."""
         indicators: list[dict[str, Any]] = []
-        data = event.get("data", {})
+        data = event.get("data") or {}
         subject = data.get("subject", "")
         from_addr = data.get("from", "")
         reply_to = data.get("reply_to", "")
@@ -150,14 +156,17 @@ class PhishingAnalyzerAgent(BaseAgent):
         urls = data.get("urls", []) or _URL_RE.findall(body)
 
         # 1. Reply-to mismatch
-        if from_addr and reply_to and self._domain_of(from_addr) != self._domain_of(reply_to):
-            indicators.append({"check": "reply_to_mismatch", "weight": 3,
+        if from_addr and reply_to and self._domain_of(
+                from_addr) != self._domain_of(reply_to):
+            indicators.append({"check": "reply_to_mismatch",
+                               "weight": 3,
                                "detail": f"From={from_addr} Reply-To={reply_to}"})
 
         # 2. Urgent language
         for pat in _URGENT_PATTERNS:
             if pat.search(subject):
-                indicators.append({"check": "urgent_language", "weight": 2,
+                indicators.append({"check": "urgent_language",
+                                   "weight": 2,
                                    "detail": f"Subject matched: {pat.pattern}"})
                 break  # one hit is enough
 
@@ -165,7 +174,8 @@ class PhishingAnalyzerAgent(BaseAgent):
         if isinstance(attachments, list):
             for att in attachments:
                 name = att if isinstance(att, str) else att.get("filename", "")
-                ext = ("." + name.rsplit(".", 1)[-1]).lower() if "." in name else ""
+                ext = ("." + name.rsplit(".", 1)
+                       [-1]).lower() if "." in name else ""
                 if ext in _SUSPICIOUS_EXTENSIONS:
                     indicators.append({"check": "suspicious_attachment", "weight": 3,
                                        "detail": f"Attachment: {name}"})
@@ -175,25 +185,30 @@ class PhishingAnalyzerAgent(BaseAgent):
         for url in all_urls:
             url_str = url if isinstance(url, str) else ""
             if _IP_URL_RE.search(url_str):
-                indicators.append({"check": "ip_url", "weight": 3, "detail": url_str})
+                indicators.append(
+                    {"check": "ip_url", "weight": 3, "detail": url_str})
             # Shortened URLs
             for short in _SHORTENER_DOMAINS:
                 if short in url_str.lower():
-                    indicators.append({"check": "shortened_url", "weight": 2, "detail": url_str})
+                    indicators.append(
+                        {"check": "shortened_url", "weight": 2, "detail": url_str})
                     break
 
         # 5. Lookalike domains
         sender_domain = self._domain_of(from_addr)
         if sender_domain:
             for legit in _LEGITIMATE_DOMAINS:
-                if sender_domain != legit and self._is_lookalike(sender_domain, legit):
-                    indicators.append({"check": "lookalike_domain", "weight": 4,
+                if sender_domain != legit and self._is_lookalike(
+                        sender_domain, legit):
+                    indicators.append({"check": "lookalike_domain",
+                                       "weight": 4,
                                        "detail": f"{sender_domain} resembles {legit}"})
                     break
 
         # 6. Suspicious TLD
         if sender_domain:
-            tld = "." + sender_domain.rsplit(".", 1)[-1] if "." in sender_domain else ""
+            tld = "." + sender_domain.rsplit(".",
+                                             1)[-1] if "." in sender_domain else ""
             if tld in _SUSPICIOUS_TLDS:
                 indicators.append({"check": "suspicious_tld", "weight": 2,
                                    "detail": f"TLD: {tld}"})
@@ -210,19 +225,19 @@ class PhishingAnalyzerAgent(BaseAgent):
     @staticmethod
     def _is_lookalike(candidate: str, legitimate: str) -> bool:
         """Detect typo-squatting via character substitution heuristics."""
-        c, l = candidate.lower(), legitimate.lower()
-        if c == l:
+        c, line_str = candidate.lower(), legitimate.lower()
+        if c == line_str:
             return False
-        subs = {"1": "l", "0": "o", "rn": "m", "vv": "w", "5": "s"}
+        subs = {"1": "line_str", "0": "o", "rn": "m", "vv": "w", "5": "s"}
         normalized = c
         for fake, real in subs.items():
             normalized = normalized.replace(fake, real)
-        if normalized == l:
+        if normalized == line_str:
             return True
         # Levenshtein distance ≤ 2
-        if abs(len(c) - len(l)) > 2:
+        if abs(len(c) - len(line_str)) > 2:
             return False
-        diffs = sum(1 for a, b in zip(c, l) if a != b) + abs(len(c) - len(l))
+        diffs = sum(1 for a, b in zip(c, line_str) if a != b) + abs(len(c) - len(line_str))
         return 0 < diffs <= 2
 
     # ------------------------------------------------------------------
@@ -234,21 +249,24 @@ class PhishingAnalyzerAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
         now = time.time()
         for f in findings:
-            key = f"phish:{f['from']}:{f['score']}"
-            if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
-                continue
-            checks = ", ".join(i["check"] for i in f["indicators"])
-            actions.append({
-                "type": "alert",
-                "severity": f["severity"],
-                "title": "Phishing Email Detected",
-                "details": {
-                    "from": f["from"], "source_ip": f["source"],
-                    "score": f["score"], "indicators": checks,
-                },
-                "alert_key": key,
-            })
-            actions.append({"type": "log_incident", "finding": f})
+            try:
+                key = f"phish:{f['from']}:{f['score']}"
+                if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
+                    continue
+                checks = ", ".join(i["check"] for i in f["indicators"])
+                actions.append({
+                    "type": "alert",
+                    "severity": f["severity"],
+                    "title": "Phishing Email Detected",
+                    "details": {
+                        "from": f["from"], "source_ip": f["source"],
+                        "score": f["score"], "indicators": checks,
+                    },
+                    "alert_key": key,
+                })
+                actions.append({"type": "log_incident", "finding": f})
+            except Exception as e:
+                logger.warning("Error deciding for phishing finding: %s", e)
         return actions
 
     # ------------------------------------------------------------------
@@ -259,26 +277,32 @@ class PhishingAnalyzerAgent(BaseAgent):
         """Execute alert and logging actions."""
         alerts_sent, logged = 0, 0
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"], title=action["title"],
-                    details=action["details"], agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._alerted_cache[action["alert_key"]] = time.time()
-            elif action["type"] == "log_incident":
-                try:
-                    f = action["finding"]
-                    self.os_client.index_document("soc-phishing-incidents", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "agent_name": self.name, "score": f["score"],
-                        "severity": f["severity"].name, "from": f["from"],
-                        "indicators": [i["check"] for i in f["indicators"]],
-                    })
-                    logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log phishing incident: %s", exc)
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"], title=action["title"],
+                        details=action["details"], agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+
+                            self._alerted_cache[action["alert_key"]] = time.time()
+                elif action["type"] == "log_incident":
+                    try:
+                        f = action["finding"]
+                        self.os_client.index_document("soc-phishing-incidents", {
+                            "@timestamp": datetime.now(timezone.utc).isoformat(),
+                            "agent_name": self.name, "score": f["score"],
+                            "severity": f["severity"].name, "from": f["from"],
+                            "indicators": [i["check"] for i in f["indicators"]],
+                        })
+                        logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log phishing incident: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing phishing action: %s", e)
         if alerts_sent:
             self.report_to_supervisor({
                 "type": "phishing_report", "alerts_sent": alerts_sent,

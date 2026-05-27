@@ -223,7 +223,11 @@ class AnomalyDetectionAgent(BaseAgent):
             return None
 
         if stdev == 0:
-            return 0.0 if value == mean else None
+            if value == mean:
+                return 0.0
+            else:
+                # Massive anomaly: baseline was completely flat, but current value changed
+                return float('inf') if value > mean else float('-inf')
 
         return (value - mean) / stdev
 
@@ -254,8 +258,10 @@ class AnomalyDetectionAgent(BaseAgent):
 
     def _is_in_learning_period(self) -> bool:
         """Check if the agent is still within the baseline learning period."""
-        elapsed = datetime.datetime.now(datetime.timezone.utc) - self._start_time
-        return elapsed.days < BASELINE_LEARNING_DAYS
+        # Evasion fix: A hard 7-day blind spot can be exploited by crashing the agent.
+        # Instead, we rely on the statistical minimum thresholds (10 for Z-score, 20 for IQR)
+        # to ensure we don't remain blind for days after a restart.
+        return False
 
     # ------------------------------------------------------------------
     # OpenSearch Anomaly Detection API helpers
@@ -312,7 +318,7 @@ class AnomalyDetectionAgent(BaseAgent):
                 "POST", "/_plugins/_anomaly_detection/detectors/_search",
                 body={"query": {"match": {"name": name}}},
             )
-            hits = resp.get("hits", {}).get("hits", [])
+            hits = (resp.get("hits") or {}).get("hits", [])
             if hits:
                 detector_id = hits[0]["_id"]
                 logger.info("Found existing detector: %s (id=%s)", name, detector_id)
@@ -376,12 +382,12 @@ class AnomalyDetectionAgent(BaseAgent):
                             ],
                         }
                     },
-                    "size": 50,
+                    "size": 10000,
                     "sort": [{"data_start_time": {"order": "desc"}}],
                 }
-                resp = self.os_client.search(index=".opendistro-anomaly-results*", body=body, size=50)
+                resp = self.os_client.search(index=".opendistro-anomaly-results*", body=body, size=10000)
                 data["anomaly_results"][det_name] = [
-                    hit["_source"] for hit in resp.get("hits", {}).get("hits", [])
+                    hit["_source"] for hit in (resp.get("hits") or {}).get("hits", [])
                 ]
             except Exception as exc:
                 logger.error("Anomaly result fetch for '%s' failed: %s", det_name, exc)
@@ -420,87 +426,96 @@ class AnomalyDetectionAgent(BaseAgent):
 
         # --- OpenSearch AD results ---
         for det_name, results in data.get("anomaly_results", {}).items():
-            for result in results:
-                anomaly_grade = float(result.get("anomaly_grade", 0))
-                confidence = float(result.get("confidence", 0))
-                severity = self.grade_to_severity(anomaly_grade)
-                if severity == Severity.INFO:
-                    continue
+            try:
+                for result in results or []:
+                    try:
+                        anomaly_grade = float(result.get("anomaly_grade", 0))
+                        confidence = float(result.get("confidence", 0))
+                        severity = self.grade_to_severity(anomaly_grade)
+                        if severity == Severity.INFO:
+                            continue
 
-                entity = result.get("entity", [])
-                entity_name = (
-                    ", ".join(f"{e.get('name', '?')}={e.get('value', '?')}" for e in entity)
-                    if entity else "global"
-                )
+                        entity = result.get("entity", [])
+                        entity_name = (
+                            ", ".join(f"{e.get('name', '?')}={e.get('value', '?')}" for e in entity)
+                            if entity else "global"
+                        )
 
-                findings.append({
-                    "type": "opensearch_anomaly",
-                    "detector_name": det_name,
-                    "anomaly_grade": anomaly_grade,
-                    "confidence": confidence,
-                    "entity": entity_name,
-                    "data_start_time": result.get("data_start_time", ""),
-                    "data_end_time": result.get("data_end_time", ""),
-                    "severity": severity,
-                })
+                        findings.append({
+                            "type": "opensearch_anomaly",
+                            "detector_name": det_name,
+                            "anomaly_grade": anomaly_grade,
+                            "confidence": confidence,
+                            "entity": entity_name,
+                            "data_start_time": result.get("data_start_time", ""),
+                            "data_end_time": result.get("data_end_time", ""),
+                            "severity": severity,
+                        })
+                    except Exception as e:
+                        logger.warning("Error processing AD result for %s: %s", det_name, e)
+            except Exception as e:
+                logger.warning("Error processing detector %s: %s", det_name, e)
 
         # --- Local Z-score and IQR analysis ---
         for metric_name, current_value in data.get("local_metrics", {}).items():
-            # Append to baseline
-            self._baseline_data[metric_name].append(current_value)
-            if len(self._baseline_data[metric_name]) > self._max_baseline_points:
-                self._baseline_data[metric_name] = self._baseline_data[metric_name][
-                    -self._max_baseline_points:
-                ]
+            try:
+                # Append to baseline
+                self._baseline_data[metric_name].append(current_value)
+                if len(self._baseline_data[metric_name]) > self._max_baseline_points:
+                    self._baseline_data[metric_name] = self._baseline_data[metric_name][
+                        -self._max_baseline_points:
+                    ]
 
-            if self._is_in_learning_period():
-                logger.debug(
-                    "Learning period active for %s – value=%.0f, samples=%d",
-                    metric_name, current_value, len(self._baseline_data[metric_name]),
-                )
-                continue
+                if self._is_in_learning_period():
+                    logger.debug(
+                        "Learning period active for %s – value=%.0f, samples=%d",
+                        metric_name, current_value, len(self._baseline_data[metric_name]),
+                    )
+                    continue
 
-            baseline = self._baseline_data[metric_name]
+                baseline = self._baseline_data[metric_name]
 
-            # Z-score
-            zscore = self.calculate_zscore(current_value, baseline)
-            if zscore is not None and abs(zscore) >= ZSCORE_LOW:
-                severity = self.zscore_to_severity(zscore)
-                if severity not in (Severity.INFO, Severity.LOW):
-                    findings.append({
-                        "type": "zscore_anomaly",
-                        "metric": metric_name,
-                        "current_value": current_value,
-                        "zscore": round(zscore, 3),
-                        "mean": round(statistics.mean(baseline), 3),
-                        "stdev": round(statistics.stdev(baseline), 3),
-                        "baseline_size": len(baseline),
-                        "severity": severity,
-                    })
+                # Z-score
+                zscore = self.calculate_zscore(current_value, baseline)
+                if zscore is not None and abs(zscore) >= ZSCORE_LOW:
+                    severity = self.zscore_to_severity(zscore)
+                    if severity not in (Severity.INFO, Severity.LOW):
+                        findings.append({
+                            "type": "zscore_anomaly",
+                            "metric": metric_name,
+                            "current_value": current_value,
+                            "zscore": round(zscore, 3),
+                            "mean": round(statistics.mean(baseline), 3),
+                            "stdev": round(statistics.stdev(baseline), 3),
+                            "baseline_size": len(baseline),
+                            "severity": severity,
+                        })
 
-            # IQR
-            iqr_result = self.calculate_iqr_bounds(baseline)
-            if iqr_result:
-                lower, upper, lower_ext, upper_ext = iqr_result
-                if current_value > upper_ext or current_value < lower_ext:
-                    sev = Severity.CRITICAL
-                elif current_value > upper or current_value < lower:
-                    sev = Severity.HIGH
-                else:
-                    sev = None
+                # IQR
+                iqr_result = self.calculate_iqr_bounds(baseline)
+                if iqr_result:
+                    lower, upper, lower_ext, upper_ext = iqr_result
+                    if current_value > upper_ext or current_value < lower_ext:
+                        sev = Severity.CRITICAL
+                    elif current_value > upper or current_value < lower:
+                        sev = Severity.HIGH
+                    else:
+                        sev = None
 
-                if sev:
-                    findings.append({
-                        "type": "iqr_outlier",
-                        "metric": metric_name,
-                        "current_value": current_value,
-                        "iqr_lower": round(lower, 3),
-                        "iqr_upper": round(upper, 3),
-                        "iqr_extreme_lower": round(lower_ext, 3),
-                        "iqr_extreme_upper": round(upper_ext, 3),
-                        "baseline_size": len(baseline),
-                        "severity": sev,
-                    })
+                    if sev:
+                        findings.append({
+                            "type": "iqr_outlier",
+                            "metric": metric_name,
+                            "current_value": current_value,
+                            "iqr_lower": round(lower, 3),
+                            "iqr_upper": round(upper, 3),
+                            "iqr_extreme_lower": round(lower_ext, 3),
+                            "iqr_extreme_upper": round(upper_ext, 3),
+                            "baseline_size": len(baseline),
+                            "severity": sev,
+                        })
+            except Exception as e:
+                logger.warning("Error processing local metrics for %s: %s", metric_name, e)
 
         return findings
 

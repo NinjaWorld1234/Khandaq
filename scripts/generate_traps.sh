@@ -12,14 +12,15 @@ echo "============================================================"
 echo "💣 Generating Active Defense Traps..."
 echo "============================================================"
 
-mkdir -p /root/khandaq-labyrinth/honeyfs/etc
-mkdir -p /root/khandaq-labyrinth/honeyfs/root
-mkdir -p /root/khandaq-labyrinth/honeyfs/home/admin
+HONEYFS_DIR="/root/khandaq-labyrinth/tarpit/honeyfs"
+mkdir -p $HONEYFS_DIR/etc
+mkdir -p $HONEYFS_DIR/root
+mkdir -p $HONEYFS_DIR/home/admin
 
 # 1. Generate Fake Credentials (Deception / Sinkholing)
 # These files look extremely attractive to an attacker but contain trackable fake data.
 echo "[*] Generating Fake Credentials (Database_Backup_2026_Credentials.txt)..."
-cat << 'EOF' > /root/khandaq-labyrinth/honeyfs/root/Database_Backup_2026_Credentials.txt
+cat << 'EOF' > $HONEYFS_DIR/root/Database_Backup_2026_Credentials.txt
 # MASTER DATABASE EXPORT - STRICTLY CONFIDENTIAL
 DB_HOST=10.0.0.99
 DB_USER=root
@@ -30,7 +31,7 @@ echo "[+] Fake credentials placed in /root directory of the honeypot."
 
 # 2. Setup Canary Token instructions
 echo "[*] Generating Canary Token Placeholder..."
-cat << 'EOF' > /root/khandaq-labyrinth/honeyfs/root/Financial_Report_Q1.pdf.README.txt
+cat << 'EOF' > $HONEYFS_DIR/root/Financial_Report_Q1.pdf.README.txt
 ATTENTION DEPLOYER:
 To make the Canary Token work and get an email with the Hacker's real IP:
 1. Go to https://canarytokens.org
@@ -38,7 +39,7 @@ To make the Canary Token work and get an email with the Hacker's real IP:
 3. Enter your email address and a reminder note (e.g., "Hacker opened decoy PDF").
 4. Download the PDF file.
 5. Rename it to "Financial_Report_Q1.pdf" and place it in this directory:
-   /root/khandaq-labyrinth/honeyfs/root/
+   $HONEYFS_DIR/root/
 6. Delete this README text file.
 EOF
 echo "[+] Canary token instructions generated."

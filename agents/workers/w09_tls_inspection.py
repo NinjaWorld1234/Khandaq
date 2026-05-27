@@ -16,12 +16,10 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Set
 
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("soc.agent.w09_tls_inspection")
@@ -38,7 +36,7 @@ _INTERNAL_RE = re.compile(
 _CN_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")  # IP address used as CN
 _CN_RANDOM_RE = re.compile(r"^[a-z0-9]{16,}$", re.IGNORECASE)  # Long hex/random string
 _CN_DGA_RE = re.compile(
-    r"^[a-z]{4,20}\.(top|xyz|club|work|buzz|gq|ml|tk|cf|ga|icu)$", re.IGNORECASE
+    r"^[a-z0-9\-]{4,40}\.(top|xyz|club|work|buzz|gq|ml|tk|cf|ga|icu)$", re.IGNORECASE
 )
 
 # --- Known malware JA3 fingerprints (sample set) ---
@@ -102,7 +100,7 @@ class TLSInspectionAgent(BaseAgent):
     @staticmethod
     def _is_expired(event: Dict[str, Any]) -> bool:
         """Check if certificate not_valid_after is in the past."""
-        not_after = event.get("not_valid_after") or event.get("certificate.not_valid_after")
+        not_after = event.get("not_valid_after") or (event.get("certificate") or {}).get("not_valid_after")
         if not not_after:
             return False
         try:
@@ -163,7 +161,7 @@ class TLSInspectionAgent(BaseAgent):
         }
         try:
             events = self.os_client.get_events_since(
-                "zeek-*", minutes=2, query=query, size=5000
+                "zeek-*", minutes=2, query=query, size=10000
             )
             logger.debug("Collected %d TLS events", len(events))
             return events
@@ -182,107 +180,119 @@ class TLSInspectionAgent(BaseAgent):
             return findings
 
         for event in data:
-            src_ip = event.get("id.orig_h", "unknown")
-            dest_ip = event.get("id.resp_h", "")
-            dest_port = int(event.get("id.resp_p", 0) or 0)
-            subject = event.get("subject") or ""
-            ja3_hash = event.get("ja3") or ""
-            ja3s_hash = event.get("ja3s") or ""
-            cipher = event.get("cipher") or ""
-            cert_fingerprint = event.get("cert_chain_fps") or event.get("sha1") or ""
+            try:
+                src_ip = str(event.get("id.orig_h") or "unknown")
+                dest_ip = str(event.get("id.resp_h") or "")
 
-            cn = self._extract_cn(subject)
+                resp_p_val = event.get("id.resp_p")
+                try:
+                    dest_port = int(resp_p_val) if resp_p_val is not None else 0
+                except (ValueError, TypeError):
+                    dest_port = 0
 
-            # Skip allowlisted certificate fingerprints
-            if cert_fingerprint and cert_fingerprint in CERT_FINGERPRINT_ALLOWLIST:
-                continue
+                subject = str(event.get("subject") or "")
+                ja3_hash = str(event.get("ja3") or "")
+                ja3s_hash = str(event.get("ja3s") or "")
+                cipher = str(event.get("cipher") or "")
+                cert_fingerprint = str(event.get("cert_chain_fps") or event.get("sha1") or "")
 
-            # Rule 1 — Self-signed certificate to external IP
-            if self._is_self_signed(event) and self._is_external(dest_ip):
-                key = f"self_signed:{dest_ip}:{cn}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "self_signed_cert",
-                        "severity": Severity.HIGH,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "cn": cn,
-                        "details": f"Self-signed certificate to external host {dest_ip} (CN={cn})",
-                    })
+                cn = self._extract_cn(subject)
 
-            # Rule 2 — Expired certificate
-            if self._is_expired(event):
-                key = f"expired:{dest_ip}:{cn}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "expired_cert",
-                        "severity": Severity.MEDIUM,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "cn": cn,
-                        "details": f"Expired certificate on {dest_ip} (CN={cn})",
-                    })
+                # Skip allowlisted certificate fingerprints
+                if cert_fingerprint and cert_fingerprint in CERT_FINGERPRINT_ALLOWLIST:
+                    continue
 
-            # Rule 3 — Suspicious CN
-            if self._is_suspicious_cn(cn):
-                key = f"sus_cn:{dest_ip}:{cn}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "suspicious_cn",
-                        "severity": Severity.HIGH,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "cn": cn,
-                        "details": f"Suspicious certificate CN='{cn}' on {dest_ip}",
-                    })
+                # Rule 1 — Self-signed certificate to external IP
+                if self._is_self_signed(event) and self._is_external(dest_ip):
+                    key = f"self_signed:{dest_ip}:{cn}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "self_signed_cert",
+                            "severity": Severity.HIGH,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "cn": cn,
+                            "details": f"Self-signed certificate to external host {dest_ip} (CN={cn})",
+                        })
 
-            # Rule 4 — JA3 / JA3S matching known malware
-            malware_name = MALWARE_JA3.get(ja3_hash) or MALWARE_JA3S.get(ja3s_hash)
-            if malware_name:
-                matched_hash = ja3_hash if ja3_hash in MALWARE_JA3 else ja3s_hash
-                key = f"ja3:{src_ip}:{matched_hash}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "malware_ja3",
-                        "severity": Severity.CRITICAL,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "ja3": matched_hash,
-                        "malware_family": malware_name,
-                        "details": f"JA3 fingerprint matches {malware_name}: {matched_hash} ({src_ip} → {dest_ip})",
-                    })
+                # Rule 2 — Expired certificate
+                if self._is_expired(event):
+                    key = f"expired:{dest_ip}:{cn}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "expired_cert",
+                            "severity": Severity.MEDIUM,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "cn": cn,
+                            "details": f"Expired certificate on {dest_ip} (CN={cn})",
+                        })
 
-            # Rule 5 — TLS on non-standard port
-            if dest_port and dest_port not in STANDARD_TLS_PORTS:
-                key = f"nonstandard_port:{src_ip}:{dest_ip}:{dest_port}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "tls_nonstandard_port",
-                        "severity": Severity.MEDIUM,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "details": f"TLS traffic on non-standard port {dest_port} ({src_ip} → {dest_ip})",
-                    })
+                # Rule 3 — Suspicious CN
+                if self._is_suspicious_cn(cn):
+                    key = f"sus_cn:{dest_ip}:{cn}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "suspicious_cn",
+                            "severity": Severity.HIGH,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "cn": cn,
+                            "details": f"Suspicious certificate CN='{cn}' on {dest_ip}",
+                        })
 
-            # Rule 6 — Weak cipher suite
-            if cipher and any(tok in cipher.upper() for tok in WEAK_CIPHER_TOKENS):
-                key = f"weak_cipher:{dest_ip}:{cipher}"
-                if self._should_alert(key):
-                    findings.append({
-                        "type": "weak_cipher",
-                        "severity": Severity.HIGH,
-                        "src_ip": src_ip,
-                        "dest_ip": dest_ip,
-                        "dest_port": dest_port,
-                        "cipher": cipher,
-                        "details": f"Weak cipher suite '{cipher}' negotiated with {dest_ip}",
-                    })
+                # Rule 4 — JA3 / JA3S matching known malware
+                malware_name = MALWARE_JA3.get(ja3_hash) or MALWARE_JA3S.get(ja3s_hash)
+                if malware_name:
+                    matched_hash = ja3_hash if ja3_hash in MALWARE_JA3 else ja3s_hash
+                    key = f"ja3:{src_ip}:{matched_hash}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "malware_ja3",
+                            "severity": Severity.CRITICAL,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "ja3": matched_hash,
+                            "malware_family": malware_name,
+                            "details": f"JA3 fingerprint matches {malware_name}: {matched_hash} ({src_ip} → {dest_ip})",
+                        })
 
+                # Rule 5 — TLS on non-standard port
+                if dest_port and dest_port not in STANDARD_TLS_PORTS:
+                    key = f"nonstandard_port:{src_ip}:{dest_ip}:{dest_port}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "tls_nonstandard_port",
+                            "severity": Severity.MEDIUM,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "details": f"TLS traffic on non-standard port {dest_port} ({src_ip} → {dest_ip})",
+                        })
+
+                # Rule 6 — Weak cipher suite
+                if cipher and any(tok in cipher.upper() for tok in WEAK_CIPHER_TOKENS):
+                    key = f"weak_cipher:{dest_ip}:{cipher}"
+                    if self._should_alert(key):
+                        findings.append({
+                            "type": "weak_cipher",
+                            "severity": Severity.HIGH,
+                            "src_ip": src_ip,
+                            "dest_ip": dest_ip,
+                            "dest_port": dest_port,
+                            "cipher": cipher,
+                            "details": f"Weak cipher suite '{cipher}' negotiated with {dest_ip}",
+                        })
+
+            except Exception as e:
+                logger.warning("Error analyzing TLS event: %s", e)
+
+        self._events_processed += len(data)
+        self._metrics.inc_events(len(data))
         return findings
 
     # ------------------------------------------------------------------
@@ -317,7 +327,7 @@ class TLSInspectionAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"TLS Anomaly: {d['type'].replace('_', ' ').title()}",
                         details={
@@ -328,7 +338,9 @@ class TLSInspectionAgent(BaseAgent):
                         },
                         agent_name=self.name,
                     )
-                    results["alerts_sent"] += 1
+                    if sent:
+                        results["alerts_sent"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
 
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])

@@ -16,15 +16,16 @@ version: "3.8"
 
 services:
   # ===========================================================================
-  # vLLM Commander — Serving Kimi K2.6-Mini
-  # محرك القيادة — تشغيل نموذج كيمي للقائد
+  # vLLM Commander — Serving Qwen-2.5-7B
+  # محرك القيادة — تشغيل نموذج كوين للقائد
   # ===========================================================================
   vllm-commander:
     image: vllm/vllm-openai:latest
     container_name: soc-vllm-commander
     hostname: vllm-commander
     restart: unless-stopped
-    command: --model /root/models/Kimi-K2.6-Mini --served-model-name "MoonshotAI/Kimi-K2.6-Mini" --port 8000 --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remote-code
+    shm_size: '8gb'
+    command: --model /root/models/Commander-Qwen --served-model-name "Qwen/Qwen2.5-7B-Instruct-GGUF" --port 8000 --max-model-len 32768 --gpu-memory-utilization 0.9 --trust-remote-code
     deploy:
       resources:
         reservations:
@@ -48,15 +49,16 @@ services:
       start_period: 60s
 
   # ===========================================================================
-  # vLLM Workers — Serving WhiteRabbitNeo
-  # محرك العمال — تشغيل نموذج الأرنب الأبيض
+  # vLLM Workers — Serving WhiteRabbitNeo-13B (Cybersecurity-Specialized LLM)
+  # محرك العمال — تشغيل نموذج WhiteRabbitNeo المتخصص بالأمن السيبراني
   # ===========================================================================
   vllm-workers:
     image: vllm/vllm-openai:latest
     container_name: soc-vllm-workers
     hostname: vllm-workers
     restart: unless-stopped
-    command: --model /root/models/WhiteRabbitNeo-13B-v1 --served-model-name "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" --port 8001 --max-model-len 16384 --gpu-memory-utilization 0.9
+    shm_size: '8gb'
+    command: --model /root/models/WhiteRabbitNeo-13B --served-model-name "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" --port 8001 --max-model-len 8192 --gpu-memory-utilization 0.9
     deploy:
       resources:
         reservations:
@@ -148,6 +150,77 @@ services:
           memory: 1g
 
   # ===========================================================================
+  # Qdrant — Vector Database for Cyber Memory Engine
+  # قاعدة بيانات المتجهات — للذاكرة السيبرانية الحية
+  # ===========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: soc-qdrant
+    hostname: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ===========================================================================
+  # Neo4j — Graph Database for Live Attack Graph
+  # قاعدة بيانات الرسم البياني — لتمثيل هجمات الشبكة
+  # ===========================================================================
+  neo4j:
+    image: neo4j:5.14
+    container_name: soc-neo4j
+    hostname: neo4j
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-Ch@ngeMe_Neo4j_2024!}
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - neo4j-data:/data
+    networks:
+      - soc-net
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ===========================================================================
+  # Deception Mesh — Honeypot Node
+  # شبكة الخداع — المصائد الوهمية لاكتشاف المهاجمين فورياً
+  # ===========================================================================
+  deception-node:
+    build:
+      context: ../
+      dockerfile: docker/Dockerfile.deception
+    container_name: soc-deception-node
+    hostname: deception-node
+    restart: unless-stopped
+    ports:
+      - "2222:2222" # Fake SSH
+      - "3389:3389" # Fake RDP
+      - "5900:5900" # Fake VNC
+    environment:
+      - REDIS_HOST=redis-ai
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_AI_PASSWORD:-Ch@ngeMe_Redis_AI_2024!}
+    networks:
+      - soc-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+  # ===========================================================================
   # AI Agents — Custom SOC AI agents (52 agents)
   # وكلاء الذكاء الاصطناعي — وكلاء ذكاء اصطناعي مخصصون (52 وكيل)
   # ===========================================================================
@@ -162,9 +235,9 @@ services:
     environment:
       # vLLM connection / اتصال محركات الذكاء المتعددة
       - VLLM_COMMANDER_URL=http://vllm-commander:8000/v1
-      - VLLM_COMMANDER_MODEL=MoonshotAI/Kimi-K2.6-Mini
+      - VLLM_COMMANDER_MODEL=Qwen/Qwen2.5-7B-Instruct-GGUF
       - VLLM_WORKER_URL=http://vllm-workers:8001/v1
-      - VLLM_WORKER_MODEL=WhiteRabbitNeo/WhiteRabbitNeo-13B-v1
+      - VLLM_WORKER_MODEL=QuantFactory/Meta-Llama-3-8B-Instruct-GGUF
       # Redis connection / اتصال ريديس
       - REDIS_HOST=redis-ai
       - REDIS_PORT=6379
@@ -186,6 +259,8 @@ services:
       # Agent configuration / إعدادات الوكلاء
       - LOG_LEVEL=${AI_AGENTS_LOG_LEVEL:-INFO}
       - WORKERS=${AI_AGENTS_WORKERS:-4}
+      - ENABLE_SELF_EVALUATION=true
+      - ENABLE_DECEPTION=true
       - TZ=${TZ:-Asia/Riyadh}
       - HUGGINGFACE_HUB_CACHE=/app/.cache/huggingface
     volumes:
@@ -215,7 +290,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/health\")' || exit 1",
+          "python -c 'import urllib.request; urllib.request.urlopen(\"http://vllm-commander:8000/health\")' || exit 1",
         ]
       interval: 30s
       timeout: 10s
@@ -233,6 +308,12 @@ volumes:
   redis-ai-replica-data:
     driver: local
     name: soc-redis-ai-replica-data
+  qdrant-data:
+    driver: local
+    name: soc-qdrant-data
+  neo4j-data:
+    driver: local
+    name: soc-neo4j-data
   ai-agents-data:
     driver: local
     name: soc-ai-agents-data

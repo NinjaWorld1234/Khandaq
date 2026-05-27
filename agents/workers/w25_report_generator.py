@@ -20,7 +20,6 @@ Supervisor channel: soc:response-supervisor
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -123,7 +122,10 @@ class ReportGeneratorAgent(BaseAgent):
         # Build severity breakdown
         severity_breakdown = current.get("by_severity", {})
         for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-            severity_breakdown.setdefault(sev, 0)
+            try:
+                severity_breakdown.setdefault(sev, 0)
+            except Exception as e:
+                logger.warning("Error processing severity breakdown: %s", e)
 
         report: Dict[str, Any] = {
             "report_type": "daily_security_summary",
@@ -275,19 +277,19 @@ class ReportGeneratorAgent(BaseAgent):
                     ],
                 }
             }
-            alerts = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._alert_index,
-                minutes=0,
-                query=query,
+                body={"query": query},
                 size=1,
             )
+            [hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])]
             # Build severity breakdown from full query
-            all_alerts = self.os_client.get_events_since(
+            all_results = self.os_client.search(
                 index=self._alert_index,
-                minutes=0,
-                query=query,
-                size=5000,
+                body={"query": query},
+                size=10000,
             )
+            all_alerts = [hit.get("_source", {}) for hit in (all_results.get("hits") or {}).get("hits", [])]
             by_severity: Dict[str, int] = {}
             for alert in all_alerts:
                 sev = alert.get("severity", alert.get("alert_severity", "UNKNOWN"))
@@ -315,12 +317,12 @@ class ReportGeneratorAgent(BaseAgent):
                     ],
                 }
             }
-            alerts = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._alert_index,
-                minutes=0,
-                query=query,
-                size=5000,
+                body={"query": query},
+                size=10000,
             )
+            alerts = [hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])]
             rule_counts: Dict[str, int] = {}
             for alert in alerts:
                 rule = alert.get("rule_name", alert.get("title", "unknown"))
@@ -350,16 +352,16 @@ class ReportGeneratorAgent(BaseAgent):
                     ],
                 }
             }
-            alerts = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._alert_index,
-                minutes=0,
-                query=query,
-                size=5000,
+                body={"query": query},
+                size=10000,
             )
+            alerts = [hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])]
             host_counts: Dict[str, int] = {}
             for alert in alerts:
                 host = (
-                    alert.get("host", {}).get("name")
+                    (alert.get("host") or {}).get("name")
                     or alert.get("agent_name")
                     or alert.get("hostname", "unknown")
                 )
@@ -387,19 +389,19 @@ class ReportGeneratorAgent(BaseAgent):
                     ],
                 }
             }
-            iocs = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._ioc_index,
-                minutes=0,
-                query=query,
+                body={"query": query},
                 size=1,
             )
+            [hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])]
             # Use length as count proxy
-            all_iocs = self.os_client.get_events_since(
+            all_results = self.os_client.search(
                 index=self._ioc_index,
-                minutes=0,
-                query=query,
-                size=5000,
+                body={"query": query},
+                size=10000,
             )
+            all_iocs = [hit.get("_source", {}) for hit in (all_results.get("hits") or {}).get("hits", [])]
             return len(all_iocs)
         except Exception as exc:
             logger.error("New IOCs query failed: %s", exc)
@@ -415,12 +417,12 @@ class ReportGeneratorAgent(BaseAgent):
                     ],
                 }
             }
-            cases = self.os_client.get_events_since(
+            results = self.os_client.search(
                 index=self._cases_index,
-                minutes=0,
-                query=query,
-                size=5000,
+                body={"query": query},
+                size=10000,
             )
+            cases = [hit.get("_source", {}) for hit in (results.get("hits") or {}).get("hits", [])]
             return len(cases)
         except Exception as exc:
             logger.error("Open cases query failed: %s", exc)

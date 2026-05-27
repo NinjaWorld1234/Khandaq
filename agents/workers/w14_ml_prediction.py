@@ -19,12 +19,10 @@ Calculates 7-day moving averages / standard deviations and detects:
 import time
 import math
 import logging
-import hashlib
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("W14-MLPrediction")
@@ -88,7 +86,7 @@ class MLPredictionAgent(BaseAgent):
             result["alerts"] = self.os_client.get_events_since(
                 "soc-alerts-*", minutes=6,
                 query={"bool": {"must": [{"exists": {"field": "severity"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect alerts: %s", e)
@@ -96,7 +94,7 @@ class MLPredictionAgent(BaseAgent):
             result["connections"] = self.os_client.get_events_since(
                 "zeek-conn-*", minutes=6,
                 query={"bool": {"must": [{"exists": {"field": "id.orig_h"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect connections: %s", e)
@@ -104,7 +102,7 @@ class MLPredictionAgent(BaseAgent):
             result["logins"] = self.os_client.get_events_since(
                 "wazuh-alerts-*", minutes=6,
                 query={"bool": {"must": [{"term": {"rule.groups": "authentication_failed"}}]}},
-                size=1000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect logins: %s", e)
@@ -112,7 +110,7 @@ class MLPredictionAgent(BaseAgent):
             result["dns"] = self.os_client.get_events_since(
                 "zeek-dns-*", minutes=6,
                 query={"bool": {"must": [{"exists": {"field": "query"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect DNS queries: %s", e)
@@ -126,76 +124,114 @@ class MLPredictionAgent(BaseAgent):
         # --- 1. Alert volume per category ---
         cat_counts: Dict[str, int] = defaultdict(int)
         for alert in data.get("alerts", []):
-            category = alert.get("rule", {}).get("groups", ["unknown"])[0] if isinstance(
-                alert.get("rule"), dict) else alert.get("agent_name", "unknown")
-            cat_counts[category] += 1
-            hour = datetime.now(timezone.utc).hour
-            self._hourly_histogram[category][hour] += 1
+            try:
+                rule = alert.get("rule") or {}
+                category = rule.get("groups", ["unknown"])[0] if isinstance(
+                    rule, dict) and rule.get("groups") else alert.get("agent_name", "unknown")
+                cat_counts[category] += 1
+                hour = datetime.now(timezone.utc).hour
+                self._hourly_histogram[category][hour] += 1
+            except Exception as e:
+                logger.warning("Error processing alert: %s", e)
 
         for category, count in cat_counts.items():
-            self._alert_series[category].append((now, float(count)))
-            finding = self._evaluate_series(self._alert_series[category], category, "alert_volume")
-            if finding:
-                findings.append(finding)
+            try:
+                self._alert_series[category].append((now, float(count)))
+                finding = self._evaluate_series(self._alert_series[category], category, "alert_volume")
+                if finding:
+                    findings.append(finding)
+            except Exception as e:
+                logger.warning("Error evaluating alert series for %s: %s", category, e)
 
         # --- 2. Connection volume per host ---
         host_conns: Dict[str, int] = defaultdict(int)
         for conn in data.get("connections", []):
-            host = conn.get("id.orig_h", "unknown")
-            host_conns[host] += 1
+            try:
+                host = conn.get("id.orig_h", "unknown")
+                host_conns[host] += 1
+            except Exception as e:
+                logger.warning("Error processing connection: %s", e)
 
         for host, count in host_conns.items():
-            self._conn_series[host].append((now, float(count)))
-            finding = self._evaluate_series(self._conn_series[host], host, "conn_volume")
-            if finding:
-                finding["host"] = host
-                findings.append(finding)
+            try:
+                self._conn_series[host].append((now, float(count)))
+                finding = self._evaluate_series(self._conn_series[host], host, "conn_volume")
+                if finding:
+                    finding["host"] = host
+                    findings.append(finding)
+            except Exception as e:
+                logger.warning("Error evaluating conn series for %s: %s", host, e)
 
         # --- 3. Failed login attempts per user/host ---
         login_counts: Dict[str, int] = defaultdict(int)
         for login in data.get("logins", []):
-            user = login.get("data", {}).get("dstuser", "") or login.get("agent", {}).get("name", "unknown")
-            login_counts[user] += 1
+            try:
+                user = (login.get("data") or {}).get("dstuser", "") or (login.get("agent") or {}).get("name", "unknown")
+                login_counts[user] += 1
+            except Exception as e:
+                logger.warning("Error processing login: %s", e)
 
         for user, count in login_counts.items():
-            self._login_series[user].append((now, float(count)))
-            finding = self._evaluate_series(self._login_series[user], user, "failed_logins")
-            if finding:
-                finding["user"] = user
-                findings.append(finding)
+            try:
+                self._login_series[user].append((now, float(count)))
+                finding = self._evaluate_series(self._login_series[user], user, "failed_logins")
+                if finding:
+                    finding["user"] = user
+                    findings.append(finding)
+            except Exception as e:
+                logger.warning("Error evaluating login series for %s: %s", user, e)
 
         # --- 4. DNS query volume per domain ---
         domain_counts: Dict[str, int] = defaultdict(int)
         for dns in data.get("dns", []):
-            query_name = dns.get("query", "")
-            parts = query_name.split(".")
-            root = ".".join(parts[-2:]) if len(parts) >= 2 else query_name
-            domain_counts[root] += 1
+            try:
+                query_name = dns.get("query", "")
+                parts = query_name.split(".")
+                root = ".".join(parts[-2:]) if len(parts) >= 2 else query_name
+                domain_counts[root] += 1
+            except Exception as e:
+                logger.warning("Error processing dns query: %s", e)
 
         for domain, count in domain_counts.items():
-            self._dns_series[domain].append((now, float(count)))
-            finding = self._evaluate_series(self._dns_series[domain], domain, "dns_pattern")
-            if finding:
-                findings.append(finding)
+            try:
+                self._dns_series[domain].append((now, float(count)))
+                finding = self._evaluate_series(self._dns_series[domain], domain, "dns_pattern")
+                if finding:
+                    findings.append(finding)
+            except Exception as e:
+                logger.warning("Error evaluating dns series for %s: %s", domain, e)
 
         # --- 5. Attack-window prediction (time-of-day) ---
         for category, histogram in self._hourly_histogram.items():
-            total = sum(histogram)
-            if total < 50:
-                continue
-            avg_hourly = total / 24.0
-            peak_hour = max(range(24), key=lambda h: histogram[h])
-            if histogram[peak_hour] > avg_hourly * 3:
-                current_hour = datetime.now(timezone.utc).hour
-                hours_until = (peak_hour - current_hour) % 24
-                if 0 < hours_until <= 4:
-                    findings.append({
-                        "type": "attack_window_prediction", "severity": Severity.MEDIUM,
-                        "entity": category, "peak_hour_utc": peak_hour,
-                        "hours_until": hours_until,
-                        "details": (f"Category '{category}' peaks at {peak_hour}:00 UTC "
-                                    f"({hours_until}h from now). Prepare defences."),
-                    })
+            try:
+                total = sum(histogram)
+                if total < 50:
+                    continue
+                avg_hourly = total / 24.0
+                peak_hour = max(range(24), key=lambda h: histogram[h])
+                if histogram[peak_hour] > avg_hourly * 3:
+                    current_hour = datetime.now(timezone.utc).hour
+                    hours_until = (peak_hour - current_hour) % 24
+                    if 0 < hours_until <= 4:
+                        findings.append({
+                            "type": "attack_window_prediction", "severity": Severity.MEDIUM,
+                            "entity": category, "peak_hour_utc": peak_hour,
+                            "hours_until": hours_until,
+                            "details": (f"Category '{category}' peaks at {peak_hour}:00 UTC "
+                                        f"({hours_until}h from now). Prepare defences."),
+                        })
+            except Exception as e:
+                logger.warning("Error evaluating attack window for %s: %s", category, e)
+
+        # Track processed events
+        total_processed = (
+            len(data.get("alerts", [])) +
+            len(data.get("connections", [])) +
+            len(data.get("logins", [])) +
+            len(data.get("dns", []))
+        )
+        self._events_processed += total_processed
+        self._metrics.inc_events(total_processed)
 
         return findings
 
@@ -209,7 +245,11 @@ class MLPredictionAgent(BaseAgent):
         avg = _mean(values[:-1])
         sd = _stddev(values[:-1], avg)
 
-        z_score = (current - avg) / sd if sd > 0 else 0.0
+        if sd == 0:
+            z_score = 0.0 if current == avg else (float('inf') if current > avg else float('-inf'))
+        else:
+            z_score = (current - avg) / sd
+            
         slope = _linear_slope(values[-min(len(values), 24):])  # recent 24 buckets
 
         if z_score > Z_SCORE_THRESHOLD:
@@ -248,19 +288,21 @@ class MLPredictionAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"Prediction: {d['type']}",
                         details={"entity": d.get("entity", ""), "info": d["details"]},
                         agent_name=self.name,
                     )
-                    results["alerts"] += 1
+                    if sent:
+                        results["alerts"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])
                     results["escalations"] += 1
                 elif action["action"] == "index_prediction":
                     doc = {**action["data"], "timestamp": datetime.now(timezone.utc).isoformat(),
-                           "agent": self.name, "severity": action["data"]["severity"].name}
+                           "host": self.name, "severity": action["data"]["severity"].name}
                     self.os_client.index_document("soc-predictions", doc)
                     results["predictions_indexed"] += 1
             except Exception as e:

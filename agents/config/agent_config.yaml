@@ -11,9 +11,9 @@
 # ---------------------------------------------------------------------------
 opensearch:
   hosts:
-    - "https://opensearch:9200"          # OPENSEARCH_HOSTS
+    - "https://127.0.0.1:9200"          # OPENSEARCH_HOSTS
   username: "admin"                       # OPENSEARCH_USER
-  password: "${OPENSEARCH_PASSWORD:-admin}"  # OPENSEARCH_PASSWORD
+  password: "Ch@ngeMe_OpenSearch_2024!"  # OPENSEARCH_PASSWORD
   verify_certs: false                     # OPENSEARCH_VERIFY_CERTS
   ssl_show_warn: false                    # OPENSEARCH_SSL_WARN
   timeout: 30                             # OPENSEARCH_TIMEOUT
@@ -24,9 +24,9 @@ opensearch:
 # Wazuh API / واجهة وازوه
 # ---------------------------------------------------------------------------
 wazuh:
-  url: "https://wazuh-manager:55000"      # WAZUH_API_URL
+  url: "https://127.0.0.1:55000"      # WAZUH_API_URL
   username: "wazuh-wui"                   # WAZUH_API_USER
-  password: "${WAZUH_API_PASSWORD:-wazuh-wui}"  # WAZUH_API_PASSWORD
+  password: "Ch@ngeMe_Wazuh_API_2024!"  # WAZUH_API_PASSWORD
   verify_ssl: false                       # WAZUH_VERIFY_SSL
   timeout: 30                             # WAZUH_TIMEOUT
 
@@ -35,7 +35,7 @@ wazuh:
 # ---------------------------------------------------------------------------
 misp:
   url: "https://misp:8443"                # MISP_URL
-  api_key: "${MISP_API_KEY:-}"            # MISP_API_KEY
+  api_key: ""            # MISP_API_KEY
   verify_ssl: false                       # MISP_VERIFY_SSL
   timeout: 30                             # MISP_TIMEOUT
 
@@ -44,7 +44,7 @@ misp:
 # ---------------------------------------------------------------------------
 iris:
   url: "https://iris:8443"                # IRIS_URL
-  api_key: "${IRIS_API_KEY:-}"            # IRIS_API_KEY
+  api_key: ""            # IRIS_API_KEY
   verify_ssl: false                       # IRIS_VERIFY_SSL
   timeout: 30                             # IRIS_TIMEOUT
 
@@ -52,27 +52,27 @@ iris:
 # vLLM (Multi-Model) / محركات الذكاء الاصطناعي
 # ---------------------------------------------------------------------------
 vllm_commander:
-  url: "http://vllm-commander:8000/v1"    # VLLM_COMMANDER_URL
-  model: "MoonshotAI/Kimi-K2.6-Mini"      # VLLM_COMMANDER_MODEL
+  url: "http://vllm-commander:8000/v1"   # VLLM_COMMANDER_URL
+  model: "Qwen/Qwen2.5-7B-Instruct-GGUF"  # VLLM_COMMANDER_MODEL
   timeout: 300                            # VLLM_COMMANDER_TIMEOUT
   max_tokens: 8192                        # VLLM_COMMANDER_MAX_TOKENS
   temperature: 0.1                        # VLLM_COMMANDER_TEMPERATURE
 
 vllm_worker:
   url: "http://vllm-workers:8001/v1"      # VLLM_WORKER_URL
-  model: "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" # VLLM_WORKER_MODEL
-  timeout: 120                            # VLLM_WORKER_TIMEOUT
+  model: "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1" # VLLM_WORKER_MODEL — Cybersecurity-specialized LLM
+  timeout: 180                            # VLLM_WORKER_TIMEOUT — 13B needs more time
   max_tokens: 4096                        # VLLM_WORKER_MAX_TOKENS
-  temperature: 0.2                        # VLLM_WORKER_TEMPERATURE
+  temperature: 0.15                       # VLLM_WORKER_TEMPERATURE — slightly lower for precision
 
 # ---------------------------------------------------------------------------
 # Redis / ريدس (message bus)
 # ---------------------------------------------------------------------------
 redis:
-  host: "redis"                           # REDIS_HOST
+  host: "127.0.0.1"                       # REDIS_HOST
   port: 6379                              # REDIS_PORT
   db: 0                                   # REDIS_DB
-  password: "${REDIS_PASSWORD:-}"         # REDIS_PASSWORD
+  password: "Ch@ngeMe_Redis_AI_2024!"     # REDIS_PASSWORD
   socket_timeout: 10                      # REDIS_SOCKET_TIMEOUT
 
 # ---------------------------------------------------------------------------

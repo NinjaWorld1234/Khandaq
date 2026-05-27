@@ -45,7 +45,7 @@ cd /root/khandaq-labyrinth
 # it's better to SCP the file from the main machine.
 if [ ! -f "docker-compose.labyrinth-node.yml" ]; then
     echo "[!] Warning: docker-compose.labyrinth-node.yml not found in /root/khandaq-labyrinth."
-    echo "    Please copy it from the soc-system/docker/ directory."
+    echo "    Please copy it (and the tarpit directory) from the soc-system/docker/ directory."
     exit 1
 fi
 

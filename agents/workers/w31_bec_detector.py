@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -61,7 +62,8 @@ class BECDetectorAgent(BaseAgent):
             config=config,
             supervisor_channel="soc:detection-supervisor",
         )
-        self._alert_index = self._agent_config.get("alert_index", "wazuh-alerts-*")
+        self._alert_index = self._agent_config.get(
+            "alert_index", "wazuh-alerts-*")
 
         # Executive roster loaded from agent config (fallback to defaults)
         self._executives: list[dict[str, str]] = self._agent_config.get("executives", [
@@ -72,13 +74,15 @@ class BECDetectorAgent(BaseAgent):
         self._exec_names: dict[str, str] = {
             e["name"].lower(): e["email"].lower() for e in self._executives
         }
-        self._exec_emails: set[str] = {e["email"].lower() for e in self._executives}
+        self._exec_emails: set[str] = {
+            e["email"].lower() for e in self._executives}
         self._company_domains: set[str] = set(
             self._agent_config.get("company_domains", ["company.com"])
         )
 
         self._alerted_cache: dict[str, float] = {}
         self._alert_cooldown = 600
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect
@@ -98,8 +102,7 @@ class BECDetectorAgent(BaseAgent):
                 }
             }
             email_events = self.os_client.get_events_since(
-                index=self._alert_index, minutes=3, query=email_query, size=500,
-            )
+                index=self._alert_index, minutes=3, query=email_query, size=10000, )
             # Also fetch forwarding rule changes
             fwd_query = {
                 "bool": {
@@ -113,7 +116,7 @@ class BECDetectorAgent(BaseAgent):
                 }
             }
             fwd_events = self.os_client.get_events_since(
-                index=self._alert_index, minutes=3, query=fwd_query, size=100,
+                index=self._alert_index, minutes=3, query=fwd_query, size=10000,
             )
             return email_events + fwd_events
         except Exception as exc:
@@ -128,72 +131,82 @@ class BECDetectorAgent(BaseAgent):
         """Detect BEC indicators in collected events."""
         findings: list[dict[str, Any]] = []
         for event in data:
-            data_block = event.get("data", {})
-            action = data_block.get("action", "")
+            try:
+                data_block = event.get("data") or {}
+                action = data_block.get("action", "")
 
-            # Check forwarding rules
-            if action in ("Set-Mailbox", "New-InboxRule") or "forward" in str(event).lower():
-                finding = self._check_forwarding_rule(event, data_block)
-                if finding:
-                    findings.append(finding)
-                continue
+                # Check forwarding rules
+                if action in (
+                    "Set-Mailbox",
+                        "New-InboxRule") or "forward" in str(event).lower():
+                    finding = self._check_forwarding_rule(event, data_block)
+                    if finding:
+                        findings.append(finding)
+                    continue
 
-            # Check email events for impersonation / payment BEC
-            from_addr = data_block.get("from", "")
-            display_name = data_block.get("display_name", "")
-            subject = data_block.get("subject", "")
-            body = data_block.get("body", "")
-            text_blob = f"{subject} {body}"
+                # Check email events for impersonation / payment BEC
+                from_addr = data_block.get("from", "")
+                display_name = data_block.get("display_name", "")
+                subject = data_block.get("subject", "")
+                body = data_block.get("body", "")
+                text_blob = f"{subject} {body}"
 
-            # Executive impersonation: display name matches exec but email doesn't
-            impersonation = self._check_impersonation(display_name, from_addr)
-            if impersonation:
-                has_payment = any(p.search(text_blob) for p in _PAYMENT_KEYWORDS)
-                severity = Severity.CRITICAL if has_payment else Severity.HIGH
-                findings.append({
-                    "type": "executive_impersonation",
-                    "severity": severity,
-                    "from": from_addr,
-                    "display_name": display_name,
-                    "claimed_exec": impersonation["claimed"],
-                    "real_email": impersonation["real_email"],
-                    "has_payment_keywords": has_payment,
-                    "subject": subject[:120],
-                })
-                continue
-
-            # Domain spoofing: email from domain similar to company domain
-            spoofing = self._check_domain_spoofing(from_addr)
-            if spoofing:
-                has_payment = any(p.search(text_blob) for p in _PAYMENT_KEYWORDS)
-                has_urgency = any(p.search(text_blob) for p in _URGENCY_KEYWORDS)
-                if has_payment or has_urgency:
+                # Executive impersonation: display name matches exec but email
+                # doesn't
+                impersonation = self._check_impersonation(display_name, from_addr)
+                if impersonation:
+                    has_payment = any(p.search(text_blob)
+                                      for p in _PAYMENT_KEYWORDS)
+                    severity = Severity.CRITICAL if has_payment else Severity.HIGH
                     findings.append({
-                        "type": "domain_spoofing",
-                        "severity": Severity.CRITICAL if has_payment else Severity.HIGH,
+                        "type": "executive_impersonation",
+                        "severity": severity,
                         "from": from_addr,
-                        "spoofed_domain": spoofing["spoofed"],
-                        "real_domain": spoofing["legitimate"],
+                        "display_name": display_name,
+                        "claimed_exec": impersonation["claimed"],
+                        "real_email": impersonation["real_email"],
                         "has_payment_keywords": has_payment,
                         "subject": subject[:120],
                     })
+                    continue
 
-            # Payment BEC from external sender
-            if from_addr and not self._is_internal(from_addr):
-                payment_hits = [p.pattern for p in _PAYMENT_KEYWORDS if p.search(text_blob)]
-                urgency_hits = [p.pattern for p in _URGENCY_KEYWORDS if p.search(text_blob)]
-                if len(payment_hits) >= 2 and urgency_hits:
-                    findings.append({
-                        "type": "payment_bec",
-                        "severity": Severity.HIGH,
-                        "from": from_addr,
-                        "payment_keywords": payment_hits[:5],
-                        "urgency_keywords": urgency_hits[:3],
-                        "subject": subject[:120],
-                    })
+                # Domain spoofing: email from domain similar to company domain
+                spoofing = self._check_domain_spoofing(from_addr)
+                if spoofing:
+                    has_payment = any(p.search(text_blob)
+                                      for p in _PAYMENT_KEYWORDS)
+                    has_urgency = any(p.search(text_blob)
+                                      for p in _URGENCY_KEYWORDS)
+                    if has_payment or has_urgency:
+                        findings.append({
+                            "type": "domain_spoofing",
+                            "severity": Severity.CRITICAL if has_payment else Severity.HIGH,
+                            "from": from_addr,
+                            "spoofed_domain": spoofing["spoofed"],
+                            "real_domain": spoofing["legitimate"],
+                            "has_payment_keywords": has_payment,
+                            "subject": subject[:120],
+                        })
 
-        self._events_processed += len(data)
-        self._metrics.inc_events(len(data))
+                # Payment BEC from external sender
+                if from_addr and not self._is_internal(from_addr):
+                    payment_hits = [
+                        p.pattern for p in _PAYMENT_KEYWORDS if p.search(text_blob)]
+                    urgency_hits = [
+                        p.pattern for p in _URGENCY_KEYWORDS if p.search(text_blob)]
+                    if len(payment_hits) >= 2 and urgency_hits:
+                        findings.append({
+                            "type": "payment_bec",
+                            "severity": Severity.HIGH,
+                            "from": from_addr,
+                            "payment_keywords": payment_hits[:5],
+                            "urgency_keywords": urgency_hits[:3],
+                            "subject": subject[:120],
+                        })
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing BEC event: %s", e)
         return findings
 
     def _check_impersonation(
@@ -209,7 +222,8 @@ class BECDetectorAgent(BaseAgent):
                 return {"claimed": exec_name, "real_email": exec_email}
         return None
 
-    def _check_domain_spoofing(self, from_addr: str) -> Optional[dict[str, str]]:
+    def _check_domain_spoofing(
+            self, from_addr: str) -> Optional[dict[str, str]]:
         """Check if sender domain is a lookalike of company domains."""
         if "@" not in from_addr:
             return None
@@ -224,16 +238,16 @@ class BECDetectorAgent(BaseAgent):
     @staticmethod
     def _is_similar_domain(candidate: str, legitimate: str) -> bool:
         """Detect domain similarity via substitution and edit distance."""
-        c, l = candidate.lower(), legitimate.lower()
-        subs = {"1": "l", "0": "o", "rn": "m", "vv": "w", "5": "s", "ii": "u"}
+        c, line_str = candidate.lower(), legitimate.lower()
+        subs = {"1": "line_str", "0": "o", "rn": "m", "vv": "w", "5": "s", "ii": "u"}
         norm = c
         for fake, real in subs.items():
             norm = norm.replace(fake, real)
-        if norm == l:
+        if norm == line_str:
             return True
-        if abs(len(c) - len(l)) > 2:
+        if abs(len(c) - len(line_str)) > 2:
             return False
-        diffs = sum(1 for a, b in zip(c, l) if a != b) + abs(len(c) - len(l))
+        diffs = sum(1 for a, b in zip(c, line_str) if a != b) + abs(len(c) - len(line_str))
         return 0 < diffs <= 2
 
     def _is_internal(self, addr: str) -> bool:
@@ -246,7 +260,11 @@ class BECDetectorAgent(BaseAgent):
         self, event: dict[str, Any], data_block: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
         """Check if a forwarding rule directs mail to an external address."""
-        fwd_to = data_block.get("forward_to", "") or data_block.get("parameters", "")
+        fwd_to = data_block.get(
+            "forward_to",
+            "") or data_block.get(
+            "parameters",
+            "")
         user = data_block.get("user", data_block.get("srcuser", "unknown"))
         if not fwd_to:
             return None
@@ -270,22 +288,25 @@ class BECDetectorAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
         now = time.time()
         for f in findings:
-            key = f"bec:{f['type']}:{f.get('from', f.get('user', ''))}"
-            if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
-                continue
-            title_map = {
-                "executive_impersonation": "BEC: Executive Impersonation Detected",
-                "domain_spoofing": "BEC: Domain Spoofing Detected",
-                "payment_bec": "BEC: Suspicious Payment Request",
-                "external_forwarding": "BEC: External Mail Forwarding Rule Created",
-            }
-            actions.append({
-                "type": "alert", "severity": f["severity"],
-                "title": title_map.get(f["type"], "BEC: Suspicious Activity"),
-                "details": {k: v for k, v in f.items() if k not in ("severity",)},
-                "alert_key": key,
-            })
-            actions.append({"type": "log_incident", "finding": f})
+            try:
+                key = f"bec:{f['type']}:{f.get('from', f.get('user', ''))}"
+                if now - self._alerted_cache.get(key, 0) < self._alert_cooldown:
+                    continue
+                title_map = {
+                    "executive_impersonation": "BEC: Executive Impersonation Detected",
+                    "domain_spoofing": "BEC: Domain Spoofing Detected",
+                    "payment_bec": "BEC: Suspicious Payment Request",
+                    "external_forwarding": "BEC: External Mail Forwarding Rule Created",
+                }
+                actions.append({
+                    "type": "alert", "severity": f["severity"],
+                    "title": title_map.get(f["type"], "BEC: Suspicious Activity"),
+                    "details": {k: v for k, v in f.items() if k not in ("severity",)},
+                    "alert_key": key,
+                })
+                actions.append({"type": "log_incident", "finding": f})
+            except Exception as e:
+                logger.warning("Error deciding for BEC finding: %s", e)
         return actions
 
     # ------------------------------------------------------------------
@@ -295,26 +316,32 @@ class BECDetectorAgent(BaseAgent):
     def act(self, actions: list[dict[str, Any]]) -> dict[str, Any]:
         alerts_sent, logged = 0, 0
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"], title=action["title"],
-                    details=action["details"], agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._alerted_cache[action["alert_key"]] = time.time()
-            elif action["type"] == "log_incident":
-                try:
-                    f = action["finding"]
-                    self.os_client.index_document("soc-bec-incidents", {
-                        "@timestamp": datetime.now(timezone.utc).isoformat(),
-                        "agent_name": self.name, "type": f["type"],
-                        "severity": f["severity"].name,
-                        "from": f.get("from", ""), "subject": f.get("subject", ""),
-                    })
-                    logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log BEC incident: %s", exc)
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"], title=action["title"],
+                        details=action["details"], agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+
+                            self._alerted_cache[action["alert_key"]] = time.time()
+                elif action["type"] == "log_incident":
+                    try:
+                        f = action["finding"]
+                        self.os_client.index_document("soc-bec-incidents", {
+                            "@timestamp": datetime.now(timezone.utc).isoformat(),
+                            "agent_name": self.name, "type": f["type"],
+                            "severity": f["severity"].name,
+                            "from": f.get("from", ""), "subject": f.get("subject", ""),
+                        })
+                        logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log BEC incident: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing BEC action: %s", e)
         if alerts_sent:
             self.report_to_supervisor({
                 "type": "bec_report", "alerts_sent": alerts_sent,

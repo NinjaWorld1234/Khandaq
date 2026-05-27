@@ -18,7 +18,6 @@ Interval: 600 seconds
 from __future__ import annotations
 
 import logging
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -129,14 +128,17 @@ class HuntingAutomationAgent(BaseAgent):
         try:
             raw_results: List[Dict[str, Any]] = []
             for hunt in HUNT_QUERIES:
-                events = self.os_client.get_events_since(
-                    index=hunt["index"],
-                    minutes=hunt["minutes"],
-                    query=hunt["query"],
-                    size=500,
-                )
-                if events:
-                    raw_results.append({**hunt, "hits": events})
+                try:
+                    events = self.os_client.get_events_since(
+                        index=hunt["index"],
+                        minutes=hunt["minutes"],
+                        query=hunt["query"],
+                        size=10000,
+                    )
+                    if events:
+                        raw_results.append({**hunt, "hits": events})
+                except Exception as e:
+                    logger.warning("Error running hunt: %s", e)
 
             # Rare outbound: aggregate destination IPs seen < threshold times in 30 days
             rare = self._query_rare_outbound()
@@ -160,7 +162,7 @@ class HuntingAutomationAgent(BaseAgent):
             result = self.os_client.aggregate(
                 index=RARE_OUTBOUND_HUNT["index"], aggs=aggs, query=query,
             )
-            buckets = result.get("dest_ips", {}).get("buckets", [])
+            buckets = (result.get("dest_ips") or {}).get("buckets", [])
             threshold = RARE_OUTBOUND_HUNT["threshold"]
             return [
                 {"dest_ip": b["key"], "count": b["doc_count"]}
@@ -176,20 +178,23 @@ class HuntingAutomationAgent(BaseAgent):
         """Convert raw hunt hits into structured findings."""
         findings: List[Dict[str, Any]] = []
         for hunt_result in data.get("hunts", []):
-            name = hunt_result["name"]
-            hits = hunt_result["hits"]
-            severity = hunt_result["severity"]
-            mitre = hunt_result["mitre"]
-            hit_count = len(hits)
+            try:
+                name = hunt_result["name"]
+                hits = hunt_result["hits"]
+                severity = hunt_result["severity"]
+                mitre = hunt_result["mitre"]
+                hit_count = len(hits)
 
-            findings.append({
-                "hunt_name": name,
-                "severity": severity,
-                "mitre_technique": mitre,
-                "hit_count": hit_count,
-                "sample_hits": hits[:10],
-                "description": f"Hunt '{name}' returned {hit_count} result(s) [MITRE {mitre}]",
-            })
+                findings.append({
+                    "hunt_name": name,
+                    "severity": severity,
+                    "mitre_technique": mitre,
+                    "hit_count": hit_count,
+                    "sample_hits": hits[:10],
+                    "description": f"Hunt '{name}' returned {hit_count} result(s) [MITRE {mitre}]",
+                })
+            except Exception as e:
+                logger.warning("Error analyzing hunt result: %s", e)
 
         self._events_processed += sum(f["hit_count"] for f in findings)
         if findings:
@@ -201,19 +206,22 @@ class HuntingAutomationAgent(BaseAgent):
         """Generate alert and index actions for each finding."""
         actions: List[Dict[str, Any]] = []
         for finding in findings:
-            actions.append({"type": "store_result", "finding": finding})
-            if finding["severity"] >= Severity.HIGH:
-                actions.append({
-                    "type": "alert",
-                    "severity": finding["severity"],
-                    "title": f"Hunt Hit: {finding['hunt_name']}",
-                    "details": {
-                        "hunt_name": finding["hunt_name"],
-                        "mitre": finding["mitre_technique"],
-                        "hit_count": finding["hit_count"],
-                        "description": finding["description"],
-                    },
-                })
+            try:
+                actions.append({"type": "store_result", "finding": finding})
+                if finding["severity"] >= Severity.HIGH:
+                    actions.append({
+                        "type": "alert",
+                        "severity": finding["severity"],
+                        "title": f"Hunt Hit: {finding['hunt_name']}",
+                        "details": {
+                            "hunt_name": finding["hunt_name"],
+                            "mitre": finding["mitre_technique"],
+                            "hit_count": finding["hit_count"],
+                            "description": finding["description"],
+                        },
+                    })
+            except Exception as e:
+                logger.warning("Error deciding action: %s", e)
         return actions
 
     # ── Act ──────────────────────────────────────────────────────────
@@ -224,34 +232,45 @@ class HuntingAutomationAgent(BaseAgent):
         now = datetime.now(timezone.utc).isoformat()
 
         for action in actions:
-            if action["type"] == "store_result":
-                finding = action["finding"]
-                try:
-                    self.os_client.index_document(
-                        index=self._hunt_results_index,
-                        document={
-                            "@timestamp": now,
-                            "hunt_name": finding["hunt_name"],
-                            "mitre_technique": finding["mitre_technique"],
-                            "severity": finding["severity"].name,
-                            "hit_count": finding["hit_count"],
-                            "sample_hits": finding["sample_hits"],
-                            "agent_name": self.name,
-                        },
-                    )
-                    stored += 1
-                except Exception as exc:
-                    logger.error("Failed to store hunt result: %s", exc)
+            try:
+                if action["type"] == "store_result":
+                    finding = action["finding"]
+                    try:
+                        self.os_client.index_document(
+                            index=self._hunt_results_index,
+                            document={
+                                "@timestamp": now,
+                                "hunt_name": finding["hunt_name"],
+                                "mitre_technique": finding["mitre_technique"],
+                                "severity": finding["severity"].name,
+                                "hit_count": finding["hit_count"],
+                                "sample_hits": finding["sample_hits"],
+                                "agent_name": self.name,
+                            },
+                        )
+                        stored += 1
+                    except Exception as exc:
+                        logger.error("Failed to store hunt result: %s", exc)
 
-            elif action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerted += 1
+                elif action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
+                    )
+                    if sent:
+                        alerted += 1
+                        severity_name = action["severity"].name if hasattr(action["severity"], "name") else str(action["severity"])
+                        self._metrics.inc_alerts(severity_name)
+                        # Forward to supervisor for escalation
+                        self.report_to_supervisor({
+                            "type": "hunt_hit_alert",
+                            "severity": severity_name,
+                            "details": action["details"]
+                        })
+            except Exception as e:
+                logger.warning("Error acting on action: %s", e)
 
         if stored or alerted:
             self.report_to_supervisor({

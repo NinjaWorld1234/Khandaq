@@ -1,0 +1,104 @@
+:root {
+  --bg-color: #0b0c10;
+  --glass-bg: rgba(31, 40, 51, 0.65);
+  --glass-border: rgba(69, 162, 158, 0.2);
+  --primary-accent: #66fcf1;
+  --secondary-accent: #45a29e;
+  --text-main: #c5c6c7;
+  --text-bright: #ffffff;
+  --danger: #ff4b4b;
+  --success: #4bb543;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  min-height: 100vh;
+  /* A subtle moving radial gradient for premium dark feel */
+  background: radial-gradient(circle at top right, #1f2833 0%, #0b0c10 40%),
+              radial-gradient(circle at bottom left, #121c22 0%, #0b0c10 40%);
+  background-attachment: fixed;
+}
+
+/* Glassmorphism utility classes */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1), box-shadow 0.3s ease;
+}
+
+.glass-panel:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.45);
+  border-color: rgba(102, 252, 241, 0.3);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0,0,0,0.2);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--secondary-accent);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--primary-accent);
+}
+
+/* Basic Animations */
+@keyframes pulseGlow {
+  0% { box-shadow: 0 0 5px var(--primary-accent); }
+  50% { box-shadow: 0 0 15px var(--primary-accent); }
+  100% { box-shadow: 0 0 5px var(--primary-accent); }
+}
+
+.glow-btn {
+  background: transparent;
+  color: var(--primary-accent);
+  border: 1px solid var(--primary-accent);
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-weight: 600;
+}
+
+.glow-btn:hover {
+  background: var(--primary-accent);
+  color: #000;
+  box-shadow: 0 0 15px var(--primary-accent);
+}
+
+.glow-btn.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+.glow-btn.danger:hover {
+  background: var(--danger);
+  color: #fff;
+  box-shadow: 0 0 15px var(--danger);
+}
+
+.glow-btn.success {
+  color: var(--success);
+  border-color: var(--success);
+}
+.glow-btn.success:hover {
+  background: var(--success);
+  color: #fff;
+  box-shadow: 0 0 15px var(--success);
+}

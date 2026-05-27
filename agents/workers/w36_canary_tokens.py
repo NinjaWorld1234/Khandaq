@@ -188,7 +188,7 @@ class CanaryTokensAgent(BaseAgent):
             file_path = os.path.join(deploy_dir, filename)
             token_id = str(uuid.uuid4())
             fake_password = hashlib.sha256(token_id.encode()).hexdigest()[:24]
-            token_short = hashlib.md5(token_id.encode()).hexdigest()[:16].upper()
+            token_short = hashlib.sha256(token_id.encode()).hexdigest()[:16].upper()
 
             content = content_template.format(
                 date=datetime.datetime.now(datetime.timezone.utc).strftime(
@@ -247,7 +247,7 @@ class CanaryTokensAgent(BaseAgent):
                     }
                 }
                 data["fim_events"] = self.os_client.get_events_since(
-                    index=WAZUH_ALERTS_INDEX, minutes=1, query=fim_query, size=100,
+                    index=WAZUH_ALERTS_INDEX, minutes=1, query=fim_query, size=10000,
                 )
             except Exception as exc:
                 logger.error("Token FIM query failed: %s", exc)
@@ -267,47 +267,59 @@ class CanaryTokensAgent(BaseAgent):
         findings: list[dict[str, Any]] = []
 
         for event in data.get("fim_events", []):
-            event_id = event.get("id", event.get("_id", str(uuid.uuid4())))
-            if event_id in self._alerted_event_ids:
-                continue
-            self._alerted_event_ids.add(event_id)
+            try:
+                event_id = event.get("id", event.get("_id", str(uuid.uuid4())))
+                if event_id in self._alerted_event_ids:
+                    self._events_processed += 1
+                    self._metrics.inc_events(1)
+                    continue
+                self._alerted_event_ids.add(event_id)
 
-            file_path = event.get("syscheck", {}).get("path", "unknown")
-            fim_event_type = event.get("syscheck", {}).get("event", "unknown")
-            agent_info = event.get("agent", {})
+                syscheck = event.get("syscheck") or {}
+                file_path = syscheck.get("path", "unknown")
+                fim_event_type = syscheck.get("event", "unknown").lower()
+                agent_info = event.get("agent") or {}
 
-            audit_data = event.get("syscheck", {}).get("audit", {})
-            accessing_user = (
-                audit_data.get("user", {}).get("name", "")
-                or audit_data.get("login_user", {}).get("name", "unknown")
-            )
-            accessing_process = audit_data.get("process", {}).get("name", "unknown")
-            process_id = audit_data.get("process", {}).get("id", "N/A")
+                audit_data = syscheck.get("audit") or {}
+                user_data = audit_data.get("user") or {}
+                login_user_data = audit_data.get("login_user") or {}
+                accessing_user = user_data.get("name", "") or login_user_data.get("name", "unknown")
+                
+                process_data = audit_data.get("process") or {}
+                accessing_process = process_data.get("name", "unknown")
+                process_id = process_data.get("id", "N/A")
 
-            token_meta = self.token_registry.get(file_path, {})
+                token_meta = self.token_registry.get(file_path, {})
 
-            findings.append({
-                "type": "token_accessed",
-                "file_path": file_path,
-                "fim_event_type": fim_event_type,
-                "hostname": agent_info.get("name", "unknown"),
-                "accessing_user": accessing_user,
-                "accessing_process": accessing_process,
-                "process_id": process_id,
-                "token_id": token_meta.get("token_id", "unknown"),
-                "token_description": token_meta.get("description", "unknown"),
-                "mitre_technique": token_meta.get("mitre_technique", "T1552"),
-            })
+                findings.append({
+                    "type": "token_accessed",
+                    "file_path": file_path,
+                    "fim_event_type": fim_event_type,
+                    "hostname": agent_info.get("name", "unknown"),
+                    "accessing_user": accessing_user,
+                    "accessing_process": accessing_process,
+                    "process_id": process_id,
+                    "token_id": token_meta.get("token_id", "unknown"),
+                    "token_description": token_meta.get("description", "unknown"),
+                    "mitre_technique": token_meta.get("mitre_technique", "T1552"),
+                })
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing Canary Token event: %s", e)
 
         # Missing tokens (deleted by attacker)
         for file_path in data.get("missing_tokens", []):
-            meta = self.token_registry.get(file_path, {})
-            findings.append({
-                "type": "token_deleted",
-                "file_path": file_path,
-                "token_id": meta.get("token_id", "unknown"),
-                "token_description": meta.get("description", "unknown"),
-            })
+            try:
+                meta = self.token_registry.get(file_path, {})
+                findings.append({
+                    "type": "token_deleted",
+                    "file_path": file_path,
+                    "token_id": meta.get("token_id", "unknown"),
+                    "token_description": meta.get("description", "unknown"),
+                })
+            except Exception as e:
+                logger.warning("Error processing missing token: %s", e)
 
         return findings
 
@@ -319,38 +331,41 @@ class CanaryTokensAgent(BaseAgent):
         actions: list[dict[str, Any]] = []
 
         for finding in findings:
-            if finding["type"] == "token_accessed":
-                actions.append({
-                    "alert": True,
-                    "severity": Severity.CRITICAL,
-                    "title": "🚨 CANARY TOKEN ACCESSED – CREDENTIAL HARVESTING DETECTED",
-                    "details": {
-                        "file_path": finding["file_path"],
-                        "token_description": finding["token_description"],
-                        "token_id": finding["token_id"],
-                        "fim_event_type": finding["fim_event_type"],
-                        "hostname": finding["hostname"],
-                        "accessing_user": finding["accessing_user"],
-                        "accessing_process": finding["accessing_process"],
-                        "process_id": finding["process_id"],
-                        "mitre_technique": finding["mitre_technique"],
-                        "mitre_tactic": "Credential Access",
-                    },
-                })
+            try:
+                if finding["type"] == "token_accessed":
+                    actions.append({
+                        "alert": True,
+                        "severity": Severity.CRITICAL,
+                        "title": "🚨 CANARY TOKEN ACCESSED – CREDENTIAL HARVESTING DETECTED",
+                        "details": {
+                            "file_path": finding["file_path"],
+                            "token_description": finding["token_description"],
+                            "token_id": finding["token_id"],
+                            "fim_event_type": finding["fim_event_type"],
+                            "hostname": finding["hostname"],
+                            "accessing_user": finding["accessing_user"],
+                            "accessing_process": finding["accessing_process"],
+                            "process_id": finding["process_id"],
+                            "mitre_technique": finding["mitre_technique"],
+                            "mitre_tactic": "Credential Access",
+                        },
+                    })
 
-            elif finding["type"] == "token_deleted":
-                actions.append({
-                    "alert": True,
-                    "severity": Severity.HIGH,
-                    "title": "⚠️ CANARY TOKEN FILE DELETED",
-                    "details": {
-                        "file_path": finding["file_path"],
-                        "token_id": finding["token_id"],
-                        "token_description": finding["token_description"],
-                        "mitre_technique": "T1070.004 - File Deletion",
-                        "mitre_tactic": "Defense Evasion",
-                    },
-                })
+                elif finding["type"] == "token_deleted":
+                    actions.append({
+                        "alert": True,
+                        "severity": Severity.HIGH,
+                        "title": "⚠️ CANARY TOKEN FILE DELETED",
+                        "details": {
+                            "file_path": finding["file_path"],
+                            "token_id": finding["token_id"],
+                            "token_description": finding["token_description"],
+                            "mitre_technique": "T1070.004 - File Deletion",
+                            "mitre_tactic": "Defense Evasion",
+                        },
+                    })
+            except Exception as e:
+                logger.warning("Error deciding for Canary finding: %s", e)
 
         return actions
 
@@ -362,19 +377,19 @@ class CanaryTokensAgent(BaseAgent):
         alerts_sent = 0
 
         for action in actions:
-            if action.get("alert"):
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-
-        self._events_processed += 1
-        self._metrics.inc_events(1)
+            try:
+                if action.get("alert"):
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+            except Exception as e:
+                logger.warning("Error executing Canary action: %s", e)
 
         if alerts_sent:
             self.report_to_supervisor({

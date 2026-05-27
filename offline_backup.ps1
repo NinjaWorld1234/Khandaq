@@ -1,16 +1,17 @@
 # Script to pull and save all Docker images offline for Air-Gapped deployment
 $ErrorActionPreference = "Stop"
 
-$composeDir = "C:\Users\computech\Documents\antigravity\blissful-mendel\soc-system\compose"
-$exportDir = "D:\soc_offline_images"
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$composeDir = Join-Path $scriptDir "docker"
+$exportDir = Join-Path $scriptDir "soc_offline_images"
 
 Write-Host "Checking export directory: $exportDir"
 if (!(Test-Path $exportDir)) {
     New-Item -ItemType Directory -Force -Path $exportDir | Out-Null
 }
 
-# Find all docker-compose.yml files
-$composeFiles = Get-ChildItem -Path $composeDir -Filter "docker-compose.yml" -Recurse
+# Find all docker-compose*.yml files
+$composeFiles = Get-ChildItem -Path $composeDir -Filter "docker-compose*.yml" -Recurse
 
 $images = @()
 
@@ -18,8 +19,18 @@ foreach ($file in $composeFiles) {
     # Extract image names from the yaml files
     $content = Get-Content $file.FullName
     foreach ($line in $content) {
-        if ($line -match '^\s*image:\s*([^\s]+)') {
-            $images += $matches[1]
+        if ($line -match '^\s*image:\s*(.+)$') {
+            $rawImg = $matches[1] -replace '["'']', ''
+            
+            # Resolve ${VAR:-default} syntax
+            if ($rawImg -match '\$\{[^:]+:-([^}]+)\}') {
+                $rawImg = $rawImg -replace '\$\{[^:]+:-([^}]+)\}', '$1'
+            }
+            
+            # Exclude specific heavy/standalone images just like bash script
+            if ($rawImg -notmatch "soc-ai-agents|greenbone|tpotce") {
+                $images += $rawImg
+            }
         }
     }
 }

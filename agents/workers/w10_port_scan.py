@@ -16,10 +16,9 @@ import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set
 
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
 from shared.alerter import Severity
 
 logger = logging.getLogger("soc.agent.w10_port_scan")
@@ -28,7 +27,7 @@ logger = logging.getLogger("soc.agent.w10_port_scan")
 VERTICAL_SCAN_PORTS = 20        # Unique ports to 1 dest in 1 cycle
 HORIZONTAL_SWEEP_HOSTS = 10     # Unique dests on same port in 1 cycle
 SYN_SCAN_S0_COUNT = 30          # S0 connections from single source
-SLOW_SCAN_PORTS_CUMULATIVE = 50 # Cumulative unique ports over multiple cycles
+SLOW_SCAN_PORTS_CUMULATIVE = 50  # Cumulative unique ports over multiple cycles
 SERVICE_ENUM_SEQUENTIAL = 8     # Sequential well-known port hits
 
 # Well-known service ports typically probed during enumeration
@@ -48,14 +47,18 @@ class PortScanAgent(BaseAgent):
             interval_seconds=60,
             supervisor_channel="soc:network-supervisor",
         )
-        # Slow-scan tracking: src_ip → {dest_ip → set(ports)} across cycles
+        # Slow-scan tracking: src_ip -> {dest_ip -> set(ports)} across cycles
         self._slow_scan_state: Dict[str, Dict[str, Set[int]]] = defaultdict(
+            lambda: defaultdict(set)
+        )
+        # Slow-sweep tracking: src_ip -> {port -> set(dest_ips)}
+        self._slow_sweep_state: Dict[str, Dict[int, Set[str]]] = defaultdict(
             lambda: defaultdict(set)
         )
         self._slow_scan_window = 300  # 5-minute window
         self._slow_scan_timestamps: Dict[str, float] = {}
 
-        # De-duplication: recently alerted scan keys → timestamp
+        # De-duplication: recently alerted scan keys -> timestamp
         self._alerted: Dict[str, float] = {}
         self._alert_cooldown = 300
 
@@ -81,6 +84,7 @@ class PortScanAgent(BaseAgent):
         ]
         for src in expired:
             self._slow_scan_state.pop(src, None)
+            self._slow_sweep_state.pop(src, None)
             self._slow_scan_timestamps.pop(src, None)
 
     # ------------------------------------------------------------------
@@ -139,128 +143,179 @@ class PortScanAgent(BaseAgent):
         )
 
         for event in data:
-            src_ip = event.get("id.orig_h", "")
-            dest_ip = event.get("id.resp_h", "")
-            dest_port = int(event.get("id.resp_p", 0) or 0)
-            conn_state = event.get("conn_state", "")
-            proto = (event.get("proto") or "").lower()
+            try:
+                src_ip = str(event.get("id.orig_h") or "")
+                dest_ip = str(event.get("id.resp_h") or "")
 
-            if not src_ip or not dest_ip:
-                continue
+                resp_p_val = event.get("id.resp_p")
+                try:
+                    dest_port = int(resp_p_val) if resp_p_val is not None else 0
+                except (ValueError, TypeError):
+                    dest_port = 0
 
-            src_dest_ports[src_ip][dest_ip].add(dest_port)
-            src_port_dests[src_ip][dest_port].add(dest_ip)
-            src_conn_states[src_ip][conn_state] += 1
+                conn_state = str(event.get("conn_state") or "")
+                proto = str(event.get("proto") or "").lower()
 
-            # S0 = SYN sent with no reply (classic SYN scan indicator)
-            if conn_state == "S0" and proto == "tcp":
-                src_syn_count[src_ip] += 1
+                if not src_ip or not dest_ip:
+                    continue
 
-            # Track port order for service enumeration
-            if dest_port in WELL_KNOWN_PORTS:
-                src_dest_port_list[src_ip][dest_ip].append(dest_port)
+                src_dest_ports[src_ip][dest_ip].add(dest_port)
+                src_port_dests[src_ip][dest_port].add(dest_ip)
+                src_conn_states[src_ip][conn_state] += 1
 
-            # Feed slow-scan tracker
-            self._slow_scan_state[src_ip][dest_ip].add(dest_port)
-            self._slow_scan_timestamps[src_ip] = time.time()
+                # S0 = SYN sent with no reply (classic SYN scan indicator)
+                if conn_state == "S0" and proto == "tcp":
+                    src_syn_count[src_ip] += 1
+
+                # Track port order for service enumeration
+                if dest_port in WELL_KNOWN_PORTS:
+                    src_dest_port_list[src_ip][dest_ip].append(dest_port)
+
+                # Feed slow-scan trackers
+                self._slow_scan_state[src_ip][dest_ip].add(dest_port)
+                self._slow_sweep_state[src_ip][dest_port].add(dest_ip)
+                self._slow_scan_timestamps[src_ip] = time.time()
+
+            except Exception as e:
+                logger.warning("Error processing scan event: %s", e)
 
         # --- Rule 1: Vertical scan (many ports on one dest) ---
         for src_ip, dest_map in src_dest_ports.items():
-            for dest_ip, ports in dest_map.items():
-                if len(ports) >= VERTICAL_SCAN_PORTS:
-                    key = f"vertical:{src_ip}:{dest_ip}"
-                    if self._should_alert(key):
-                        findings.append({
-                            "type": "vertical_scan",
-                            "severity": Severity.HIGH,
-                            "src_ip": src_ip,
-                            "dest_ip": dest_ip,
-                            "unique_ports": len(ports),
-                            "sample_ports": sorted(ports)[:20],
-                            "details": (
-                                f"Vertical scan: {src_ip} probed {len(ports)} ports "
-                                f"on {dest_ip}"
-                            ),
-                        })
+            try:
+                for dest_ip, ports in dest_map.items():
+                    if len(ports) >= VERTICAL_SCAN_PORTS:
+                        key = f"vertical:{src_ip}:{dest_ip}"
+                        if self._should_alert(key):
+                            findings.append({
+                                "type": "vertical_scan",
+                                "severity": Severity.HIGH,
+                                "src_ip": src_ip,
+                                "dest_ip": dest_ip,
+                                "unique_ports": len(ports),
+                                "sample_ports": sorted(ports)[:20],
+                                "details": (
+                                    f"Vertical scan: {src_ip} probed {len(ports)} ports "
+                                    f"on {dest_ip}"
+                                ),
+                            })
+            except Exception as e:
+                logger.warning("Error in Rule 1: %s", e)
 
         # --- Rule 2: Horizontal sweep (same port, many dests) ---
         for src_ip, port_map in src_port_dests.items():
-            for port, dests in port_map.items():
-                if len(dests) >= HORIZONTAL_SWEEP_HOSTS:
-                    key = f"horizontal:{src_ip}:{port}"
-                    if self._should_alert(key):
-                        findings.append({
-                            "type": "horizontal_sweep",
-                            "severity": Severity.HIGH,
-                            "src_ip": src_ip,
-                            "port": port,
-                            "unique_hosts": len(dests),
-                            "sample_hosts": sorted(dests)[:10],
-                            "details": (
-                                f"Horizontal sweep: {src_ip} hit port {port} on "
-                                f"{len(dests)} hosts"
-                            ),
-                        })
+            try:
+                for port, dests in port_map.items():
+                    if len(dests) >= HORIZONTAL_SWEEP_HOSTS:
+                        key = f"horizontal:{src_ip}:{port}"
+                        if self._should_alert(key):
+                            findings.append({
+                                "type": "horizontal_sweep",
+                                "severity": Severity.HIGH,
+                                "src_ip": src_ip,
+                                "port": port,
+                                "unique_hosts": len(dests),
+                                "sample_hosts": sorted(dests)[:10],
+                                "details": (
+                                    f"Horizontal sweep: {src_ip} hit port {port} on "
+                                    f"{len(dests)} hosts"
+                                ),
+                            })
+            except Exception as e:
+                logger.warning("Error in Rule 2: %s", e)
 
         # --- Rule 3: SYN scan (high S0 count) ---
         for src_ip, s0_count in src_syn_count.items():
-            if s0_count >= SYN_SCAN_S0_COUNT:
-                key = f"syn_scan:{src_ip}"
-                if self._should_alert(key):
-                    rej_count = src_conn_states[src_ip].get("REJ", 0)
-                    findings.append({
-                        "type": "syn_scan",
-                        "severity": Severity.HIGH,
-                        "src_ip": src_ip,
-                        "s0_connections": s0_count,
-                        "rej_connections": rej_count,
-                        "conn_states": dict(src_conn_states[src_ip]),
-                        "details": (
-                            f"SYN scan: {src_ip} sent {s0_count} unanswered SYNs "
-                            f"({rej_count} rejected)"
-                        ),
-                    })
+            try:
+                if s0_count >= SYN_SCAN_S0_COUNT:
+                    key = f"syn_scan:{src_ip}"
+                    if self._should_alert(key):
+                        rej_count = src_conn_states[src_ip].get("REJ", 0)
+                        findings.append({
+                            "type": "syn_scan",
+                            "severity": Severity.HIGH,
+                            "src_ip": src_ip,
+                            "s0_connections": s0_count,
+                            "rej_connections": rej_count,
+                            "conn_states": dict(src_conn_states[src_ip]),
+                            "details": (
+                                f"SYN scan: {src_ip} sent {s0_count} unanswered SYNs "
+                                f"({rej_count} rejected)"
+                            ),
+                        })
+            except Exception as e:
+                logger.warning("Error in Rule 3: %s", e)
 
         # --- Rule 4: Slow/stealth scan (cumulative across cycles) ---
         self._prune_slow_scan_state()
         for src_ip, dest_map in self._slow_scan_state.items():
-            for dest_ip, ports in dest_map.items():
-                if len(ports) >= SLOW_SCAN_PORTS_CUMULATIVE:
-                    key = f"slow_scan:{src_ip}:{dest_ip}"
-                    if self._should_alert(key):
-                        findings.append({
-                            "type": "slow_stealth_scan",
-                            "severity": Severity.MEDIUM,
-                            "src_ip": src_ip,
-                            "dest_ip": dest_ip,
-                            "unique_ports": len(ports),
-                            "details": (
-                                f"Slow scan: {src_ip} probed {len(ports)} ports on "
-                                f"{dest_ip} over 5-min window"
-                            ),
-                        })
-                    # Reset after alerting to avoid repeated triggers
-                    dest_map[dest_ip] = set()
+            try:
+                for dest_ip, ports in dest_map.items():
+                    if len(ports) >= SLOW_SCAN_PORTS_CUMULATIVE:
+                        key = f"slow_scan:{src_ip}:{dest_ip}"
+                        if self._should_alert(key):
+                            findings.append({
+                                "type": "slow_stealth_scan",
+                                "severity": Severity.MEDIUM,
+                                "src_ip": src_ip,
+                                "dest_ip": dest_ip,
+                                "unique_ports": len(ports),
+                                "details": (
+                                    f"Slow scan: {src_ip} probed {len(ports)} ports on "
+                                    f"{dest_ip} over 5-min window"
+                                ),
+                            })
+                        # Reset after alerting to avoid repeated triggers
+                        dest_map[dest_ip] = set()
+            except Exception as e:
+                logger.warning("Error in Rule 4: %s", e)
+
+        # --- Rule 4.5: Slow horizontal sweep (cumulative across cycles) ---
+        for src_ip, port_map in self._slow_sweep_state.items():
+            try:
+                for port, dests in port_map.items():
+                    if len(dests) >= 30:  # 30 hosts over 5 minutes
+                        key = f"slow_sweep:{src_ip}:{port}"
+                        if self._should_alert(key):
+                            findings.append({
+                                "type": "slow_stealth_sweep",
+                                "severity": Severity.MEDIUM,
+                                "src_ip": src_ip,
+                                "port": port,
+                                "unique_hosts": len(dests),
+                                "details": (
+                                    f"Slow horizontal sweep: {src_ip} hit port {port} on "
+                                    f"{len(dests)} hosts over 5-min window"
+                                ),
+                            })
+                        # Reset after alerting to avoid repeated triggers
+                        port_map[port] = set()
+            except Exception as e:
+                logger.warning("Error in Rule 4.5: %s", e)
 
         # --- Rule 5: Service enumeration (sequential well-known ports) ---
         for src_ip, dest_map in src_dest_port_list.items():
-            for dest_ip, port_seq in dest_map.items():
-                unique_wk = set(port_seq)
-                if len(unique_wk) >= SERVICE_ENUM_SEQUENTIAL:
-                    key = f"svc_enum:{src_ip}:{dest_ip}"
-                    if self._should_alert(key):
-                        findings.append({
-                            "type": "service_enumeration",
-                            "severity": Severity.MEDIUM,
-                            "src_ip": src_ip,
-                            "dest_ip": dest_ip,
-                            "services_probed": sorted(unique_wk),
-                            "details": (
-                                f"Service enumeration: {src_ip} probed "
-                                f"{len(unique_wk)} well-known ports on {dest_ip}"
-                            ),
-                        })
+            try:
+                for dest_ip, port_seq in dest_map.items():
+                    unique_wk = set(port_seq)
+                    if len(unique_wk) >= SERVICE_ENUM_SEQUENTIAL:
+                        key = f"svc_enum:{src_ip}:{dest_ip}"
+                        if self._should_alert(key):
+                            findings.append({
+                                "type": "service_enumeration",
+                                "severity": Severity.MEDIUM,
+                                "src_ip": src_ip,
+                                "dest_ip": dest_ip,
+                                "services_probed": sorted(unique_wk),
+                                "details": (
+                                    f"Service enumeration: {src_ip} probed "
+                                    f"{len(unique_wk)} well-known ports on {dest_ip}"
+                                ),
+                            })
+            except Exception as e:
+                logger.warning("Error in Rule 5: %s", e)
 
+        self._events_processed += len(data)
+        self._metrics.inc_events(len(data))
         return findings
 
     # ------------------------------------------------------------------
@@ -303,7 +358,7 @@ class PortScanAgent(BaseAgent):
             try:
                 if action["action"] == "alert":
                     d = action["data"]
-                    self.alerter.send_alert(
+                    sent = self.alerter.send_alert(
                         severity=d["severity"],
                         title=f"Port Scan: {d['type'].replace('_', ' ').title()}",
                         details={
@@ -313,7 +368,9 @@ class PortScanAgent(BaseAgent):
                         },
                         agent_name=self.name,
                     )
-                    results["alerts_sent"] += 1
+                    if sent:
+                        results["alerts_sent"] += 1
+                        self._metrics.inc_alerts(d["severity"].name)
 
                 elif action["action"] == "escalate":
                     self.report_to_supervisor(action["data"])

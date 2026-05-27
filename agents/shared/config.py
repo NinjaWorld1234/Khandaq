@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 import yaml
 
@@ -71,10 +71,28 @@ class IRISConfig:
 class VLLMConfig:
     """vLLM connection settings. إعدادات اتصال محرك vLLM"""
     url: str = "http://localhost:8000/v1"
-    model: str = "MoonshotAI/Kimi-K2.6-Mini"
+    model: str = "Qwen/Qwen2.5-7B-Instruct-GGUF"
+    temperature: float = 0.2
+    max_tokens: int = 4096
+    api_key: str = "EMPTY"  # vLLM default
     timeout: int = 300
-    max_tokens: int = 8192
-    temperature: float = 0.1
+
+    # Different settings based on agent role
+    # إعدادات مختلفة حسب دور الوكيل
+    role_overrides: Dict[str, Dict[str, Any]] = field(
+        default_factory=lambda: {
+            "tactical": {"model": "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1", "url": "http://vllm-workers:8001/v1", "temperature": 0.2, "max_tokens": 4096},
+            "commander": {"model": "Qwen/Qwen2.5-7B-Instruct-GGUF", "url": "http://vllm-commander:8000/v1", "temperature": 0.1, "max_tokens": 8192},
+            "worker": {"model": "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1", "url": "http://vllm-workers:8001/v1", "temperature": 0.15, "max_tokens": 4096},
+        }
+    )
+
+    @classmethod
+    def create(cls, role: str) -> "VLLMConfig":
+        """Factory for default configs by role."""
+        defaults = cls().role_overrides
+        cfg = defaults.get(role, defaults["commander"])
+        return cls(**cfg)
 
 
 @dataclass(frozen=True)
@@ -227,8 +245,10 @@ class SOCConfig:
         self.wazuh = self._build_wazuh()
         self.misp = self._build_misp()
         self.iris = self._build_iris()
-        self.vllm_commander = self._build_vllm_commander()
-        self.vllm_worker = self._build_vllm_worker()
+        self.vllm_commander = self._build_vllm_config("vllm_commander", "commander")
+        self.vllm_tactical = self._build_vllm_config("vllm_tactical", "tactical")
+        self.vllm_router = self._build_vllm_config("vllm_router", "router")
+        self.vllm_worker = self._build_vllm_config("vllm_worker", "worker")
         self.redis = self._build_redis()
         self.alerting = self._build_alerting()
         self.thresholds = self._build_thresholds()
@@ -315,24 +335,17 @@ class SOCConfig:
             timeout=self._env("IRIS_TIMEOUT", s.get("timeout", 30), int),
         )
 
-    def _build_vllm_commander(self) -> VLLMConfig:
-        s = self._section("vllm_commander")
+    def _build_vllm_config(self, section: str, role: str) -> VLLMConfig:
+        s = self._section(section)
+        default_cfg = VLLMConfig.create(role)
         return VLLMConfig(
-            url=self._env("VLLM_COMMANDER_URL", s.get("url", "http://localhost:8000/v1")),
-            model=self._env("VLLM_COMMANDER_MODEL", s.get("model", "MoonshotAI/Kimi-K2.6-Mini")),
-            timeout=self._env("VLLM_COMMANDER_TIMEOUT", s.get("timeout", 300), int),
-            max_tokens=self._env("VLLM_COMMANDER_MAX_TOKENS", s.get("max_tokens", 8192), int),
-            temperature=self._env("VLLM_COMMANDER_TEMPERATURE", s.get("temperature", 0.1), float),
-        )
-
-    def _build_vllm_worker(self) -> VLLMConfig:
-        s = self._section("vllm_worker")
-        return VLLMConfig(
-            url=self._env("VLLM_WORKER_URL", s.get("url", "http://localhost:8001/v1")),
-            model=self._env("VLLM_WORKER_MODEL", s.get("model", "WhiteRabbitNeo/WhiteRabbitNeo-13B-v1")),
-            timeout=self._env("VLLM_WORKER_TIMEOUT", s.get("timeout", 120), int),
-            max_tokens=self._env("VLLM_WORKER_MAX_TOKENS", s.get("max_tokens", 4096), int),
-            temperature=self._env("VLLM_WORKER_TEMPERATURE", s.get("temperature", 0.2), float),
+            url=self._env(f"SOC_{section.upper()}_URL", s.get("url", default_cfg.url)),
+            model=self._env(f"SOC_{section.upper()}_MODEL", s.get("model", default_cfg.model)),
+            timeout=int(self._env(f"SOC_{section.upper()}_TIMEOUT", s.get("timeout", default_cfg.timeout), int)),
+            max_tokens=int(self._env(f"SOC_{section.upper()}_MAX_TOKENS",
+                           s.get("max_tokens", default_cfg.max_tokens), int)),
+            temperature=float(self._env(f"SOC_{section.upper()}_TEMPERATURE",
+                              s.get("temperature", default_cfg.temperature), float)),
         )
 
     def _build_redis(self) -> RedisConfig:
@@ -350,6 +363,13 @@ class SOCConfig:
         smtp_s = s.get("smtp", {})
         slack_s = s.get("slack", {})
         tg_s = s.get("telegram", {})
+
+        if not isinstance(smtp_s, dict):
+            smtp_s = {}
+        if not isinstance(slack_s, dict):
+            slack_s = {}
+        if not isinstance(tg_s, dict):
+            tg_s = {}
 
         smtp = SMTPConfig(
             host=self._env("SMTP_HOST", smtp_s.get("host", "localhost")),

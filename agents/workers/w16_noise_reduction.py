@@ -12,14 +12,13 @@ Reduces false positives and alert fatigue by:
 """
 
 import time
+import threading
 import logging
 import hashlib
-from typing import Dict, Any, List, Optional, Set, Tuple
+from typing import Dict, Any, List, Set
 from collections import defaultdict
 from datetime import datetime, timezone
 from shared.base_agent import BaseAgent
-from shared.config import SOCConfig
-from shared.alerter import Severity
 
 logger = logging.getLogger("W16-NoiseReduction")
 
@@ -39,11 +38,11 @@ BUSINESS_HOURS = range(7, 19)
 
 def _alert_fingerprint(alert: Dict[str, Any]) -> str:
     """Generate a deduplication fingerprint for an alert."""
-    rule_id = str(alert.get("rule", {}).get("id", "") if isinstance(alert.get("rule"), dict)
+    rule_id = str((alert.get("rule") or {}).get("id", "") if isinstance(alert.get("rule"), dict)
                   else alert.get("rule_id", ""))
-    host = str(alert.get("agent", {}).get("name", "") if isinstance(alert.get("agent"), dict)
+    host = str((alert.get("agent") or {}).get("name", "") if isinstance(alert.get("agent"), dict)
                else alert.get("host", "unknown"))
-    title = str(alert.get("title", alert.get("rule", {}).get("description", "")
+    title = str(alert.get("title") or ((alert.get("rule") or {}).get("description", "")
                 if isinstance(alert.get("rule"), dict) else ""))
     raw = f"{rule_id}:{host}:{title}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -81,6 +80,8 @@ class NoiseReductionAgent(BaseAgent):
         self._seen_fingerprints: Dict[str, float] = {}
         # Stats for supervisor reporting
         self._cycle_stats = {"total": 0, "deduped": 0, "suppressed": 0, "emitted": 0}
+        self._processed_feedback_ids: Dict[str, float] = {}
+        self._cache_lock = threading.Lock()
 
     def collect(self) -> Dict[str, Any]:
         """Fetch raw alerts and dismissed-alert feedback."""
@@ -89,7 +90,7 @@ class NoiseReductionAgent(BaseAgent):
             result["alerts"] = self.os_client.get_events_since(
                 "soc-alerts-*", minutes=1,
                 query={"bool": {"must": [{"exists": {"field": "title"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect alerts: %s", e)
@@ -97,7 +98,7 @@ class NoiseReductionAgent(BaseAgent):
             result["alerts"] += self.os_client.get_events_since(
                 "wazuh-alerts-*", minutes=1,
                 query={"bool": {"must": [{"exists": {"field": "rule.id"}}]}},
-                size=2000,
+                size=10000,
             )
         except Exception as e:
             logger.error("Failed to collect Wazuh alerts: %s", e)
@@ -106,7 +107,7 @@ class NoiseReductionAgent(BaseAgent):
             result["feedback"] = self.os_client.get_events_since(
                 "soc-alert-feedback", minutes=10,
                 query={"bool": {"must": [{"exists": {"field": "rule_id"}}]}},
-                size=500,
+                size=10000,
             )
         except Exception:
             pass  # Feedback index may not exist yet
@@ -120,24 +121,43 @@ class NoiseReductionAgent(BaseAgent):
 
         # --- Process analyst feedback to update FP rates ---
         for fb in data.get("feedback", []):
-            rule_id = str(fb.get("rule_id", ""))
-            disposition = fb.get("disposition", "").lower()
-            if rule_id:
-                self._fp_tracker[rule_id]["total"] += 1
-                if disposition in ("false_positive", "dismissed", "benign"):
-                    self._fp_tracker[rule_id]["false_positives"] += 1
+            try:
+                fb_id = str(fb.get("_id", fb.get("id", "")))
+                if not fb_id:
+                    fb_id = hashlib.sha256(str(fb).encode()).hexdigest()
+                
+                with self._cache_lock:
+                    if fb_id in self._processed_feedback_ids:
+                        continue
+                    self._processed_feedback_ids[fb_id] = now + 3600  # 1 hour memory
+                
+                rule_id = str(fb.get("rule_id", ""))
+                disposition = fb.get("disposition", "").lower()
+                if rule_id:
+                    if disposition in ("false_positive", "dismissed", "benign"):
+                        with self._cache_lock:
+                            self._fp_tracker[rule_id]["false_positives"] += 1
+            except Exception as e:
+                logger.warning("Error processing feedback: %s", e)
 
         # --- Check which rules should be suppressed ---
         for rule_id, stats in self._fp_tracker.items():
-            if stats["total"] >= FP_SAMPLE_THRESHOLD:
-                fp_rate = stats["false_positives"] / stats["total"]
-                if fp_rate >= FP_RATE_SUPPRESS and rule_id not in self._suppressed_rules:
-                    self._suppressed_rules.add(rule_id)
-                    logger.warning("Auto-suppressing rule %s (FP rate: %.1f%% over %d samples)",
-                                   rule_id, fp_rate * 100, stats["total"])
+            try:
+                if stats["total"] >= FP_SAMPLE_THRESHOLD:
+                    fp_rate = stats["false_positives"] / stats["total"]
+                    if fp_rate >= FP_RATE_SUPPRESS and rule_id not in self._suppressed_rules:
+                        with self._cache_lock:
 
-        # Prune expired fingerprints
-        self._seen_fingerprints = {fp: exp for fp, exp in self._seen_fingerprints.items() if exp > now}
+                            self._suppressed_rules.add(rule_id)
+                        logger.warning("Auto-suppressing rule %s (FP rate: %.1f%% over %d samples)",
+                                       rule_id, fp_rate * 100, stats["total"])
+            except Exception as e:
+                logger.warning("Error checking rule suppression for %s: %s", rule_id, e)
+
+        # Prune expired fingerprints and feedback
+        with self._cache_lock:
+            self._seen_fingerprints = {fp: exp for fp, exp in self._seen_fingerprints.items() if exp > now}
+            self._processed_feedback_ids = {k: exp for k, exp in self._processed_feedback_ids.items() if exp > now}
 
         # --- Process each alert ---
         stats = {"total": 0, "deduped": 0, "suppressed": 0, "emitted": 0}
@@ -145,41 +165,50 @@ class NoiseReductionAgent(BaseAgent):
         stats["total"] = len(alerts)
 
         for alert in alerts:
-            rule_id = _extract_rule_id(alert)
-            host = _extract_host(alert)
-            fingerprint = _alert_fingerprint(alert)
+            try:
+                rule_id = _extract_rule_id(alert)
+                host = _extract_host(alert)
+                fingerprint = _alert_fingerprint(alert)
 
-            # 1. Auto-suppress high-FP rules
-            if rule_id in self._suppressed_rules:
-                stats["suppressed"] += 1
-                continue
+                # 1. Auto-suppress high-FP rules (flag them instead of dropping)
+                is_suppressed = rule_id in self._suppressed_rules
+                if is_suppressed:
+                    stats["suppressed"] += 1
 
-            # 2. Deduplicate (same fingerprint within window)
-            if fingerprint in self._seen_fingerprints:
-                stats["deduped"] += 1
-                continue
-            self._seen_fingerprints[fingerprint] = now + DEDUP_WINDOW
+                # 2. Deduplicate (same fingerprint within window)
+                if fingerprint in self._seen_fingerprints:
+                    stats["deduped"] += 1
+                    continue
+                with self._cache_lock:
 
-            # 3. Track for FP analysis
-            self._fp_tracker[rule_id]["total"] += 1
+                    self._seen_fingerprints[fingerprint] = now + DEDUP_WINDOW
 
-            # 4. Priority scoring
-            base_severity = self._get_severity(alert)
-            adjusted = self._score_priority(base_severity, host, rule_id, current_hour)
+                # 3. Track for FP analysis
+                with self._cache_lock:
 
-            findings.append({
-                "type": "filtered_alert",
-                "original": alert,
-                "rule_id": rule_id,
-                "host": host,
-                "fingerprint": fingerprint,
-                "original_severity": base_severity,
-                "adjusted_severity": adjusted,
-                "fp_rate": self._get_fp_rate(rule_id),
-            })
-            stats["emitted"] += 1
+                    self._fp_tracker[rule_id]["total"] += 1
 
-        self._cycle_stats = stats
+                # 4. Priority scoring
+                base_severity = self._get_severity(alert)
+                adjusted = 0 if is_suppressed else self._score_priority(base_severity, host, rule_id, current_hour)
+
+                findings.append({
+                    "type": "filtered_alert",
+                    "original": alert,
+                    "rule_id": rule_id,
+                    "host": host,
+                    "fingerprint": fingerprint,
+                    "original_severity": base_severity,
+                    "adjusted_severity": adjusted,
+                    "fp_rate": self._get_fp_rate(rule_id),
+                })
+                stats["emitted"] += 1
+            except Exception as e:
+                logger.warning("Error processing alert: %s", e)
+
+        with self._cache_lock:
+
+            self._cycle_stats = stats
         if stats["total"] > 0:
             logger.info("Noise reduction: %d total → %d emitted (%d deduped, %d suppressed)",
                         stats["total"], stats["emitted"], stats["deduped"], stats["suppressed"])
@@ -259,7 +288,7 @@ class NoiseReductionAgent(BaseAgent):
                         "adjusted_severity": severity_names.get(f["adjusted_severity"], "LOW"),
                         "fp_rate": round(f["fp_rate"], 3),
                         "title": (f["original"].get("title", "")
-                                  or f["original"].get("rule", {}).get("description", "")),
+                                  or ((f["original"].get("rule") or {}).get("description", "") if isinstance(f["original"].get("rule"), dict) else "")),
                         "original_alert": f["original"],
                     }
                     batch.append(doc)
@@ -284,6 +313,9 @@ class NoiseReductionAgent(BaseAgent):
                     logger.warning("Bulk index had %d errors", len(errors))
             except Exception as e:
                 logger.error("Bulk index of filtered alerts failed: %s", e)
+                
+        self._events_processed += len(batch)
+        self._metrics.inc_events(len(batch))
 
         return results
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -66,6 +67,7 @@ class AdvancedFIMAgent(BaseAgent):
         # Cache of already-alerted file paths to reduce noise (path -> timestamp)
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown = 600  # 10-minute cooldown per unique file path
+        self._cache_lock = threading.Lock()
         # Whitelist of paths that change frequently (logs, caches)
         self._path_whitelist: Set[str] = set(
             self._agent_config.get("path_whitelist", [
@@ -90,7 +92,7 @@ class AdvancedFIMAgent(BaseAgent):
                 }
             }
             events = self.os_client.get_events_since(
-                index="wazuh-alerts-*", minutes=2, query=query, size=2000,
+                index="wazuh-alerts-*", minutes=2, query=query, size=10000,
             )
             logger.debug("Collected %d FIM events", len(events))
             return events
@@ -108,50 +110,61 @@ class AdvancedFIMAgent(BaseAgent):
         host_file_counts: Dict[str, int] = defaultdict(int)
 
         for event in data:
-            syscheck = event.get("syscheck", {})
-            file_path: str = syscheck.get("path", "").replace("\\", "\\").strip()
-            agent_name: str = event.get("agent", {}).get("name", "unknown")
-            change_type: str = syscheck.get("event", "modified")
-            path_lower = file_path.lower()
+            try:
+                syscheck = event.get("syscheck") or {}
+                file_path: str = syscheck.get("path", "").strip()
+                agent_obj = event.get("agent") or {}
+                agent_name: str = agent_obj.get("name", "unknown")
+                # إصلاح V02-SEC-HIGH-01: إضافة .lower() لمنع التهرب باستخدام أحرف كبيرة (Case Sensitivity Evasion)
+                change_type: str = syscheck.get("event", "modified").lower()
+                path_lower = file_path.lower()
 
-            if not file_path or self._is_whitelisted(path_lower):
-                continue
+                if not file_path or self._is_whitelisted(path_lower):
+                    continue
 
-            host_file_counts[agent_name] += 1
+                host_file_counts[agent_name] += 1
 
-            # Rule 1: Entropy increase (encryption / packing indicator)
-            self._check_entropy(syscheck, file_path, agent_name, findings)
+                # Rule 1: Entropy increase (encryption / packing indicator)
+                self._check_entropy(syscheck, file_path, agent_name, findings)
 
-            # Rule 2: Critical system binary modification
-            self._check_critical_binary(path_lower, file_path, agent_name, change_type, findings)
+                # Rule 2: Critical system binary modification
+                self._check_critical_binary(path_lower, file_path, agent_name, change_type, findings)
 
-            # Rule 3: Executable in unusual location
-            self._check_unusual_executable(syscheck, path_lower, file_path, agent_name, change_type, findings)
+                # Rule 3: Executable in unusual location
+                self._check_unusual_executable(syscheck, path_lower, file_path, agent_name, change_type, findings)
 
-            # Rule 5: Hidden file creation
-            self._check_hidden_file(syscheck, path_lower, file_path, agent_name, change_type, findings)
+                # Rule 5: Hidden file creation
+                self._check_hidden_file(syscheck, path_lower, file_path, agent_name, change_type, findings)
 
-            # Rule 6: Startup / cron / persistence modification
-            self._check_persistence(path_lower, file_path, agent_name, change_type, findings)
+                # Rule 6: Startup / cron / persistence modification
+                self._check_persistence(path_lower, file_path, agent_name, change_type, findings)
+            except Exception as e:
+                logger.warning("Error processing FIM event: %s", e)
 
         # Rule 4: Mass file modification (>50 files in 1 minute per host)
-        for host, count in host_file_counts.items():
-            baseline = self._host_baselines.get(host, 5.0)
-            if count >= _MASS_MOD_THRESHOLD and count > baseline * 5:
-                findings.append({
-                    "rule": "mass_file_modification",
-                    "severity": Severity.CRITICAL,
-                    "host": host,
-                    "file_count": count,
-                    "baseline": round(baseline, 1),
-                    "description": (
-                        f"Mass file modification on {host}: {count} files changed "
-                        f"(baseline ~{baseline:.0f}). Possible ransomware or wiper."
-                    ),
-                })
-            # Update rolling baseline: exponential moving average
-            alpha = 0.1
-            self._host_baselines[host] = alpha * count + (1 - alpha) * baseline
+        # إصلاح V2-LOGIC-LOW-01: Update baseline for ALL known hosts to ensure decay for inactive hosts
+        all_hosts = set(self._host_baselines.keys()).union(host_file_counts.keys())
+        for host in all_hosts:
+            try:
+                count = host_file_counts.get(host, 0)
+                baseline = self._host_baselines.get(host, 5.0)
+                if count >= _MASS_MOD_THRESHOLD and count > baseline * 5:
+                    findings.append({
+                        "rule": "mass_file_modification",
+                        "severity": Severity.CRITICAL,
+                        "host": host,
+                        "file_count": count,
+                        "baseline": round(baseline, 1),
+                        "description": (
+                            f"Mass file modification on {host}: {count} files changed "
+                            f"(baseline ~{baseline:.0f}). Possible ransomware or wiper."
+                        ),
+                    })
+                # Update rolling baseline: exponential moving average
+                alpha = 0.1
+                self._host_baselines[host] = alpha * count + (1 - alpha) * baseline
+            except Exception as e:
+                logger.warning("Error processing mass modification for host %s: %s", host, e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -165,7 +178,7 @@ class AdvancedFIMAgent(BaseAgent):
         """Detect sudden entropy jump indicating encryption or packing."""
         sha_after = syscheck.get("sha256_after", "")
         sha_before = syscheck.get("sha256_before", "")
-        diff_attrs = syscheck.get("changed_attributes", [])
+        syscheck.get("changed_attributes", [])
         # Wazuh sometimes reports md5/sha changes; we approximate entropy from size+hash
         size_after = syscheck.get("size_after")
         size_before = syscheck.get("size_before")
@@ -296,7 +309,9 @@ class AdvancedFIMAgent(BaseAgent):
                 if sent:
                     alerts_sent += 1
                     self._metrics.inc_alerts(f["severity"].name)
-                    self._alerted_cache[action["cache_key"]] = time.time()
+                    with self._cache_lock:
+
+                        self._alerted_cache[action["cache_key"]] = time.time()
             elif action["type"] == "escalate":
                 self.report_to_supervisor({
                     "type": "fim_escalation", "rule": f["rule"],
@@ -317,7 +332,9 @@ class AdvancedFIMAgent(BaseAgent):
 
         # Prune old cooldown entries
         cutoff = time.time() - self._alert_cooldown * 2
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         return {"alerts_sent": alerts_sent, "escalations": escalations,
                 "incidents_logged": incidents_logged}

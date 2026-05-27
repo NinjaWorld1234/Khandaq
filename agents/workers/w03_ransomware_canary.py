@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import time
+import threading
 from typing import Any, Optional
 
 from shared.alerter import Severity
@@ -109,7 +110,9 @@ class RansomwareCanaryAgent(BaseAgent):
             config=config,
             supervisor_channel="soc:endpoint-supervisor",
         )
+        # Wazuh Client for Active Response
         self._wazuh: Optional[WazuhClient] = None
+        self._cache_lock = threading.Lock()
 
         # Canary directories – configurable via constructor or config file
         # مجلدات ملفات الطُعم - قابلة للتخصيص
@@ -134,9 +137,11 @@ class RansomwareCanaryAgent(BaseAgent):
 
     @property
     def wazuh(self) -> WazuhClient:
-        """Lazy-initialize Wazuh client."""
+        """Lazy init Wazuh Client."""
         if self._wazuh is None:
-            self._wazuh = WazuhClient(self.config)
+            with self._cache_lock:
+                if self._wazuh is None:
+                    self._wazuh = WazuhClient(self.config)
         return self._wazuh
 
     # ------------------------------------------------------------------
@@ -168,6 +173,13 @@ class RansomwareCanaryAgent(BaseAgent):
             )
 
             try:
+                # إصلاح V3-SEC-CRIT-01: Ensure file is writable before opening if it exists
+                if os.path.exists(canary_path):
+                    try:
+                        os.chmod(canary_path, 0o600)
+                    except OSError:
+                        pass
+
                 with open(canary_path, "w", encoding="utf-8") as fh:
                     fh.write(sentinel)
 
@@ -225,7 +237,7 @@ class RansomwareCanaryAgent(BaseAgent):
                 }
                 data["fim_events"] = self.os_client.get_events_since(
                     index=WAZUH_ALERTS_INDEX, minutes=lookback,
-                    query=fim_query, size=50,
+                    query=fim_query, size=10000,
                 )
             except Exception as exc:
                 logger.error("FIM canary query failed: %s", exc)
@@ -256,7 +268,7 @@ class RansomwareCanaryAgent(BaseAgent):
             }
             data["shadow_copy_events"] = self.os_client.get_events_since(
                 index=WAZUH_ALERTS_INDEX, minutes=lookback,
-                query=shadow_query, size=50,
+                query=shadow_query, size=10000,
             )
         except Exception as exc:
             logger.error("Shadow copy query failed: %s", exc)
@@ -281,7 +293,7 @@ class RansomwareCanaryAgent(BaseAgent):
             }
             data["boot_config_events"] = self.os_client.get_events_since(
                 index=WAZUH_ALERTS_INDEX, minutes=lookback,
-                query=boot_query, size=50,
+                query=boot_query, size=10000,
             )
         except Exception as exc:
             logger.error("Boot config query failed: %s", exc)
@@ -291,7 +303,7 @@ class RansomwareCanaryAgent(BaseAgent):
             proc_query = {"term": {"data.win.system.eventID": "1"}}
             data["process_events"] = self.os_client.get_events_since(
                 index=WAZUH_ALERTS_INDEX, minutes=lookback,
-                query=proc_query, size=200,
+                query=proc_query, size=10000,
             )
         except Exception as exc:
             logger.error("Process event query failed: %s", exc)
@@ -308,7 +320,7 @@ class RansomwareCanaryAgent(BaseAgent):
             }
             data["extension_events"] = self.os_client.get_events_since(
                 index=WAZUH_ALERTS_INDEX, minutes=lookback,
-                query=ext_query, size=200,
+                query=ext_query, size=10000,
             )
         except Exception as exc:
             logger.error("Extension change query failed: %s", exc)
@@ -327,56 +339,78 @@ class RansomwareCanaryAgent(BaseAgent):
 
         # --- Canary FIM alerts ---
         for event in data.get("fim_events", []):
-            canary_path = event.get("syscheck", {}).get("path", "unknown")
-            agent_info = event.get("agent", {})
-            findings.append({
-                "type": "canary_modified",
-                "canary_path": canary_path,
-                "hostname": agent_info.get("name", "unknown"),
-                "wazuh_agent_id": agent_info.get("id", "unknown"),
-                "raw_event": event,
-            })
+            try:
+                syscheck_obj = event.get("syscheck") or {}
+                canary_path = syscheck_obj.get("path", "unknown")
+                agent_info = event.get("agent") or {}
+                findings.append({
+                    "type": "canary_modified",
+                    "canary_path": canary_path,
+                    "hostname": agent_info.get("name", "unknown"),
+                    "wazuh_agent_id": agent_info.get("id", "unknown"),
+                    "raw_event": event,
+                })
+            except Exception as e:
+                logger.warning("Error processing canary fim event: %s", e)
 
         # --- Shadow copy deletion ---
         for event in data.get("shadow_copy_events", []):
-            agent_info = event.get("agent", {})
-            cmd = event.get("data", {}).get("win", {}).get("eventdata", {}).get("commandLine", "N/A")
-            findings.append({
-                "type": "shadow_copy_deleted",
-                "hostname": agent_info.get("name", "unknown"),
-                "command_line": cmd,
-                "raw_event": event,
-            })
+            try:
+                agent_info = event.get("agent") or {}
+                data_obj = event.get("data") or {}
+                win_obj = data_obj.get("win") or {}
+                ev_obj = win_obj.get("eventdata") or {}
+                cmd = ev_obj.get("commandLine", "N/A")
+                findings.append({
+                    "type": "shadow_copy_deleted",
+                    "hostname": agent_info.get("name", "unknown"),
+                    "command_line": cmd,
+                    "raw_event": event,
+                })
+            except Exception as e:
+                logger.warning("Error processing shadow copy event: %s", e)
 
         # --- Boot config changes ---
         for event in data.get("boot_config_events", []):
-            agent_info = event.get("agent", {})
-            cmd = event.get("data", {}).get("win", {}).get("eventdata", {}).get("commandLine", "N/A")
-            findings.append({
-                "type": "boot_config_tampered",
-                "hostname": agent_info.get("name", "unknown"),
-                "command_line": cmd,
-                "raw_event": event,
-            })
+            try:
+                agent_info = event.get("agent") or {}
+                data_obj = event.get("data") or {}
+                win_obj = data_obj.get("win") or {}
+                ev_obj = win_obj.get("eventdata") or {}
+                cmd = ev_obj.get("commandLine", "N/A")
+                findings.append({
+                    "type": "boot_config_tampered",
+                    "hostname": agent_info.get("name", "unknown"),
+                    "command_line": cmd,
+                    "raw_event": event,
+                })
+            except Exception as e:
+                logger.warning("Error processing boot config event: %s", e)
 
         # --- Known ransomware process names ---
         for event in data.get("process_events", []):
-            ed = event.get("data", {}).get("win", {}).get("eventdata", {})
-            process_name = ed.get("image", "")
-            original_name = ed.get("originalFileName", "")
-            command_line = ed.get("commandLine", "")
-            check_strings = [s for s in [process_name, original_name, command_line] if s]
-            for pattern in RANSOMWARE_PROCESS_PATTERNS:
-                if any(pattern.search(s) for s in check_strings):
-                    findings.append({
-                        "type": "ransomware_process",
-                        "hostname": event.get("agent", {}).get("name", "unknown"),
-                        "process_name": process_name,
-                        "command_line": command_line,
-                        "matched_pattern": pattern.pattern,
-                        "raw_event": event,
-                    })
-                    break
+            try:
+                data_obj = event.get("data") or {}
+                win_obj = data_obj.get("win") or {}
+                ed = win_obj.get("eventdata") or {}
+                process_name = ed.get("image", "")
+                original_name = ed.get("originalFileName", "")
+                command_line = ed.get("commandLine", "")
+                check_strings = [s for s in [process_name, original_name, command_line] if s]
+                for pattern in RANSOMWARE_PROCESS_PATTERNS:
+                    if any(pattern.search(s) for s in check_strings):
+                        agent_obj = event.get("agent") or {}
+                        findings.append({
+                            "type": "ransomware_process",
+                            "hostname": agent_obj.get("name", "unknown"),
+                            "process_name": process_name,
+                            "command_line": command_line,
+                            "matched_pattern": pattern.pattern,
+                            "raw_event": event,
+                        })
+                        break
+            except Exception as e:
+                logger.warning("Error processing ransomware process event: %s", e)
 
         # --- Mass extension changes ---
         # Reset counter window every 5 minutes
@@ -385,20 +419,27 @@ class RansomwareCanaryAgent(BaseAgent):
             self._extension_change_window_start = time.time()
 
         for event in data.get("extension_events", []):
-            hostname = event.get("agent", {}).get("name", "unknown")
-            self._extension_change_counts[hostname] = (
-                self._extension_change_counts.get(hostname, 0) + 1
-            )
+            try:
+                agent_obj = event.get("agent") or {}
+                hostname = agent_obj.get("name", "unknown")
+                self._extension_change_counts[hostname] = (
+                    self._extension_change_counts.get(hostname, 0) + 1
+                )
+            except Exception as e:
+                logger.warning("Error processing extension event: %s", e)
 
         for hostname, count in list(self._extension_change_counts.items()):
-            if count >= self._extension_change_threshold:
-                findings.append({
-                    "type": "mass_extension_change",
-                    "hostname": hostname,
-                    "change_count": count,
-                    "threshold": self._extension_change_threshold,
-                })
-                self._extension_change_counts[hostname] = 0  # reset after detection
+            try:
+                if count >= self._extension_change_threshold:
+                    findings.append({
+                        "type": "mass_extension_change",
+                        "hostname": hostname,
+                        "change_count": count,
+                        "threshold": self._extension_change_threshold,
+                    })
+                    self._extension_change_counts[hostname] = 0  # reset after detection
+            except Exception as e:
+                logger.warning("Error processing extension counts: %s", e)
 
         return findings
 

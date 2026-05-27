@@ -1,3 +1,4 @@
+import threading
 """
 SOC Worker Agent W27 — Playbook Executor
 Executes predefined response playbooks based on alert type.
@@ -6,7 +7,7 @@ Each playbook is a sequence of action steps tracked in soc-playbook-runs.
 
 import logging
 import hashlib
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime, timezone
 from shared.base_agent import BaseAgent
 from shared.alerter import Severity
@@ -71,7 +72,7 @@ class PlaybookExecutorAgent(BaseAgent):
         }
         try:
             events = self.os_client.get_events_since(
-                index=PENDING_INDEX, minutes=2, query=query, size=50,
+                index=PENDING_INDEX, minutes=2, query=query, size=10000,
             )
             logger.info("Collected %d pending playbook triggers", len(events))
             return events
@@ -85,25 +86,33 @@ class PlaybookExecutorAgent(BaseAgent):
     def analyze(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         findings: List[Dict[str, Any]] = []
         for alert in data:
-            alert_type = alert.get("alert_type", "")
-            if alert_type not in PLAYBOOKS:
-                continue
-            raw = f"{alert_type}:{alert.get('agent', {}).get('id', '')}:{alert.get('@timestamp', '')}"
-            run_id = hashlib.sha256(raw.encode()).hexdigest()[:16]
-            if run_id in self._recent_run_ids:
-                continue
-            self._recent_run_ids.add(run_id)
-            findings.append({
-                "run_id": run_id,
-                "alert_type": alert_type,
-                "playbook_steps": PLAYBOOKS[alert_type],
-                "source_alert": alert,
-                "host": alert.get("agent", {}).get("name", "unknown"),
-                "target_ip": alert.get("data", {}).get("srcip", ""),
-            })
+            try:
+                alert_type = alert.get("alert_type", "")
+                if alert_type not in PLAYBOOKS:
+                    continue
+                raw = f"{alert_type}:{(alert.get('agent') or {}).get('id', '')}:{alert.get('@timestamp', '')}"
+                run_id = hashlib.sha256(raw.encode()).hexdigest()[:16]
+                if run_id in self._recent_run_ids:
+                    continue
+                self._recent_run_ids.add(run_id)
+                findings.append({
+                    "run_id": run_id,
+                    "alert_type": alert_type,
+                    "playbook_steps": PLAYBOOKS[alert_type],
+                    "source_alert": alert,
+                    "host": (alert.get("agent") or {}).get("name", "unknown"),
+                    "target_ip": (alert.get("data") or {}).get("srcip", ""),
+                })
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error analyzing alert: %s", e)
         # cap memory set
         if len(self._recent_run_ids) > 5000:
-            self._recent_run_ids = set(list(self._recent_run_ids)[-2500:])
+            with self._cache_lock:
+
+                self._recent_run_ids = set(list(self._recent_run_ids)[-2500:])
+        self._cache_lock = threading.Lock()
         return findings
 
     # ------------------------------------------------------------------
@@ -112,14 +121,17 @@ class PlaybookExecutorAgent(BaseAgent):
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = []
         for finding in findings:
-            actions.append({
-                "action": "execute_playbook",
-                "run_id": finding["run_id"],
-                "alert_type": finding["alert_type"],
-                "steps": finding["playbook_steps"],
-                "host": finding["host"],
-                "target_ip": finding["target_ip"],
-            })
+            try:
+                actions.append({
+                    "action": "execute_playbook",
+                    "run_id": finding["run_id"],
+                    "alert_type": finding["alert_type"],
+                    "steps": finding["playbook_steps"],
+                    "host": finding["host"],
+                    "target_ip": finding["target_ip"],
+                })
+            except Exception as e:
+                logger.warning("Error deciding playbook action: %s", e)
         return actions
 
     # ------------------------------------------------------------------
@@ -128,53 +140,58 @@ class PlaybookExecutorAgent(BaseAgent):
     def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
         results = {"playbooks_executed": 0, "steps_completed": 0, "steps_failed": 0}
         for action in actions:
-            run_id = action["run_id"]
-            step_results: List[Dict[str, Any]] = []
-            overall_status = "completed"
-
-            for idx, step in enumerate(action["steps"], start=1):
-                ts = datetime.now(timezone.utc).isoformat()
-                step_status, step_msg = self._execute_step(
-                    step["action"], action["host"], action["target_ip"],
-                )
-                step_results.append({
-                    "step_number": idx,
-                    "action": step["action"],
-                    "description": step["description"],
-                    "status": step_status,
-                    "message": step_msg,
-                    "timestamp": ts,
-                })
-                if step_status == "success":
-                    results["steps_completed"] += 1
-                else:
-                    results["steps_failed"] += 1
-                    overall_status = "partial_failure"
-
-            run_doc = {
-                "@timestamp": datetime.now(timezone.utc).isoformat(),
-                "run_id": run_id,
-                "alert_type": action["alert_type"],
-                "host": action["host"],
-                "status": overall_status,
-                "total_steps": len(action["steps"]),
-                "steps": step_results,
-            }
             try:
-                self.os_client.index_document(PLAYBOOK_INDEX, run_doc, doc_id=run_id)
-            except Exception as exc:
-                logger.error("Failed to index playbook run %s: %s", run_id, exc)
+                run_id = action["run_id"]
+                step_results: List[Dict[str, Any]] = []
+                overall_status = "completed"
 
-            sev = Severity.HIGH if overall_status == "partial_failure" else Severity.MEDIUM
-            self.alerter.send_alert(
-                severity=sev,
-                title=f"Playbook '{action['alert_type']}' {overall_status}",
-                details={"run_id": run_id, "host": action["host"],
-                         "steps_ok": results["steps_completed"],
-                         "steps_fail": results["steps_failed"]},
-                agent_name=self.name,
-            )
-            results["playbooks_executed"] += 1
+                for idx, step in enumerate(action["steps"], start=1):
+                    ts = datetime.now(timezone.utc).isoformat()
+                    step_status, step_msg = self._execute_step(
+                        step["action"], action["host"], action["target_ip"],
+                    )
+                    step_results.append({
+                        "step_number": idx,
+                        "action": step["action"],
+                        "description": step["description"],
+                        "status": step_status,
+                        "message": step_msg,
+                        "timestamp": ts,
+                    })
+                    if step_status == "success":
+                        results["steps_completed"] += 1
+                    else:
+                        results["steps_failed"] += 1
+                        overall_status = "partial_failure"
+
+                run_doc = {
+                    "@timestamp": datetime.now(timezone.utc).isoformat(),
+                    "run_id": run_id,
+                    "alert_type": action["alert_type"],
+                    "host": action["host"],
+                    "status": overall_status,
+                    "total_steps": len(action["steps"]),
+                    "steps": step_results,
+                }
+                try:
+                    self.os_client.index_document(PLAYBOOK_INDEX, run_doc, doc_id=run_id)
+                except Exception as exc:
+                    logger.error("Failed to index playbook run %s: %s", run_id, exc)
+
+                sev = Severity.HIGH if overall_status == "partial_failure" else Severity.MEDIUM
+                sent = self.alerter.send_alert(
+                    severity=sev,
+                    title=f"Playbook '{action['alert_type']}' {overall_status}",
+                    details={"run_id": run_id, "host": action["host"],
+                             "steps_ok": results["steps_completed"],
+                             "steps_fail": results["steps_failed"]},
+                    agent_name=self.name,
+                )
+                if sent:
+                    self._metrics.inc_alerts(sev.name)
+                results["playbooks_executed"] += 1
+            except Exception as e:
+                logger.warning("Error acting on playbook action: %s", e)
 
         if results["playbooks_executed"]:
             logger.info("Executed %d playbooks (%d steps ok, %d failed)",

@@ -5,11 +5,13 @@ from aiohttp import web
 import redis
 import json
 import datetime
+import os
 
 # Setup Redis connection (pointing to the Broker in the Khandaq Core)
 # In production, this will route through the WireGuard tunnel
+REDIS_HOST = os.environ.get("REDIS_HOST", "redis-ai")
 try:
-    redis_client = redis.Redis(host='redis-broker', port=6379, db=0, socket_timeout=2)
+    redis_client = redis.Redis(host=REDIS_HOST, port=6379, db=0, socket_timeout=2)
 except Exception as e:
     print(f"[-] Redis connection failed: {e}")
     redis_client = None

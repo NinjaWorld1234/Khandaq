@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -76,6 +77,7 @@ class AnomalousIdentityAgent(BaseAgent):
         # Cooldown cache
         self._alerted_cache: Dict[str, float] = {}
         self._alert_cooldown = 600
+        self._cache_lock = threading.Lock()
 
         # Service account patterns
         self._service_prefixes = tuple(
@@ -88,6 +90,8 @@ class AnomalousIdentityAgent(BaseAgent):
 
     @staticmethod
     def _extract(doc: Dict[str, Any], dotted_key: str) -> Optional[str]:
+        if dotted_key in doc:
+            return str(doc[dotted_key])
         current: Any = doc
         for key in dotted_key.split("."):
             if isinstance(current, dict):
@@ -159,18 +163,18 @@ class AnomalousIdentityAgent(BaseAgent):
             logon_success = self.os_client.get_events_since(
                 index=self._alert_index, minutes=3,
                 query={"match": {"data.win.system.eventID": "4624"}},
-                size=5000,
+                size=10000,
             )
             logon_failure = self.os_client.get_events_since(
                 index=self._alert_index, minutes=3,
                 query={"match": {"data.win.system.eventID": "4625"}},
-                size=3000,
+                size=10000,
             )
             # Resource access events (4663 = object access)
             resource_events = self.os_client.get_events_since(
                 index=self._alert_index, minutes=3,
                 query={"match": {"data.win.system.eventID": "4663"}},
-                size=3000,
+                size=10000,
             )
             # VPN/remote access events
             vpn_events = self.os_client.get_events_since(
@@ -179,7 +183,7 @@ class AnomalousIdentityAgent(BaseAgent):
                     {"match": {"data.win.system.eventID": "6272"}},
                     {"match": {"data.win.system.eventID": "6278"}},
                 ]}},
-                size=1000,
+                size=10000,
             )
             return {
                 "logon_success": logon_success,
@@ -210,114 +214,126 @@ class AnomalousIdentityAgent(BaseAgent):
         # Track failures per user for this cycle
         failure_counts: Dict[str, int] = defaultdict(int)
         for event in logon_failure:
-            user = self._extract(event, "data.win.eventdata.targetUserName") or ""
-            if user and not user.endswith("$"):
-                failure_counts[user] += 1
+            try:
+                user = self._extract(event, "data.win.eventdata.targetUserName") or ""
+                if user and not user.endswith("$"):
+                    failure_counts[user] += 1
+            except Exception as e:
+                logger.warning("Error processing logon failure: %s", e)
 
         # Process successful logons
         for event in logon_success:
-            user = self._extract(event, "data.win.eventdata.targetUserName") or ""
-            src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
-            logon_type = self._extract(event, "data.win.eventdata.logonType") or ""
-            timestamp_str = self._extract(event, "timestamp") or ""
-
-            if not user or user.endswith("$") or user.upper() in ("SYSTEM", "ANONYMOUS LOGON"):
-                continue
-
-            profile = self._get_profile(user)
-            anomalies: List[str] = []
-            risk_added = 0.0
-
-            # Parse hour from event timestamp
             try:
-                event_hour = datetime.fromisoformat(
-                    timestamp_str.replace("Z", "+00:00")
-                ).hour
-            except (ValueError, AttributeError):
-                event_hour = datetime.now(timezone.utc).hour
+                user = self._extract(event, "data.win.eventdata.targetUserName") or ""
+                src_ip = self._extract(event, "data.win.eventdata.ipAddress") or ""
+                logon_type = self._extract(event, "data.win.eventdata.logonType") or ""
+                timestamp_str = self._extract(event, "timestamp") or ""
 
-            # --- Anomaly 1: Unusual hour ---
-            if not self._is_in_learning(profile) and profile["total_logins"] > 10:
-                hour_total = sum(profile["login_hours"].values())
-                hour_pct = profile["login_hours"].get(event_hour, 0) / max(hour_total, 1)
-                if hour_pct < 0.02:  # less than 2% of historical logins at this hour
-                    anomalies.append(f"unusual_login_hour_{event_hour:02d}")
-                    risk_added += _POINTS_UNUSUAL_HOUR
+                if not user or user.endswith("$") or user.upper() in ("SYSTEM", "ANONYMOUS LOGON"):
+                    continue
 
-            # --- Anomaly 2: New IP range ---
-            if src_ip and src_ip not in ("-", "::1", "127.0.0.1"):
-                ip_range = self._ip_to_range(src_ip)
-                if not self._is_in_learning(profile) and ip_range not in profile["source_ip_ranges"]:
-                    anomalies.append(f"new_ip_range:{ip_range}")
-                    risk_added += _POINTS_NEW_IP_RANGE
-                profile["source_ip_ranges"].add(ip_range)
+                profile = self._get_profile(user)
+                anomalies: List[str] = []
+                risk_added = 0.0
 
-            # --- Anomaly 3: Service account interactive login ---
-            if profile["is_service_account"] and logon_type in ("2", "10", "11"):
-                anomalies.append(f"service_account_interactive_logon_type_{logon_type}")
-                risk_added += _POINTS_SERVICE_INTERACTIVE
-                profile["interactive_logon_count"] += 1
+                # Parse hour from event timestamp
+                try:
+                    event_hour = datetime.fromisoformat(
+                        timestamp_str.replace("Z", "+00:00")
+                    ).hour
+                except (ValueError, AttributeError):
+                    event_hour = datetime.now(timezone.utc).hour
 
-            # --- Anomaly 4: High failure count preceding success ---
-            if failure_counts.get(user, 0) >= 5:
-                anomalies.append(f"multiple_failures_then_success:{failure_counts[user]}")
-                risk_added += _POINTS_MULTIPLE_FAILURES
+                # --- Anomaly 1: Unusual hour ---
+                if not self._is_in_learning(profile) and profile["total_logins"] > 10:
+                    hour_total = sum(profile["login_hours"].values())
+                    hour_pct = profile["login_hours"].get(event_hour, 0) / max(hour_total, 1)
+                    if hour_pct < 0.02:  # less than 2% of historical logins at this hour
+                        anomalies.append(f"unusual_login_hour_{event_hour:02d}")
+                        risk_added += _POINTS_UNUSUAL_HOUR
 
-            # Update profile
-            profile["login_hours"][event_hour] += 1
-            profile["total_logins"] += 1
+                # --- Anomaly 2: New IP range ---
+                if src_ip and src_ip not in ("-", "::1", "127.0.0.1"):
+                    ip_range = self._ip_to_range(src_ip)
+                    if not self._is_in_learning(profile) and ip_range not in profile["source_ip_ranges"]:
+                        anomalies.append(f"new_ip_range:{ip_range}")
+                        risk_added += _POINTS_NEW_IP_RANGE
+                    profile["source_ip_ranges"].add(ip_range)
 
-            # Record finding if anomalies detected
-            if anomalies and risk_added > 0:
-                new_score = self._add_risk(user, risk_added)
-                severity = self._score_to_severity(new_score)
-                findings.append({
-                    "pattern": "anomalous_identity",
-                    "user": user,
-                    "source_ip": src_ip,
-                    "anomalies": anomalies,
-                    "risk_points_added": risk_added,
-                    "risk_score": round(new_score, 1),
-                    "severity": severity,
-                    "in_learning": self._is_in_learning(profile),
-                    "description": (
-                        f"User '{user}' anomalies: {', '.join(anomalies)}. "
-                        f"Risk score: {new_score:.0f}/100"
-                    ),
-                })
+                # --- Anomaly 3: Service account interactive login ---
+                if profile["is_service_account"] and logon_type in ("2", "10", "11"):
+                    anomalies.append(f"service_account_interactive_logon_type_{logon_type}")
+                    risk_added += _POINTS_SERVICE_INTERACTIVE
+                    profile["interactive_logon_count"] += 1
+
+                # --- Anomaly 4: High failure count preceding success ---
+                if failure_counts.get(user, 0) >= 5:
+                    anomalies.append(f"multiple_failures_then_success:{failure_counts[user]}")
+                    risk_added += _POINTS_MULTIPLE_FAILURES
+
+                # Update profile
+                profile["login_hours"][event_hour] += 1
+                profile["total_logins"] += 1
+
+                # Record finding if anomalies detected
+                if anomalies and risk_added > 0:
+                    new_score = self._add_risk(user, risk_added)
+                    severity = self._score_to_severity(new_score)
+                    findings.append({
+                        "pattern": "anomalous_identity",
+                        "user": user,
+                        "source_ip": src_ip,
+                        "anomalies": anomalies,
+                        "risk_points_added": risk_added,
+                        "risk_score": round(new_score, 1),
+                        "severity": severity,
+                        "in_learning": self._is_in_learning(profile),
+                        "description": (
+                            f"User '{user}' anomalies: {', '.join(anomalies)}. "
+                            f"Risk score: {new_score:.0f}/100"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error processing logon success: %s", e)
 
         # Process resource access anomalies
         resources_per_user: Dict[str, Set[str]] = defaultdict(set)
         for event in resource_events:
-            user = self._extract(event, "data.win.eventdata.subjectUserName") or ""
-            obj_name = self._extract(event, "data.win.eventdata.objectName") or ""
-            if user and obj_name and not user.endswith("$"):
-                resources_per_user[user].add(obj_name)
+            try:
+                user = self._extract(event, "data.win.eventdata.subjectUserName") or ""
+                obj_name = self._extract(event, "data.win.eventdata.objectName") or ""
+                if user and obj_name and not user.endswith("$"):
+                    resources_per_user[user].add(obj_name)
+            except Exception as e:
+                logger.warning("Error processing resource event: %s", e)
 
         for user, resources in resources_per_user.items():
-            profile = self._get_profile(user)
-            if self._is_in_learning(profile):
+            try:
+                profile = self._get_profile(user)
+                if self._is_in_learning(profile):
+                    profile["resources"].update(resources)
+                    continue
+                new_resources = resources - profile["resources"]
+                if len(new_resources) >= 5:
+                    risk_added = _POINTS_NEW_RESOURCE * min(len(new_resources) / 5, 3.0)
+                    new_score = self._add_risk(user, risk_added)
+                    severity = self._score_to_severity(new_score)
+                    findings.append({
+                        "pattern": "new_resource_access",
+                        "user": user,
+                        "new_resource_count": len(new_resources),
+                        "sample_resources": sorted(new_resources)[:10],
+                        "risk_points_added": round(risk_added, 1),
+                        "risk_score": round(new_score, 1),
+                        "severity": severity,
+                        "description": (
+                            f"User '{user}' accessed {len(new_resources)} previously "
+                            f"unseen resources. Risk score: {new_score:.0f}/100"
+                        ),
+                    })
                 profile["resources"].update(resources)
-                continue
-            new_resources = resources - profile["resources"]
-            if len(new_resources) >= 5:
-                risk_added = _POINTS_NEW_RESOURCE * min(len(new_resources) / 5, 3.0)
-                new_score = self._add_risk(user, risk_added)
-                severity = self._score_to_severity(new_score)
-                findings.append({
-                    "pattern": "new_resource_access",
-                    "user": user,
-                    "new_resource_count": len(new_resources),
-                    "sample_resources": sorted(new_resources)[:10],
-                    "risk_points_added": round(risk_added, 1),
-                    "risk_score": round(new_score, 1),
-                    "severity": severity,
-                    "description": (
-                        f"User '{user}' accessed {len(new_resources)} previously "
-                        f"unseen resources. Risk score: {new_score:.0f}/100"
-                    ),
-                })
-            profile["resources"].update(resources)
+            except Exception as e:
+                logger.warning("Error evaluating resource anomalies: %s", e)
 
         if findings:
             logger.warning("Detected %d identity anomaly finding(s)", len(findings))
@@ -333,30 +349,34 @@ class AnomalousIdentityAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            if finding.get("in_learning"):
-                continue  # suppress alerts during learning period
+            try:
+                if finding.get("in_learning"):
+                    continue  # suppress alerts during learning period
 
-            score = finding.get("risk_score", 0)
-            if score < _MEDIUM_THRESHOLD:
-                continue
+                score = finding.get("risk_score", 0)
+                if score < _MEDIUM_THRESHOLD:
+                    continue
 
-            key = f"{finding['pattern']}:{finding['user']}"
-            last = self._alerted_cache.get(key, 0.0)
-            if now - last < self._alert_cooldown:
-                continue
+                key = f"{finding['pattern']}:{finding['user']}"
+                with self._cache_lock:
+                    last = self._alerted_cache.get(key, 0.0)
+                if now - last < self._alert_cooldown:
+                    continue
 
-            actions.append({
-                "type": "alert",
-                "severity": finding["severity"],
-                "title": f"Anomalous Identity: {finding['user']}",
-                "details": {k: v for k, v in finding.items() if k != "severity"},
-                "cooldown_key": key,
-            })
-            actions.append({"type": "log_incident", "finding": finding})
-            actions.append({"type": "store_profile", "user": finding["user"]})
+                actions.append({
+                    "type": "alert",
+                    "severity": finding["severity"],
+                    "title": f"Anomalous Identity: {finding['user']}",
+                    "details": {k: v for k, v in finding.items() if k != "severity"},
+                    "cooldown_key": key,
+                })
+                actions.append({"type": "log_incident", "finding": finding})
+                actions.append({"type": "store_profile", "user": finding["user"]})
 
-            if finding["severity"] >= Severity.CRITICAL:
-                actions.append({"type": "escalate", "finding": finding})
+                if finding["severity"] >= Severity.CRITICAL:
+                    actions.append({"type": "escalate", "finding": finding})
+            except Exception as e:
+                logger.warning("Error deciding anomalous finding action: %s", e)
 
         return actions
 
@@ -370,70 +390,76 @@ class AnomalousIdentityAgent(BaseAgent):
         incidents_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["cooldown_key"]] = time.time()
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        with self._cache_lock:
+                            self._alerted_cache[action["cooldown_key"]] = time.time()
 
-            elif action["type"] == "log_incident":
-                try:
+                elif action["type"] == "log_incident":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-identity-incidents",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "pattern": finding["pattern"],
+                                "severity": finding["severity"].name,
+                                "user": finding["user"],
+                                "risk_score": finding["risk_score"],
+                                "anomalies": finding.get("anomalies", []),
+                                "description": finding["description"],
+                            },
+                        )
+                        incidents_logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log identity incident: %s", exc)
+
+                elif action["type"] == "store_profile":
+                    try:
+                        user = action["user"]
+                        profile = self._profiles.get(user, {})
+                        self.os_client.index_document(
+                            index=self._profile_index,
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "user": user,
+                                "risk_score": round(self._decayed_score(user), 1),
+                                "total_logins": profile.get("total_logins", 0),
+                                "known_ip_ranges": len(profile.get("source_ip_ranges", set())),
+                                "known_resources": len(profile.get("resources", set())),
+                                "is_service_account": profile.get("is_service_account", False),
+                            },
+                        )
+                    except Exception as exc:
+                        logger.error("Failed to store user profile: %s", exc)
+
+                elif action["type"] == "escalate":
                     finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-identity-incidents",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "pattern": finding["pattern"],
-                            "severity": finding["severity"].name,
-                            "user": finding["user"],
-                            "risk_score": finding["risk_score"],
-                            "anomalies": finding.get("anomalies", []),
-                            "description": finding["description"],
-                        },
-                    )
-                    incidents_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log identity incident: %s", exc)
-
-            elif action["type"] == "store_profile":
-                try:
-                    user = action["user"]
-                    profile = self._profiles.get(user, {})
-                    self.os_client.index_document(
-                        index=self._profile_index,
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "user": user,
-                            "risk_score": round(self._decayed_score(user), 1),
-                            "total_logins": profile.get("total_logins", 0),
-                            "known_ip_ranges": len(profile.get("source_ip_ranges", set())),
-                            "known_resources": len(profile.get("resources", set())),
-                            "is_service_account": profile.get("is_service_account", False),
-                        },
-                    )
-                except Exception as exc:
-                    logger.error("Failed to store user profile: %s", exc)
-
-            elif action["type"] == "escalate":
-                finding = action["finding"]
-                self.report_to_supervisor({
-                    "type": "identity_anomaly_critical",
-                    "user": finding["user"],
-                    "risk_score": finding["risk_score"],
-                    "anomalies": finding.get("anomalies", []),
-                    "description": finding["description"],
-                })
+                    self.report_to_supervisor({
+                        "type": "identity_anomaly_critical",
+                        "user": finding["user"],
+                        "risk_score": finding["risk_score"],
+                        "anomalies": finding.get("anomalies", []),
+                        "description": finding["description"],
+                    })
+            except Exception as e:
+                logger.warning("Error executing anomalous identity action: %s", e)
 
         # Prune cooldown cache
         cutoff = time.time() - self._alert_cooldown * 3
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         if alerts_sent:
             self.report_to_supervisor({

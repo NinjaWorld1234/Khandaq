@@ -1,0 +1,37 @@
+[
+    {
+        "timestamp": 1622548800,
+        "event_type": "auth_failure",
+        "src_ip": "192.168.1.150",
+        "dst_ip": "10.0.0.5",
+        "user": "admin_test",
+        "message": "Multiple failed login attempts detected."
+    },
+    {
+        "timestamp": 1622548860,
+        "event_type": "auth_success",
+        "src_ip": "192.168.1.150",
+        "dst_ip": "10.0.0.5",
+        "user": "admin_test",
+        "message": "Successful login after multiple failures."
+    },
+    {
+        "timestamp": 1622552400,
+        "event_type": "process_creation",
+        "src_ip": "10.0.0.5",
+        "dst_ip": "10.0.0.5",
+        "user": "admin_test",
+        "process_name": "powershell.exe",
+        "command_line": "powershell.exe -enc JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAEkATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtACgAWwBDAG8AbgB2AGUAcgB0AF0AOgA6AEYAcgBvAG0AQgBhAHMAZQA2ADQAUwB0AHIAaQBuAGcAKA...",
+        "message": "Suspicious encoded PowerShell command executed."
+    },
+    {
+        "timestamp": 1622552460,
+        "event_type": "network_connection",
+        "src_ip": "10.0.0.5",
+        "dst_ip": "10.0.0.10",
+        "dst_port": 445,
+        "user": "admin_test",
+        "message": "Lateral movement attempt via SMB detected."
+    }
+]

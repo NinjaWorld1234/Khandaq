@@ -195,6 +195,94 @@
       ],
       "title": "Memory Usage",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 9
+      },
+      "id": 100,
+      "panels": [],
+      "title": "AI & LLM Observability",
+      "type": "row"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 10
+      },
+      "id": 101,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95 Duration (s)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(llm_request_duration_seconds_sum[5m])) / sum(rate(llm_request_duration_seconds_count[5m]))",
+          "legendFormat": "Avg Duration (s)",
+          "refId": "B"
+        }
+      ],
+      "title": "LLM Request Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 10
+      },
+      "id": 102,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(llm_tokens_used_total[5m])) by (model)",
+          "legendFormat": "{{model}} Tokens/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "LLM Token Usage Rate",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
@@ -212,5 +300,5 @@
   "timezone": "",
   "title": "Khandaq SOC Telemetry",
   "uid": "khandaq_soc_001",
-  "version": 1
+  "version": 2
 }

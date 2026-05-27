@@ -1,128 +1,118 @@
+import json
 import logging
+import threading
 from typing import Dict, Any, List, Optional
 from shared.base_agent import BaseAgent
-from shared.alerter import Severity
 from shared.config import SOCConfig
+from shared.ai_client import AIClient
+from config.system_prompts import MISTRAL_ROUTER_PROMPT
 
 logger = logging.getLogger("NetworkSupervisor")
+
 
 class NetworkSupervisor(BaseAgent):
     def __init__(self, config: Optional[SOCConfig] = None):
         super().__init__(
-            name="NetworkSupervisor",
-            description="Supervises network-focused agents and correlates events",
+            name="NetworkSupervisor_Mistral",
+            description="Supervises network agents and uses Mistral AI for context compression and routing",
             interval_seconds=10,
             config=config,
             supervisor_channel="soc:network-supervisor"
         )
-        self.managed_workers = ["W06_DNSTunneling", "W07_C2Beaconing", "W08_DataExfiltration"]
-        self.recent_alerts = [] # Keep a sliding window of alerts in memory
+        self.recent_alerts: list[dict] = []  # Keep a sliding window of alerts in memory
+        self._lock = threading.Lock()
+        self.ai_client = AIClient(role="router", config=config)
+        self._cache_lock = threading.Lock()
 
     def collect(self) -> List[Dict[str, Any]]:
         # Supervisor mostly reacts to sub-agent messages via pub/sub, not polling,
         # but we use collect to process the internal buffer of received alerts.
-        alerts_to_process = self.recent_alerts.copy()
-        self.recent_alerts = [] # Clear the buffer
+        with self._lock:
+            alerts_to_process = self.recent_alerts.copy()
+            with self._cache_lock:
+
+                self.recent_alerts.clear()  # Clear the buffer safely
         return alerts_to_process
 
     def analyze(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        findings = []
         if not data:
-            return findings
+            return []
 
-        # Basic correlation logic
-        dns_alerts = [a for a in data if "dns" in a.get("type", "").lower() or a.get("agent_source") == "W06_DNSTunneling"]
-        c2_alerts = [a for a in data if "c2" in a.get("type", "").lower() or a.get("agent_source") == "W07_C2Beaconing"]
-        exfil_alerts = [a for a in data if "exfiltration" in a.get("type", "").lower() or "transfer" in a.get("type", "").lower() or a.get("agent_source") == "W08_DataExfiltration"]
+        # Convert the batch of alerts into a JSON string for Mistral
+        try:
+            alerts_json = json.dumps(data, default=str)
+        except Exception as e:
+            logger.error(f"Failed to serialize alerts for Mistral: {e}")
+            return []
 
-        # Rule 1: DNS Tunneling + C2 Beaconing to same IP = CRITICAL
-        for dns in dns_alerts:
-            dns_ip = dns.get("src_ip")
-            for c2 in c2_alerts:
-                if c2.get("src_ip") == dns_ip:
-                    findings.append({
-                        "type": "confirmed_c2_activity",
-                        "severity": Severity.CRITICAL,
-                        "src_ip": dns_ip,
-                        "dst_ip": c2.get("dst_ip"),
-                        "details": f"Correlated DNS Tunneling and C2 Beaconing from {dns_ip}"
-                    })
+        prompt = f"Analyze the following batch of network security alerts:\n```json\n{alerts_json}\n```"
 
-        # Rule 2: Exfiltration + C2 = Data theft in progress
-        for exfil in exfil_alerts:
-            ex_ip = exfil.get("src_ip")
-            for c2 in c2_alerts:
-                if c2.get("src_ip") == ex_ip:
-                    findings.append({
-                        "type": "data_theft_in_progress",
-                        "severity": Severity.CRITICAL,
-                        "src_ip": ex_ip,
-                        "dst_ip": exfil.get("dst_ip"),
-                        "details": f"Correlated Exfiltration and C2 Beaconing from {ex_ip} - active data theft"
-                    })
+        logger.info(f"Sending {len(data)} alerts to Mistral Router for compression and routing...")
+        try:
+            response = self.ai_client.generate(prompt, system_prompt=MISTRAL_ROUTER_PROMPT, json_mode=True)
+        except Exception as e:
+            logger.error(f"Mistral generation failed: {e}")
+            return []
 
-        # Forward individual high-severity alerts to commander anyway
-        for alert in data:
-            if alert.get("severity") in [Severity.HIGH, Severity.CRITICAL]:
-                findings.append(alert)
+        parsed_response = self.ai_client.extract_json(response)
 
-        return findings
+        # Attach the original data so it can be forwarded
+        parsed_response["original_alerts_count"] = len(data)
+        parsed_response["raw_data"] = data
+
+        return [parsed_response]
 
     def decide(self, findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         actions = []
         for finding in findings:
-            if finding.get("type") in ["confirmed_c2_activity", "data_theft_in_progress"]:
-                # Auto-block C2 IP
-                actions.append({
-                    "action": "block_ip",
-                    "ip": finding.get("dst_ip")
-                })
-                # Escalate to commander
-                actions.append({
-                    "action": "escalate",
-                    "data": finding
-                })
-            elif finding.get("severity") in [Severity.HIGH, Severity.CRITICAL]:
-                # Just escalate
-                actions.append({
-                    "action": "escalate",
-                    "data": finding
-                })
+            try:
+                if finding.get("error"):
+                    logger.error(f"Mistral Routing Error: {finding}")
+                    continue
+    
+                route = finding.get("route_to", "discard").lower()
+                if route == "tactical":
+                    actions.append({"action": "route_tactical", "data": finding})
+                elif route == "commander":
+                    actions.append({"action": "route_commander", "data": finding})
+                else:
+                    logger.info(f"Mistral discarded batch. Summary: {finding.get('summary')}")
+            except Exception as e:
+                logger.warning("Error processing finding in decide: %s", e)
         return actions
 
     def act(self, actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results = {"escalated": 0, "blocked": 0}
+        results = {"routed_tactical": 0, "routed_commander": 0}
         for action in actions:
-            if action["action"] == "escalate":
-                f = action["data"]
-                self.redis_bus.publish("soc:supervisor-to-commander", {
-                    "supervisor": self.name,
-                    "type": f.get("type"),
-                    "severity": f.get("severity").name if hasattr(f.get("severity"), "name") else str(f.get("severity")),
-                    "host": f.get("src_ip", ""),
-                    "details": f.get("details", "")
-                }, sender=self.name, message_type="escalation")
-                results["escalated"] += 1
-            elif action["action"] == "block_ip":
+            try:
+                payload = action.get("data", {})
+                action_type = action.get("action")
                 try:
-                    ip = action.get("ip")
-                    if ip:
-                        # Assuming Wazuh client has active response capability
-                        # self.wazuh_client.trigger_active_response("firewall-drop", agent_id="all", custom_args=[ip])
-                        logger.warning(f"ACTION: Blocking IP {ip} network-wide")
-                        results["blocked"] += 1
+                    if action_type == "route_tactical":
+                        self.redis_bus.publish("soc:tactical-analysis", payload, sender=self.name,
+                                               message_type="compressed_tactical")
+                        results["routed_tactical"] += 1
+                    elif action_type == "route_commander":
+                        self.redis_bus.publish("soc:supervisor-to-commander", payload,
+                                               sender=self.name, message_type="compressed_strategic")
+                        results["routed_commander"] += 1
                 except Exception as e:
-                    logger.error(f"Failed to block IP: {e}")
+                    logger.error(f"Failed to route action {action_type} to redis: {e}")
+            except Exception as e:
+                logger.warning("Error processing action in act: %s", e)
         return results
 
     def handle_worker_message(self, message: dict):
         try:
-            source = message.get("source_agent")
-            if source in self.managed_workers:
-                logger.info(f"Received alert from {source}")
-                alert_data = message.get("data", {})
-                alert_data["agent_source"] = source
-                self.recent_alerts.append(alert_data)
+            payload = message.get("payload") or {}
+            source = message.get("sender") or payload.get("agent_name", "unknown")
+            logger.info(f"Received alert from {source}")
+            alert_data = payload
+            alert_data["agent_source"] = source
+            with self._lock:
+                with self._cache_lock:
+
+                    self.recent_alerts.append(alert_data)
         except Exception as e:
             logger.error(f"Failed parsing worker message: {e}")
 
@@ -131,6 +121,7 @@ class NetworkSupervisor(BaseAgent):
         self.redis_bus.subscribe(self.supervisor_channel, self.handle_worker_message)
         # Call base run_loop
         super().run_loop()
+
 
 if __name__ == "__main__":
     agent = NetworkSupervisor()

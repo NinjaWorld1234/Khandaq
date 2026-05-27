@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -101,6 +102,7 @@ class YaraScannerAgent(BaseAgent):
         self._alert_cooldown: int = 900  # 15 min cooldown per file+rule
         self._total_scanned: int = 0
         self._total_matched: int = 0
+        self._cache_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Collect: fetch FIM syscheck events from OpenSearch
@@ -117,7 +119,7 @@ class YaraScannerAgent(BaseAgent):
                 index=self._alert_index,
                 minutes=self._scan_window_min,
                 query=query,
-                size=500,
+                size=10000,
             )
             logger.info("Collected %d FIM events for YARA scanning", len(events))
             return events
@@ -133,33 +135,36 @@ class YaraScannerAgent(BaseAgent):
         """Scan each FIM event against all compiled YARA rules."""
         findings: list[dict[str, Any]] = []
         for event in data:
-            self._total_scanned += 1
-            syscheck = event.get("syscheck", {})
-            file_path = syscheck.get("path", "")
-            diff_content = syscheck.get("diff", "")
-            event_text = syscheck.get("event", "")
-            # Build a combined text blob to scan
-            scan_text = f"{file_path} {diff_content} {event_text}"
-            rule_desc = event.get("rule", {}).get("description", "")
-            scan_text += f" {rule_desc}"
+            try:
+                self._total_scanned += 1
+                syscheck = event.get("syscheck", {})
+                file_path = syscheck.get("path", "")
+                diff_content = syscheck.get("diff", "")
+                event_text = syscheck.get("event", "").lower()
+                # Build a combined text blob to scan
+                scan_text = f"{file_path} {diff_content} {event_text}"
+                rule_desc = (event.get("rule") or {}).get("description", "")
+                scan_text += f" {rule_desc}"
 
-            for rule in _COMPILED_RULES:
-                for compiled_re in rule["_compiled"]:
-                    match = compiled_re.search(scan_text)
-                    if match:
-                        self._total_matched += 1
-                        findings.append({
-                            "rule_name": rule["name"],
-                            "family": rule["family"],
-                            "severity": rule["severity"],
-                            "matched_pattern": match.group(0),
-                            "file_path": file_path,
-                            "sha256": syscheck.get("sha256_after", "N/A"),
-                            "agent_id": event.get("agent", {}).get("id", "N/A"),
-                            "agent_name": event.get("agent", {}).get("name", "N/A"),
-                            "timestamp": event.get("@timestamp", ""),
-                        })
-                        break  # one match per rule per event is enough
+                for rule in _COMPILED_RULES:
+                    for compiled_re in rule["_compiled"]:
+                        match = compiled_re.search(scan_text)
+                        if match:
+                            self._total_matched += 1
+                            findings.append({
+                                "rule_name": rule["name"],
+                                "family": rule["family"],
+                                "severity": rule["severity"],
+                                "matched_pattern": match.group(0),
+                                "file_path": file_path,
+                                "sha256": syscheck.get("sha256_after", "N/A"),
+                                "agent_id": (event.get("agent") or {}).get("id", "N/A"),
+                                "agent_name": (event.get("agent") or {}).get("name", "N/A"),
+                                "timestamp": event.get("@timestamp", ""),
+                            })
+                            break  # one match per rule per event is enough
+            except Exception as e:
+                logger.warning("Error processing YARA scan for event: %s", e)
 
         self._events_processed += len(data)
         self._metrics.inc_events(len(data))
@@ -214,7 +219,17 @@ class YaraScannerAgent(BaseAgent):
                 if sent:
                     alerts_sent += 1
                     self._metrics.inc_alerts(action["severity"].name)
-                    self._alerted_cache[action["cache_key"]] = time.time()
+                    with self._cache_lock:
+
+                        self._alerted_cache[action["cache_key"]] = time.time()
+
+                    # Forward to supervisor for potential correlation and escalation
+                    self.report_to_supervisor({
+                        "type": "yara_match_alert",
+                        "severity": action["severity"],
+                        "agent": action["details"].get("endpoint_agent", ""),
+                        "details": action["details"]
+                    })
             elif action["type"] == "log_incident":
                 try:
                     f = action["finding"]
@@ -233,7 +248,9 @@ class YaraScannerAgent(BaseAgent):
 
         # Prune cooldown cache
         cutoff = time.time() - self._alert_cooldown * 2
-        self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._alerted_cache = {k: v for k, v in self._alerted_cache.items() if v > cutoff}
 
         if alerts_sent:
             self.report_to_supervisor({

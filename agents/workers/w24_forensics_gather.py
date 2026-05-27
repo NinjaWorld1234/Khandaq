@@ -21,7 +21,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from shared.alerter import Severity
 from shared.base_agent import BaseAgent
 from shared.config import SOCConfig
 
@@ -54,17 +53,20 @@ class ForensicsGatherAgent(BaseAgent):
         try:
             query = {"match": {"severity": "CRITICAL"}}
             alerts = self.os_client.get_events_since(
-                index=_ALERTS_INDEX, minutes=5, query=query, size=50,
+                index=_ALERTS_INDEX, minutes=5, query=query, size=10000,
             )
             # Deduplicate against already-processed alerts
             new_alerts = []
             for alert in alerts:
-                alert_id = alert.get("_id", hashlib.md5(
-                    str(alert.get("@timestamp", "") + alert.get("title", "")).encode()
-                ).hexdigest()[:12])
-                if alert_id not in self._processed_alert_ids:
-                    alert["_dedup_id"] = alert_id
-                    new_alerts.append(alert)
+                try:
+                    alert_id = alert.get("_id", hashlib.sha256(
+                        str(alert.get("@timestamp", "") + alert.get("title", "")).encode()
+                    ).hexdigest()[:12])
+                    if alert_id not in self._processed_alert_ids:
+                        alert["_dedup_id"] = alert_id
+                        new_alerts.append(alert)
+                except Exception as e:
+                    logger.warning("Error processing alert deduplication: %s", e)
             return {"critical_alerts": new_alerts}
         except Exception as exc:
             logger.error("Forensics collect failed: %s", exc)
@@ -79,32 +81,36 @@ class ForensicsGatherAgent(BaseAgent):
             return findings
 
         for alert in alerts:
-            host = (
-                alert.get("agent", {}).get("name")
-                or alert.get("details", {}).get("host")
-                or alert.get("host", "unknown")
-            )
-            case_id = alert.get("case_id", "UNLINKED")
-            window_min = _EVIDENCE_WINDOW_HOURS * 60
+            try:
+                host = (
+                    (alert.get("agent") or {}).get("name")
+                    or (alert.get("details") or {}).get("host")
+                    or alert.get("host", "unknown")
+                )
+                case_id = alert.get("case_id", "UNLINKED")
+                window_min = _EVIDENCE_WINDOW_HOURS * 60
 
-            evidence: Dict[str, Any] = {
-                "process_tree": self._gather_process_tree(host, window_min),
-                "network_connections": self._gather_network_connections(host, window_min),
-                "file_modifications": self._gather_file_modifications(host, window_min),
-                "login_history": self._gather_login_history(host, window_min),
-                "dns_queries": self._gather_dns_queries(host, window_min),
-            }
+                evidence: Dict[str, Any] = {
+                    "process_tree": self._gather_process_tree(host, window_min),
+                    "network_connections": self._gather_network_connections(host, window_min),
+                    "file_modifications": self._gather_file_modifications(host, window_min),
+                    "login_history": self._gather_login_history(host, window_min),
+                    "dns_queries": self._gather_dns_queries(host, window_min),
+                }
 
-            total_items = sum(len(v) for v in evidence.values() if isinstance(v, list))
-            self._events_processed += total_items
+                total_items = sum(len(v) for v in evidence.values() if isinstance(v, list))
+                self._events_processed += total_items
+                self._metrics.inc_events(total_items)
 
-            findings.append({
-                "host": host,
-                "case_id": case_id,
-                "alert": alert,
-                "evidence": evidence,
-                "evidence_count": total_items,
-            })
+                findings.append({
+                    "host": host,
+                    "case_id": case_id,
+                    "alert": alert,
+                    "evidence": evidence,
+                    "evidence_count": total_items,
+                })
+            except Exception as e:
+                logger.warning("Error gathering evidence for alert: %s", e)
 
         if findings:
             logger.info("Gathered forensic evidence for %d hosts", len(findings))
@@ -118,20 +124,21 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"data.win.system.eventID": "1"}},
             ]}}
             events = self.os_client.get_events_since(
-                index=_WAZUH_INDEX, minutes=window_min, query=query, size=500,
+                index=_WAZUH_INDEX, minutes=window_min, query=query, size=10000,
             )
-            return [
-                {
+            results = []
+            for e in events:
+                ed = ((e.get("data") or {}).get("win") or {}).get("eventdata") or {}
+                results.append({
                     "timestamp": e.get("@timestamp"),
-                    "image": e.get("data", {}).get("win", {}).get("eventdata", {}).get("image"),
-                    "parent_image": e.get("data", {}).get("win", {}).get("eventdata", {}).get("parentImage"),
-                    "command_line": e.get("data", {}).get("win", {}).get("eventdata", {}).get("commandLine"),
-                    "pid": e.get("data", {}).get("win", {}).get("eventdata", {}).get("processId"),
-                    "ppid": e.get("data", {}).get("win", {}).get("eventdata", {}).get("parentProcessId"),
-                    "user": e.get("data", {}).get("win", {}).get("eventdata", {}).get("user"),
-                }
-                for e in events
-            ]
+                    "image": ed.get("image"),
+                    "parent_image": ed.get("parentImage"),
+                    "command_line": ed.get("commandLine"),
+                    "pid": ed.get("processId"),
+                    "ppid": ed.get("parentProcessId"),
+                    "user": ed.get("user"),
+                })
+            return results
         except Exception as exc:
             logger.error("Process tree gather failed for %s: %s", host, exc)
             return []
@@ -145,10 +152,10 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"data.win.system.eventID": "3"}},
             ]}}
             events = self.os_client.get_events_since(
-                index=_WAZUH_INDEX, minutes=window_min, query=query, size=300,
+                index=_WAZUH_INDEX, minutes=window_min, query=query, size=10000,
             )
             for e in events:
-                ed = e.get("data", {}).get("win", {}).get("eventdata", {})
+                ed = ((e.get("data") or {}).get("win") or {}).get("eventdata") or {}
                 results.append({
                     "timestamp": e.get("@timestamp"),
                     "source": "sysmon",
@@ -167,7 +174,7 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"host.keyword": host}},
             ], "minimum_should_match": 1}}
             zeek_events = self.os_client.get_events_since(
-                index=_ZEEK_INDEX, minutes=window_min, query=zeek_query, size=300,
+                index=_ZEEK_INDEX, minutes=window_min, query=zeek_query, size=10000,
             )
             for e in zeek_events:
                 results.append({
@@ -191,16 +198,17 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"data.win.system.eventID": "11"}},
             ]}}
             events = self.os_client.get_events_since(
-                index=_WAZUH_INDEX, minutes=window_min, query=query, size=300,
+                index=_WAZUH_INDEX, minutes=window_min, query=query, size=10000,
             )
-            return [
-                {
+            results = []
+            for e in events:
+                ed = ((e.get("data") or {}).get("win") or {}).get("eventdata") or {}
+                results.append({
                     "timestamp": e.get("@timestamp"),
-                    "target_filename": e.get("data", {}).get("win", {}).get("eventdata", {}).get("targetFilename"),
-                    "image": e.get("data", {}).get("win", {}).get("eventdata", {}).get("image"),
-                }
-                for e in events
-            ]
+                    "target_filename": ed.get("targetFilename"),
+                    "image": ed.get("image"),
+                })
+            return results
         except Exception as exc:
             logger.error("File modification gather failed for %s: %s", host, exc)
             return []
@@ -215,18 +223,20 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"data.win.system.eventID": "4625"}},
             ], "minimum_should_match": 1}}
             events = self.os_client.get_events_since(
-                index=_WAZUH_INDEX, minutes=window_min, query=query, size=200,
+                index=_WAZUH_INDEX, minutes=window_min, query=query, size=10000,
             )
-            return [
-                {
+            results = []
+            for e in events:
+                sys = ((e.get("data") or {}).get("win") or {}).get("system") or {}
+                ed = ((e.get("data") or {}).get("win") or {}).get("eventdata") or {}
+                results.append({
                     "timestamp": e.get("@timestamp"),
-                    "event_id": e.get("data", {}).get("win", {}).get("system", {}).get("eventID"),
-                    "user": e.get("data", {}).get("dstuser"),
-                    "src_ip": e.get("data", {}).get("srcip"),
-                    "logon_type": e.get("data", {}).get("win", {}).get("eventdata", {}).get("logonType"),
-                }
-                for e in events
-            ]
+                    "event_id": sys.get("eventID"),
+                    "user": (e.get("data") or {}).get("dstuser"),
+                    "src_ip": (e.get("data") or {}).get("srcip"),
+                    "logon_type": ed.get("logonType"),
+                })
+            return results
         except Exception as exc:
             logger.error("Login history gather failed for %s: %s", host, exc)
             return []
@@ -240,14 +250,15 @@ class ForensicsGatherAgent(BaseAgent):
                 {"match": {"data.win.system.eventID": "22"}},
             ]}}
             events = self.os_client.get_events_since(
-                index=_WAZUH_INDEX, minutes=window_min, query=query, size=300,
+                index=_WAZUH_INDEX, minutes=window_min, query=query, size=10000,
             )
             for e in events:
+                ed = ((e.get("data") or {}).get("win") or {}).get("eventdata") or {}
                 results.append({
                     "timestamp": e.get("@timestamp"),
                     "source": "sysmon",
-                    "query_name": e.get("data", {}).get("win", {}).get("eventdata", {}).get("queryName"),
-                    "query_result": e.get("data", {}).get("win", {}).get("eventdata", {}).get("queryResults"),
+                    "query_name": ed.get("queryName"),
+                    "query_result": ed.get("queryResults"),
                 })
         except Exception as exc:
             logger.error("DNS gather (Sysmon) failed for %s: %s", host, exc)
@@ -265,44 +276,47 @@ class ForensicsGatherAgent(BaseAgent):
         now = datetime.now(timezone.utc).isoformat()
 
         for action in actions:
-            finding = action["finding"]
-            report_id = hashlib.sha256(
-                f"{finding['host']}:{now}".encode()
-            ).hexdigest()[:16]
-
-            report = {
-                "@timestamp": now,
-                "report_id": report_id,
-                "case_id": finding["case_id"],
-                "host": finding["host"],
-                "evidence_count": finding["evidence_count"],
-                "evidence": finding["evidence"],
-                "chain_of_custody": {
-                    "collected_by": self.name,
-                    "collected_at": now,
-                    "method": "automated_opensearch_query",
-                    "integrity_hash": hashlib.sha256(
-                        str(finding["evidence"]).encode()
-                    ).hexdigest(),
-                },
-                "trigger_alert": {
-                    "title": finding["alert"].get("title", "N/A"),
-                    "severity": finding["alert"].get("severity", "CRITICAL"),
-                    "timestamp": finding["alert"].get("@timestamp", now),
-                },
-            }
             try:
-                self.os_client.index_document(
-                    index=_FORENSICS_INDEX, document=report, doc_id=report_id,
-                )
-                stored += 1
-                dedup_id = finding["alert"].get("_dedup_id")
-                if dedup_id:
-                    self._processed_alert_ids.add(dedup_id)
-                logger.info("Stored forensics report %s for host %s (%d items)",
-                            report_id, finding["host"], finding["evidence_count"])
-            except Exception as exc:
-                logger.error("Failed to store forensics report: %s", exc)
+                finding = action["finding"]
+                report_id = hashlib.sha256(
+                    f"{finding['host']}:{now}".encode()
+                ).hexdigest()[:16]
+
+                report = {
+                    "@timestamp": now,
+                    "report_id": report_id,
+                    "case_id": finding["case_id"],
+                    "host": finding["host"],
+                    "evidence_count": finding["evidence_count"],
+                    "evidence": finding["evidence"],
+                    "chain_of_custody": {
+                        "collected_by": self.name,
+                        "collected_at": now,
+                        "method": "automated_opensearch_query",
+                        "integrity_hash": hashlib.sha256(
+                            str(finding["evidence"]).encode()
+                        ).hexdigest(),
+                    },
+                    "trigger_alert": {
+                        "title": finding["alert"].get("title", "N/A"),
+                        "severity": finding["alert"].get("severity", "CRITICAL"),
+                        "timestamp": finding["alert"].get("@timestamp", now),
+                    },
+                }
+                try:
+                    self.os_client.index_document(
+                        index=_FORENSICS_INDEX, document=report, doc_id=report_id,
+                    )
+                    stored += 1
+                    dedup_id = finding["alert"].get("_dedup_id")
+                    if dedup_id:
+                        self._processed_alert_ids.add(dedup_id)
+                    logger.info("Stored forensics report %s for host %s (%d items)",
+                                report_id, finding["host"], finding["evidence_count"])
+                except Exception as exc:
+                    logger.error("Failed to store forensics report: %s", exc)
+            except Exception as e:
+                logger.warning("Error acting on action: %s", e)
 
         # Prune cache
         if len(self._processed_alert_ids) > self._max_cache:

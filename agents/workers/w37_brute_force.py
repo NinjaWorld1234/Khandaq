@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -87,13 +88,16 @@ class BruteForceAgent(BaseAgent):
 
         # State: track already-alerted combinations to reduce noise
         self._alerted_cache: dict[str, float] = {}
+        self._cache_lock = threading.Lock()
         self._alert_cooldown = 600  # Don't re-alert same pattern for 10 min
 
     @property
     def wazuh(self) -> WazuhClient:
         """Lazy-initialize Wazuh client."""
         if self._wazuh is None:
-            self._wazuh = WazuhClient(self.config)
+            with self._lock:  # reusing base agent lock
+                if self._wazuh is None:
+                    self._wazuh = WazuhClient(self.config)
         return self._wazuh
 
     # ------------------------------------------------------------------
@@ -150,7 +154,7 @@ class BruteForceAgent(BaseAgent):
             index=self._alert_index,
             minutes=window_minutes,
             query=self._build_logon_failure_query(),
-            size=5000,
+            size=10000,
         )
 
     def _query_logon_failures_aggregated(
@@ -184,7 +188,8 @@ class BruteForceAgent(BaseAgent):
         result = self.os_client.aggregate(
             index=self._alert_index, aggs=aggs, query=query
         )
-        buckets = result.get("by_source_ip", {}).get("buckets", [])
+        by_source_ip = result.get("by_source_ip") or {}
+        buckets = by_source_ip.get("buckets", [])
         return {b["key"]: b["doc_count"] for b in buckets}
 
     def _query_distributed_aggregated(
@@ -228,11 +233,13 @@ class BruteForceAgent(BaseAgent):
         result = self.os_client.aggregate(
             index=self._alert_index, aggs=aggs, query=query
         )
-        user_buckets = result.get("by_target_user", {}).get("buckets", [])
+        by_target_user = result.get("by_target_user") or {}
+        user_buckets = by_target_user.get("buckets", [])
         output: dict[str, list[str]] = {}
         for ub in user_buckets:
             account = ub["key"]
-            ips = [sb["key"] for sb in ub.get("unique_sources", {}).get("buckets", [])]
+            unique_sources = ub.get("unique_sources") or {}
+            ips = [sb["key"] for sb in unique_sources.get("buckets", [])]
             output[account] = ips
         return output
 
@@ -278,13 +285,15 @@ class BruteForceAgent(BaseAgent):
         result = self.os_client.aggregate(
             index=self._alert_index, aggs=aggs, query=query
         )
-        ip_buckets = result.get("by_source_ip", {}).get("buckets", [])
+        by_source_ip = result.get("by_source_ip") or {}
+        ip_buckets = by_source_ip.get("buckets", [])
         output: dict[str, list[str]] = {}
         for ib in ip_buckets:
             src_ip = ib["key"]
+            unique_targets = ib.get("unique_targets") or {}
             accounts = [
                 tb["key"]
-                for tb in ib.get("unique_targets", {}).get("buckets", [])
+                for tb in unique_targets.get("buckets", [])
             ]
             output[src_ip] = accounts
         return output
@@ -309,87 +318,104 @@ class BruteForceAgent(BaseAgent):
         fast_events = data.get("fast_events", [])
         ip_counts: dict[str, int] = defaultdict(int)
         for event in fast_events:
-            src_ip = self._extract_nested(event, self._src_ip_field)
-            if src_ip and src_ip not in self._ip_whitelist:
-                ip_counts[src_ip] += 1
+            try:
+                src_ip = self._extract_nested(event, self._src_ip_field)
+                if src_ip and src_ip not in self._ip_whitelist:
+                    ip_counts[src_ip] += 1
+                self._events_processed += 1
+                self._metrics.inc_events(1)
+            except Exception as e:
+                logger.warning("Error processing fast event: %s", e)
 
         for ip, count in ip_counts.items():
-            if count >= self._fast_threshold:
-                findings.append({
-                    "pattern": "fast_brute_force",
-                    "severity": Severity.HIGH,
-                    "source_ip": ip,
-                    "failure_count": count,
-                    "window": f"{self._fast_window_min} min",
-                    "threshold": self._fast_threshold,
-                    "description": (
-                        f"Fast brute force: {count} login failures from {ip} "
-                        f"in {self._fast_window_min} minutes"
-                    ),
-                })
+            try:
+                if count >= self._fast_threshold:
+                    findings.append({
+                        "pattern": "fast_brute_force",
+                        "severity": Severity.HIGH,
+                        "source_ip": ip,
+                        "failure_count": count,
+                        "window": f"{self._fast_window_min} min",
+                        "threshold": self._fast_threshold,
+                        "description": (
+                            f"Fast brute force: {count} login failures from {ip} "
+                            f"in {self._fast_window_min} minutes"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating fast brute force: %s", e)
 
         # --- Pattern 2: Slow/Low-and-Slow Brute Force ---
         slow_agg = data.get("slow_agg", {})
         for ip, count in slow_agg.items():
-            if ip in self._ip_whitelist:
-                continue
-            if count >= self._slow_threshold:
-                findings.append({
-                    "pattern": "slow_brute_force",
-                    "severity": Severity.MEDIUM,
-                    "source_ip": ip,
-                    "failure_count": count,
-                    "window": f"{self._slow_window_hours} hours",
-                    "threshold": self._slow_threshold,
-                    "description": (
-                        f"Low-and-slow brute force: {count} login failures from {ip} "
-                        f"over {self._slow_window_hours} hours"
-                    ),
-                })
+            try:
+                if ip in self._ip_whitelist:
+                    continue
+                if count >= self._slow_threshold:
+                    findings.append({
+                        "pattern": "slow_brute_force",
+                        "severity": Severity.MEDIUM,
+                        "source_ip": ip,
+                        "failure_count": count,
+                        "window": f"{self._slow_window_hours} hours",
+                        "threshold": self._slow_threshold,
+                        "description": (
+                            f"Low-and-slow brute force: {count} login failures from {ip} "
+                            f"over {self._slow_window_hours} hours"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating slow brute force: %s", e)
 
         # --- Pattern 3: Distributed Attack ---
         distributed_agg = data.get("distributed_agg", {})
         for account, source_ips in distributed_agg.items():
-            # Filter whitelisted IPs
-            filtered_ips = [ip for ip in source_ips if ip not in self._ip_whitelist]
-            if len(filtered_ips) >= self._distributed_ips:
-                findings.append({
-                    "pattern": "distributed_brute_force",
-                    "severity": Severity.HIGH,
-                    "target_account": account,
-                    "source_ips": filtered_ips,
-                    "unique_sources": len(filtered_ips),
-                    "window": f"{self._distributed_window_min} min",
-                    "threshold": self._distributed_ips,
-                    "description": (
-                        f"Distributed attack: {len(filtered_ips)} unique IPs "
-                        f"targeting account '{account}' in "
-                        f"{self._distributed_window_min} minutes"
-                    ),
-                })
+            try:
+                # Filter whitelisted IPs
+                filtered_ips = [ip for ip in source_ips if ip not in self._ip_whitelist]
+                if len(filtered_ips) >= self._distributed_ips:
+                    findings.append({
+                        "pattern": "distributed_brute_force",
+                        "severity": Severity.HIGH,
+                        "target_account": account,
+                        "source_ips": filtered_ips,
+                        "unique_sources": len(filtered_ips),
+                        "window": f"{self._distributed_window_min} min",
+                        "threshold": self._distributed_ips,
+                        "description": (
+                            f"Distributed attack: {len(filtered_ips)} unique IPs "
+                            f"targeting account '{account}' in "
+                            f"{self._distributed_window_min} minutes"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating distributed attack: %s", e)
 
         # --- Pattern 4: Password Spray ---
         spray_agg = data.get("spray_agg", {})
         for src_ip, target_accounts in spray_agg.items():
-            if src_ip in self._ip_whitelist:
-                continue
-            if len(target_accounts) >= self._spray_accounts:
-                findings.append({
-                    "pattern": "password_spray",
-                    "severity": Severity.CRITICAL,
-                    "source_ip": src_ip,
-                    "target_accounts": target_accounts,
-                    "unique_accounts": len(target_accounts),
-                    "window": f"{self._spray_window_min} min",
-                    "threshold": self._spray_accounts,
-                    "description": (
-                        f"Password spray: {src_ip} tried {len(target_accounts)} "
-                        f"different accounts in {self._spray_window_min} minutes"
-                    ),
-                })
+            try:
+                if src_ip in self._ip_whitelist:
+                    continue
+                if len(target_accounts) >= self._spray_accounts:
+                    findings.append({
+                        "pattern": "password_spray",
+                        "severity": Severity.CRITICAL,
+                        "source_ip": src_ip,
+                        "target_accounts": target_accounts,
+                        "unique_accounts": len(target_accounts),
+                        "window": f"{self._spray_window_min} min",
+                        "threshold": self._spray_accounts,
+                        "description": (
+                            f"Password spray: {src_ip} tried {len(target_accounts)} "
+                            f"different accounts in {self._spray_window_min} minutes"
+                        ),
+                    })
+            except Exception as e:
+                logger.warning("Error evaluating password spray: %s", e)
 
         # Update metrics
-        total_events = len(fast_events) + sum(slow_agg.values())
+        total_events = sum(slow_agg.values())
         self._events_processed += total_events
         self._metrics.inc_events(total_events)
 
@@ -402,8 +428,9 @@ class BruteForceAgent(BaseAgent):
     def _extract_nested(doc: dict[str, Any], dotted_key: str) -> Optional[str]:
         """
         Extract a value from a nested dict using a dotted key path.
-        e.g. _extract_nested(doc, "data.srcip") -> doc["data"]["srcip"]
         """
+        if dotted_key in doc:
+            return str(doc[dotted_key])
         keys = dotted_key.split(".")
         current: Any = doc
         for key in keys:
@@ -431,52 +458,56 @@ class BruteForceAgent(BaseAgent):
         now = time.time()
 
         for finding in findings:
-            pattern = finding["pattern"]
-            source_ip = finding.get("source_ip", "unknown")
-            target = finding.get("target_account", source_ip)
-            alert_key = f"{pattern}:{source_ip}:{target}"
+            try:
+                pattern = finding["pattern"]
+                source_ip = finding.get("source_ip", "unknown")
+                target = finding.get("target_account", source_ip)
+                alert_key = f"{pattern}:{source_ip}:{target}"
 
-            # Check cooldown to avoid duplicate alerts
-            last_alerted = self._alerted_cache.get(alert_key, 0.0)
-            if now - last_alerted < self._alert_cooldown:
-                logger.debug("Skipping alert (cooldown): %s", alert_key)
-                continue
+                # Check cooldown to avoid duplicate alerts
+                with self._cache_lock:
+                    last_alerted = self._alerted_cache.get(alert_key, 0.0)
+                if now - last_alerted < self._alert_cooldown:
+                    logger.debug("Skipping alert (cooldown): %s", alert_key)
+                    continue
 
-            # Alert action
-            actions.append({
-                "type": "alert",
-                "severity": finding["severity"],
-                "title": f"Brute Force Detected: {pattern.replace('_', ' ').title()}",
-                "details": {
-                    "pattern": finding["pattern"],
-                    "source_ip": source_ip,
-                    "target_account": finding.get("target_account", "N/A"),
-                    "failure_count": finding.get("failure_count", "N/A"),
-                    "unique_sources": finding.get("unique_sources", "N/A"),
-                    "unique_accounts": finding.get("unique_accounts", "N/A"),
-                    "window": finding["window"],
-                    "description": finding["description"],
-                },
-                "alert_key": alert_key,
-            })
-
-            # Auto-block action (if enabled and severity is HIGH+)
-            if (
-                self._auto_block
-                and source_ip != "unknown"
-                and finding["severity"] >= Severity.HIGH
-            ):
+                # Alert action
                 actions.append({
-                    "type": "block_ip",
-                    "source_ip": source_ip,
-                    "reason": finding["description"],
+                    "type": "alert",
+                    "severity": finding["severity"],
+                    "title": f"Brute Force Detected: {pattern.replace('_', ' ').title()}",
+                    "details": {
+                        "pattern": finding["pattern"],
+                        "source_ip": source_ip,
+                        "target_account": finding.get("target_account", "N/A"),
+                        "failure_count": finding.get("failure_count", "N/A"),
+                        "unique_sources": finding.get("unique_sources", "N/A"),
+                        "unique_accounts": finding.get("unique_accounts", "N/A"),
+                        "window": finding["window"],
+                        "description": finding["description"],
+                    },
+                    "alert_key": alert_key,
                 })
 
-            # Log to incident index
-            actions.append({
-                "type": "log_incident",
-                "finding": finding,
-            })
+                # Auto-block action (if enabled and severity is HIGH+)
+                if (
+                    self._auto_block
+                    and source_ip != "unknown"
+                    and finding["severity"] >= Severity.HIGH
+                ):
+                    actions.append({
+                        "type": "block_ip",
+                        "source_ip": source_ip,
+                        "reason": finding["description"],
+                    })
+
+                # Log to incident index
+                actions.append({
+                    "type": "log_incident",
+                    "finding": finding,
+                })
+            except Exception as e:
+                logger.warning("Error deciding for brute force finding: %s", e)
 
         return actions
 
@@ -499,57 +530,62 @@ class BruteForceAgent(BaseAgent):
         incidents_logged = 0
 
         for action in actions:
-            if action["type"] == "alert":
-                sent = self.alerter.send_alert(
-                    severity=action["severity"],
-                    title=action["title"],
-                    details=action["details"],
-                    agent_name=self.name,
-                )
-                if sent:
-                    alerts_sent += 1
-                    self._metrics.inc_alerts(action["severity"].name)
-                    # Update cooldown cache
-                    self._alerted_cache[action["alert_key"]] = time.time()
+            try:
+                if action["type"] == "alert":
+                    sent = self.alerter.send_alert(
+                        severity=action["severity"],
+                        title=action["title"],
+                        details=action["details"],
+                        agent_name=self.name,
+                    )
+                    if sent:
+                        alerts_sent += 1
+                        self._metrics.inc_alerts(action["severity"].name)
+                        # Update cooldown cache
+                        with self._cache_lock:
 
-            elif action["type"] == "block_ip":
-                try:
-                    self.wazuh.block_ip(
-                        agent_id="all",
-                        ip_address=action["source_ip"],
-                    )
-                    ips_blocked += 1
-                    logger.warning(
-                        "Blocked IP %s via Wazuh active response",
-                        action["source_ip"],
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Failed to block IP %s: %s", action["source_ip"], exc
-                    )
+                            self._alerted_cache[action["alert_key"]] = time.time()
 
-            elif action["type"] == "log_incident":
-                try:
-                    finding = action["finding"]
-                    self.os_client.index_document(
-                        index="soc-brute-force-incidents",
-                        document={
-                            "@timestamp": datetime.now(timezone.utc).isoformat(),
-                            "agent_name": self.name,
-                            "pattern": finding["pattern"],
-                            "severity": finding["severity"].name,
-                            "source_ip": finding.get("source_ip"),
-                            "target_account": finding.get("target_account"),
-                            "failure_count": finding.get("failure_count"),
-                            "unique_sources": finding.get("unique_sources"),
-                            "unique_accounts": finding.get("unique_accounts"),
-                            "window": finding["window"],
-                            "description": finding["description"],
-                        },
-                    )
-                    incidents_logged += 1
-                except Exception as exc:
-                    logger.error("Failed to log brute force incident: %s", exc)
+                elif action["type"] == "block_ip":
+                    try:
+                        self.wazuh.block_ip(
+                            agent_id="all",
+                            ip_address=action["source_ip"],
+                        )
+                        ips_blocked += 1
+                        logger.warning(
+                            "Blocked IP %s via Wazuh active response",
+                            action["source_ip"],
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to block IP %s: %s", action["source_ip"], exc
+                        )
+
+                elif action["type"] == "log_incident":
+                    try:
+                        finding = action["finding"]
+                        self.os_client.index_document(
+                            index="soc-brute-force-incidents",
+                            document={
+                                "@timestamp": datetime.now(timezone.utc).isoformat(),
+                                "agent_name": self.name,
+                                "pattern": finding["pattern"],
+                                "severity": finding["severity"].name,
+                                "source_ip": finding.get("source_ip"),
+                                "target_account": finding.get("target_account"),
+                                "failure_count": finding.get("failure_count"),
+                                "unique_sources": finding.get("unique_sources"),
+                                "unique_accounts": finding.get("unique_accounts"),
+                                "window": finding["window"],
+                                "description": finding["description"],
+                            },
+                        )
+                        incidents_logged += 1
+                    except Exception as exc:
+                        logger.error("Failed to log brute force incident: %s", exc)
+            except Exception as e:
+                logger.warning("Error executing brute force action: %s", e)
 
         # Prune old cooldown entries
         self._prune_cooldown_cache()
@@ -572,12 +608,13 @@ class BruteForceAgent(BaseAgent):
     def _prune_cooldown_cache(self) -> None:
         """Remove expired entries from the alert cooldown cache."""
         now = time.time()
-        expired = [
-            k for k, v in self._alerted_cache.items()
-            if now - v > self._alert_cooldown * 2
-        ]
-        for k in expired:
-            del self._alerted_cache[k]
+        with self._cache_lock:
+            expired = [
+                k for k, v in self._alerted_cache.items()
+                if now - v > self._alert_cooldown * 2
+            ]
+            for k in expired:
+                del self._alerted_cache[k]
 
 
 # ---------------------------------------------------------------------------

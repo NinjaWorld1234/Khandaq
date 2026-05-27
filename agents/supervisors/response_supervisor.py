@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import threading
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
@@ -62,6 +63,7 @@ class ResponseSupervisor(BaseAgent):
         # FP rate feedback
         self._fp_rates: Dict[str, float] = {}
         self._last_daily_summary = 0.0
+        self._cache_lock = threading.Lock()
         self._escalated_keys: Dict[str, float] = {}
         self._cooldown = 300
 
@@ -72,9 +74,13 @@ class ResponseSupervisor(BaseAgent):
     def _on_worker_message(self, message: dict) -> None:
         try:
             data = message if isinstance(message, dict) else json.loads(message)
-            data["_received_at"] = time.time()
-            data["_source"] = data.get("source_agent", data.get("agent_name", data.get("sender", "")))
-            self._recent_alerts.append(data)
+            sender = data.get("sender", "unknown")
+            payload = data.get("payload", {})
+            payload["_received_at"] = time.time()
+            payload["_source"] = sender
+            with self._cache_lock:
+
+                self._recent_alerts.append(payload)
         except Exception as exc:
             logger.error("Failed to parse worker message: %s", exc)
 
@@ -89,7 +95,9 @@ class ResponseSupervisor(BaseAgent):
             if now - a.get("_received_at", 0) < 900
         ]
         batch = list(self._recent_alerts)
-        self._recent_alerts.clear()
+        with self._cache_lock:
+
+            self._recent_alerts.clear()
         return batch
 
     # ------------------------------------------------------------------
@@ -101,118 +109,136 @@ class ResponseSupervisor(BaseAgent):
         now = time.time()
 
         for alert in data:
-            source = alert.get("_source", "")
-            host = alert.get("host", "")
-            severity = self._parse_severity(alert.get("severity", "MEDIUM"))
-
-            # Categorize
-            if "auto_case" in source.lower() or "w23" in source.lower():
-                self._open_cases[host].append({"time": now, "alert": alert})
-            elif "smart_decision" in source.lower() or "w26" in source.lower():
-                decision = alert.get("decision", "")
-                if "isolate" in str(decision).lower():
-                    self._pending_isolations[host] = {"time": now, "alert": alert}
-                if alert.get("asset_criticality") == "critical":
-                    self._critical_assets.add(host)
-            elif "vulnerability" in source.lower() or "w29" in source.lower():
-                self._vuln_findings[host].append({"time": now, "alert": alert})
-            elif "reinforcement" in source.lower() or "w28" in source.lower():
-                for rule_id, fp_rate in alert.get("fp_rates", {}).items():
-                    self._fp_rates[rule_id] = fp_rate
-
-            # Forward HIGH/CRITICAL
-            if severity >= Severity.HIGH:
-                findings.append({
-                    "type": "worker_escalation",
-                    "source": source,
-                    "severity": severity,
-                    "host": host,
-                    "details": alert,
-                })
+            try:
+                source = alert.get("_source", "")
+                host = alert.get("host", "")
+                severity = self._parse_severity(alert.get("severity", "MEDIUM"))
+    
+                # Categorize
+                if "auto_case" in source.lower() or "w23" in source.lower():
+                    self._open_cases[host].append({"time": now, "alert": alert})
+                elif "smart_decision" in source.lower() or "w26" in source.lower():
+                    decision = alert.get("decision", "")
+                    if "isolate" in str(decision).lower():
+                        self._pending_isolations[host] = {"time": now, "alert": alert}
+                    if alert.get("asset_criticality") == "critical":
+                        self._critical_assets.add(host)
+                elif "vulnerability" in source.lower() or "w29" in source.lower():
+                    self._vuln_findings[host].append({"time": now, "alert": alert})
+                elif "reinforcement" in source.lower() or "w28" in source.lower():
+                    for rule_id, fp_rate in alert.get("fp_rates", {}).items():
+                        self._fp_rates[rule_id] = fp_rate
+    
+                # Forward HIGH/CRITICAL
+                if severity >= Severity.HIGH:
+                    findings.append({
+                        "type": "worker_escalation",
+                        "source": source,
+                        "severity": severity,
+                        "host": host,
+                        "details": alert,
+                    })
+            except Exception as e:
+                logger.warning("Error processing raw alert: %s", e)
 
         # ── Rule 1: Critical vuln + active exploitation ──
         for host, vulns in self._vuln_findings.items():
-            critical_vulns = [
-                v for v in vulns
-                if now - v["time"] < _CORRELATION_WINDOW
-                and v["alert"].get("cvss", 0) >= 9.0
-            ]
-            active_cases = [
-                c for c in self._open_cases.get(host, [])
-                if now - c["time"] < _CORRELATION_WINDOW
-            ]
-            if critical_vulns and active_cases:
-                key = f"vuln_exploit:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "VULNERABILITY_UNDER_EXPLOITATION",
-                        "severity": Severity.CRITICAL,
-                        "host": host,
-                        "details": (f"Critical vulnerability on {host} with "
-                                    f"{len(active_cases)} active cases — emergency patch required"),
-                        "vuln_count": len(critical_vulns),
-                        "case_count": len(active_cases),
-                    })
+            try:
+                critical_vulns = [
+                    v for v in vulns
+                    if now - v["time"] < _CORRELATION_WINDOW
+                    and v["alert"].get("cvss", 0) >= 9.0
+                ]
+                active_cases = [
+                    c for c in self._open_cases.get(host, [])
+                    if now - c["time"] < _CORRELATION_WINDOW
+                ]
+                if critical_vulns and active_cases:
+                    key = f"vuln_exploit:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "VULNERABILITY_UNDER_EXPLOITATION",
+                            "severity": Severity.CRITICAL,
+                            "host": host,
+                            "details": (f"Critical vulnerability on {host} with "
+                                        f"{len(active_cases)} active cases — emergency patch required"),
+                            "vuln_count": len(critical_vulns),
+                            "case_count": len(active_cases),
+                        })
+            except Exception as e:
+                logger.warning("Error in rule 1 correlation: %s", e)
 
         # ── Rule 2: Isolation decision + ensure playbook ──
         for host, iso in list(self._pending_isolations.items()):
-            if now - iso["time"] > _CORRELATION_WINDOW:
-                del self._pending_isolations[host]
-                continue
-            cases = self._open_cases.get(host, [])
-            recent_cases = [c for c in cases if now - c["time"] < _CORRELATION_WINDOW]
-            if recent_cases:
-                key = f"iso_playbook:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "ISOLATION_PLAYBOOK_TRIGGER",
-                        "severity": Severity.HIGH,
-                        "host": host,
-                        "details": f"Host {host} isolation decided — triggering incident response playbook",
-                    })
+            try:
+                if now - iso["time"] > _CORRELATION_WINDOW:
+                    del self._pending_isolations[host]
+                    continue
+                cases = self._open_cases.get(host, [])
+                recent_cases = [c for c in cases if now - c["time"] < _CORRELATION_WINDOW]
+                if recent_cases:
+                    key = f"iso_playbook:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "ISOLATION_PLAYBOOK_TRIGGER",
+                            "severity": Severity.HIGH,
+                            "host": host,
+                            "details": f"Host {host} isolation decided — triggering incident response playbook",
+                        })
+            except Exception as e:
+                logger.warning("Error in rule 2 correlation: %s", e)
 
         # ── Rule 3: Vulnerability on critical asset ──
         for host in self._critical_assets:
-            vulns = [
-                v for v in self._vuln_findings.get(host, [])
-                if now - v["time"] < 3600
-            ]
-            if vulns:
-                key = f"vuln_critical_asset:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "CRITICAL_ASSET_VULNERABLE",
-                        "severity": Severity.HIGH,
-                        "host": host,
-                        "details": f"Critical asset {host} has {len(vulns)} vulnerabilities — priority patch",
-                        "vuln_count": len(vulns),
-                    })
+            try:
+                vulns = [
+                    v for v in self._vuln_findings.get(host, [])
+                    if now - v["time"] < 3600
+                ]
+                if vulns:
+                    key = f"vuln_critical_asset:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "CRITICAL_ASSET_VULNERABLE",
+                            "severity": Severity.HIGH,
+                            "host": host,
+                            "details": f"Critical asset {host} has {len(vulns)} vulnerabilities — priority patch",
+                            "vuln_count": len(vulns),
+                        })
+            except Exception as e:
+                logger.warning("Error in rule 3 correlation: %s", e)
 
         # ── Rule 4: Multiple cases for same host ──
         for host, cases in self._open_cases.items():
-            recent = [c for c in cases if now - c["time"] < _CORRELATION_WINDOW]
-            if len(recent) >= 3:
-                key = f"multi_case:{host}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "REPEATED_INCIDENTS",
-                        "severity": Severity.HIGH,
-                        "host": host,
-                        "details": f"Host {host} has {len(recent)} cases in {_CORRELATION_WINDOW}s — possible ongoing attack",
-                    })
+            try:
+                recent = [c for c in cases if now - c["time"] < _CORRELATION_WINDOW]
+                if len(recent) >= 3:
+                    key = f"multi_case:{host}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "REPEATED_INCIDENTS",
+                            "severity": Severity.HIGH,
+                            "host": host,
+                            "details": f"Host {host} has {len(recent)} cases in {_CORRELATION_WINDOW}s — possible ongoing attack",
+                        })
+            except Exception as e:
+                logger.warning("Error in rule 4 correlation: %s", e)
 
         # ── Rule 5: High FP rate feedback ──
         for rule_id, rate in self._fp_rates.items():
-            if rate > 0.85:
-                key = f"fp_tune:{rule_id}"
-                if self._should_escalate(key, now):
-                    findings.append({
-                        "type": "HIGH_FALSE_POSITIVE_RATE",
-                        "severity": Severity.LOW,
-                        "details": f"Rule {rule_id} has {rate*100:.0f}% false positive rate — recommend tuning",
-                        "rule_id": rule_id,
-                        "fp_rate": rate,
-                    })
+            try:
+                if rate > 0.85:
+                    key = f"fp_tune:{rule_id}"
+                    if self._should_escalate(key, now):
+                        findings.append({
+                            "type": "HIGH_FALSE_POSITIVE_RATE",
+                            "severity": Severity.LOW,
+                            "details": f"Rule {rule_id} has {rate*100:.0f}% false positive rate — recommend tuning",
+                            "rule_id": rule_id,
+                            "fp_rate": rate,
+                        })
+            except Exception as e:
+                logger.warning("Error in rule 5 correlation: %s", e)
 
         # ── Daily summary ──
         if now - self._last_daily_summary > _DAILY_SUMMARY_INTERVAL:
@@ -254,7 +280,7 @@ class ResponseSupervisor(BaseAgent):
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "type": f.get("type"),
                         "severity": f["severity"].name
-                            if hasattr(f.get("severity"), "name") else str(f.get("severity")),
+                        if hasattr(f.get("severity"), "name") else str(f.get("severity")),
                         "host": f.get("host", ""),
                         "details": f.get("details", ""),
                     }
@@ -301,7 +327,9 @@ class ResponseSupervisor(BaseAgent):
             self._vuln_findings[host] = [v for v in self._vuln_findings[host] if v["time"] > cutoff]
             if not self._vuln_findings[host]:
                 del self._vuln_findings[host]
-        self._escalated_keys = {k: v for k, v in self._escalated_keys.items() if v > cutoff}
+        with self._cache_lock:
+
+            self._escalated_keys = {k: v for k, v in self._escalated_keys.items() if v > cutoff}
 
     def _generate_daily_summary(self) -> str:
         total_cases = sum(len(c) for c in self._open_cases.values())

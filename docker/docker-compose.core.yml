@@ -57,7 +57,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1",
+          "curl -sk -u admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!} https://localhost:9200/_cluster/health?wait_for_status=yellow || curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow || exit 1",
         ]
       interval: 30s
       timeout: 10s
@@ -107,7 +107,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s || exit 1",
+          "curl -sk -u admin:${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!} https://localhost:9200/_cluster/health?wait_for_status=yellow || curl -sf http://localhost:9200/_cluster/health?wait_for_status=yellow || exit 1",
         ]
       interval: 30s
       timeout: 10s
@@ -124,7 +124,7 @@ services:
     hostname: opensearch-dashboards
     restart: unless-stopped
     environment:
-      - OPENSEARCH_HOSTS=["http://opensearch-node1:9200","http://opensearch-node2:9200"]
+      - OPENSEARCH_HOSTS=["https://opensearch-node1:9200","https://opensearch-node2:9200"]
       - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
     ports:
       - "${OPENSEARCH_DASHBOARDS_PORT:-5601}:5601"
@@ -160,7 +160,7 @@ services:
     hostname: wazuh-manager
     restart: unless-stopped
     environment:
-      - INDEXER_URL=http://opensearch-node1:9200
+      - INDEXER_URL=https://opensearch-node1:9200
       - INDEXER_USERNAME=admin
       - INDEXER_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD:-Ch@ngeMe_OpenSearch_2024!}
       - FILEBEAT_SSL_VERIFICATION_MODE=none
