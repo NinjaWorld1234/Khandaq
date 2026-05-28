@@ -77,15 +77,21 @@ CURRENT=1
 log_step "Starting offline download for $TOTAL_IMAGES Docker images..."
 
 for img in "${IMAGES[@]}"; do
-    log_info "[$CURRENT/$TOTAL_IMAGES] Pulling $img ..."
-    if docker pull "$img"; then
-        safe_name=$(echo "$img" | tr '/:' '_')
-        tar_path="${OFFLINE_DIR}/${safe_name}.tar"
-        
-        log_info "Saving $img to $tar_path ..."
-        docker save -o "$tar_path" "$img"
+    safe_name=$(echo "$img" | tr '/:' '_')
+    tar_path="${OFFLINE_DIR}/${safe_name}.tar"
+
+    if [ -f "$tar_path" ]; then
+        log_info "[$CURRENT/$TOTAL_IMAGES] Skipping $img - already saved at $tar_path"
     else
-        log_error "Failed to pull $img. Skipping..."
+        log_info "[$CURRENT/$TOTAL_IMAGES] Pulling $img ..."
+        if docker pull "$img"; then
+            log_info "Saving $img to $tar_path ..."
+            docker save -o "$tar_path" "$img"
+            log_info "Cleaning up docker cache for $img to save space..."
+            docker rmi "$img" || true
+        else
+            log_error "Failed to pull $img. Skipping..."
+        fi
     fi
     CURRENT=$((CURRENT + 1))
 done
