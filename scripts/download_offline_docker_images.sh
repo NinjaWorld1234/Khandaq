@@ -11,7 +11,7 @@ readonly BLUE='\033[0;34m'
 readonly RED='\033[0;31m'
 readonly NC='\033[0m'
 
-readonly OFFLINE_DIR="/root/Khandaq/soc_offline_images"
+readonly OFFLINE_DIR="/mnt/gdrive/soc_offline_images"
 
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
